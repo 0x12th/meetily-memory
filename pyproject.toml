@@ -1,0 +1,79 @@
+[project]
+name = "meetily-memory"
+version = "0.1.0"
+description = "Local-first Meetily history index and CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "orjson>=3.10.0",
+  "platformdirs>=4.3.0",
+  "rich>=13.9.0",
+  "typer>=0.12.0",
+]
+
+[project.scripts]
+meetily-memory = "meetily_memory.cli.app:main"
+mm = "meetily_memory.cli.app:main"
+
+[dependency-groups]
+dev = [
+  "pre-commit>=4.0.0",
+  "pytest>=8.3.0",
+  "ruff>=0.8.0",
+  "ty>=0.0.1a21",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.25,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812",
+  "D100",
+  "D101",
+  "D102",
+  "D103",
+  "D104",
+  "D105",
+  "D106",
+  "D107",
+  "D203",
+  "D212",
+  "ISC001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/meetily_memory/cli/app.py" = [
+  "FBT002",
+  "S603",
+  "S607",
+]
+"src/meetily_memory/db/repository.py" = [
+  "ANN401",
+]
+"src/meetily_memory/scanner/meetily_sqlite.py" = [
+  "ANN401",
+]
+"tests/**/*.py" = [
+  "ANN201",
+  "PLR2004",
+  "S101",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["meetily_memory"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
