@@ -8,6 +8,13 @@ from meetily_memory.db.repository import IndexRepository, build_fts_query
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
 
+EMPTY_ENTITY_COUNT_SQL = (
+    "SELECT COUNT(*) FROM decisions",
+    "SELECT COUNT(*) FROM action_items",
+    "SELECT COUNT(*) FROM risks",
+    "SELECT COUNT(*) FROM open_questions",
+)
+
 
 def test_readonly_meetily_connection_is_context_managed(meetily_db: Path) -> None:
     with readonly_sqlite_connection(meetily_db) as conn:
@@ -30,8 +37,10 @@ def test_index_schema_uses_builtin_sqlite_migration(tmp_path: Path) -> None:
     repo = IndexRepository(index_path)
 
     with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0
+        for sql in EMPTY_ENTITY_COUNT_SQL:
+            assert conn.execute(sql).fetchone()[0] == 0
         repo.stats()
 
 
@@ -57,6 +66,18 @@ def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path:
         "transcript-1",
         "summary:meeting-1",
     }
+
+    structured_entities = repo.list_structured_entities(meeting["id"])
+    assert {entity["kind"] for entity in structured_entities} >= {
+        "decisions",
+        "open_questions",
+    }
+
+    stats = repo.stats()
+    assert stats["decisions"] >= 1
+    assert stats["action_items"] >= 1
+    assert stats["risks"] >= 1
+    assert stats["open_questions"] >= 1
 
     search_results = repo.search("pricing decision")
     assert search_results[0]["meeting_external_id"] == "meeting-1"
@@ -95,7 +116,7 @@ def test_scan_is_incremental_and_replaces_changed_meeting_chunks(
     conn = sqlite3.connect(meetily_db)
     conn.execute(
         "UPDATE transcripts SET transcript = ? WHERE id = ?",
-        ("Robert agreed to send migration risks and budget notes by Friday.", "transcript-2"),
+        ("Vladimir agreed to send migration risks and budget notes by Friday.", "transcript-2"),
     )
     conn.execute(
         "UPDATE meetings SET updated_at = ? WHERE id = ?",

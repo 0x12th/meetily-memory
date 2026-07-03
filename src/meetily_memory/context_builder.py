@@ -86,7 +86,14 @@ def format_excerpt(row: Mapping[str, object]) -> str:
     if row.get("timestamp_label"):
         prefix_parts.append(str(row["timestamp_label"]))
     prefix = f"**{' | '.join(prefix_parts)}**: " if prefix_parts else ""
-    return f"> {prefix}{normalize_excerpt(str(row['text']))}"
+    source = format_source(row)
+    return f"{source}\n> {prefix}{normalize_excerpt(str(row['text']))}"
+
+
+def format_source(row: Mapping[str, object]) -> str:
+    meeting_id = row.get("meeting_external_id") or row.get("meeting_id") or "unknown-meeting"
+    chunk_id = row.get("chunk_external_id") or row.get("chunk_id") or "unknown-chunk"
+    return f"Source: {meeting_id} / {chunk_id}"
 
 
 def normalize_excerpt(text: str) -> str:

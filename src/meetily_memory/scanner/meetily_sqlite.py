@@ -8,6 +8,7 @@ from typing import Any
 from meetily_memory.db.repository import ChunkRecord, IndexRepository, MeetingRecord
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
+from meetily_memory.structure_analyzer import StructureAnalyzer
 
 
 @dataclass
@@ -26,6 +27,7 @@ class MeetilySQLiteScanner:
 
     def __init__(self, index_path: Path) -> None:
         self.repo = IndexRepository(Path(index_path))
+        self.structure_analyzer = StructureAnalyzer(self.repo)
 
     def scan(self, source_path: Path, *, force: bool = False) -> ScanResult:
         source_path = Path(source_path)
@@ -44,11 +46,13 @@ class MeetilySQLiteScanner:
                 meeting, chunks = normalize_meeting(source_id, source_path, upstream, utc_now())
                 result.chunks_seen += len(chunks)
                 existing = self.repo.get_meeting_by_external_id(source_id, meeting.external_id)
-                _, updated, inserted_chunks = self.repo.upsert_meeting_with_chunks(
+                meeting_id, updated, inserted_chunks = self.repo.upsert_meeting_with_chunks(
                     meeting,
                     chunks,
                     force=force,
                 )
+                if existing is None or updated:
+                    self.structure_analyzer.analyze_meeting(meeting_id)
                 result.chunks_inserted += inserted_chunks
                 if existing is None:
                     result.meetings_inserted += 1

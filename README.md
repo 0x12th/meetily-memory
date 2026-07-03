@@ -1,26 +1,145 @@
 # Meetily Memory
 
-Local-first CLI for indexing and searching Meetily meeting history. Meetily
-Memory is a local memory layer on top of Meetily: it imports meeting history,
-normalizes it into a private SQLite index, and provides fast search through a
-small command-line interface.
+Turn your local Meetily meeting history into a private, searchable memory.
 
-It does not replace Meetily, record audio, transcribe meetings, or mutate the
-Meetily database.
+Meetily Memory indexes your Meetily database into a local SQLite search index,
+then helps you find past decisions, tasks, risks, questions, and ready-to-paste
+LLM context from old meetings.
 
-## Principles
+It does not replace Meetily, record audio, transcribe meetings, upload data, or
+mutate the Meetily database.
 
-- Local-first: no required cloud services.
-- Read-only upstream: Meetily data is never modified.
-- Minimal infrastructure: no Docker, Postgres, queues, or background services.
-- One local CLI: `mm`.
-- Fast local search with SQLite and FTS5.
-- Plugin/MCP-ready architecture for later versions.
+## Why
+
+After enough meetings, the hard part is not recording another call. The hard
+part is answering questions like:
+
+- What did we decide about pricing?
+- What did Vladimir promise last week?
+- Which risks came up during the migration discussion?
+- What context should I paste into ChatGPT or Claude before asking a follow-up?
+
+Meetily Memory gives you a local CLI for that workflow:
+
+```text
+Meetily history -> local sync -> search -> LLM context
+```
+
+## Install
+
+From the repository:
+
+```bash
+uv sync
+```
+
+Then run commands through `uv`:
+
+```bash
+uv run mm --help
+```
+
+The CLI is exposed as both `meetily-memory` and `mm`.
+
+## First Run
+
+Meetily Memory can often find the Meetily database automatically:
+
+```bash
+uv run mm doctor
+uv run mm scan
+```
+
+If autodiscovery does not find it, pass the source explicitly:
+
+```bash
+uv run mm doctor --source /path/to/meeting_minutes.sqlite
+```
+
+Then sync it into the private local index:
+
+```bash
+uv run mm scan --source /path/to/meeting_minutes.sqlite
+```
+
+Now try the two main workflows:
+
+```bash
+uv run mm s "pricing decision"
+uv run mm c "what did we decide about pricing?"
+```
+
+`mm s` searches the meeting history. `mm c` builds Markdown context you can
+paste into ChatGPT, Claude, or another LLM.
+
+## First Useful Commands
+
+| Command | What it does |
+|---|---|
+| `mm doctor` | Checks autodiscovery, the Meetily DB, local index path, SQLite, and FTS5. |
+| `mm scan` | Syncs Meetily history into the local `index.sqlite`. |
+| `mm s "query"` | Searches transcript chunks with SQLite FTS5. |
+| `mm c "question"` | Builds LLM-ready Markdown context from relevant meetings. |
+| `mm analyze` | Extracts decisions, action items, risks, and open questions. |
+| `mm decisions` | Lists extracted decisions with meeting and source chunk evidence. |
+| `mm tasks` | Lists extracted action items with meeting and source chunk evidence. |
+| `mm risks` | Lists extracted risks with meeting and source chunk evidence. |
+| `mm questions` | Lists extracted open questions with meeting and source chunk evidence. |
+| `mm last` | Shows the latest indexed meeting. |
+| `mm p "Vladimir"` | Finds recent meetings related to a person, best-effort. |
+| `mm open <meeting-id>` | Opens the source meeting folder or prints its path. |
+
+## Example Workflow
+
+```bash
+uv run mm doctor --source ~/Library/Application\ Support/com.meetily.ai/meeting_minutes.sqlite
+uv run mm scan --source ~/Library/Application\ Support/com.meetily.ai/meeting_minutes.sqlite
+uv run mm analyze
+
+uv run mm s "migration risk"
+uv run mm c "what risks did we discuss for the migration?"
+uv run mm risks
+uv run mm last --person Vladimir
+```
+
+## Source Discovery
+
+`--source` is optional. Without it, `mm doctor` and `mm scan` try to discover
+the Meetily database in common app-data locations. Explicit `--source` is still
+the most reliable option when Meetily uses a non-default location or you want to
+index a specific database file.
+
+The source may be:
+
+- a Meetily SQLite file: `meeting_minutes.sqlite`;
+- a legacy Meetily DB: `meeting_minutes.db`;
+- a directory containing one of those files.
+
+You can also set:
+
+```bash
+export MEETILY_MEMORY_SOURCE=/path/to/meeting_minutes.sqlite
+```
+
+Then run:
+
+```bash
+uv run mm doctor
+uv run mm scan
+```
+
+By default, Meetily Memory stores its own index in the platform data directory
+via `platformdirs`. Override it when needed:
+
+```bash
+uv run mm --index /path/to/index.sqlite scan --source /path/to/meeting_minutes.sqlite
+```
 
 ## Data Contract
 
-Meetily is treated as an upstream source. Meetily Memory opens the source
-database read-only and writes all derived state into its own `index.sqlite`.
+Meetily is treated as a read-only upstream source. Meetily Memory opens the
+source database read-only and writes all derived state into its own
+`index.sqlite`.
 
 ```text
 source.kind = meetily_sqlite
@@ -31,60 +150,24 @@ fingerprint = hash(normalized Meetily row data)
 ```
 
 Derived data stored in `index.sqlite` includes normalized meetings, searchable
-chunks, best-effort people metadata, artifacts, scan history, the FTS5 index,
-and future embeddings or plugin state.
+chunks, best-effort people metadata, structured meeting entities, artifacts,
+scan history, and the FTS5 index.
 
-## Source Discovery
+Structured meeting entities currently include:
 
-Use `--source` when the Meetily database is not in a default app-data location:
+- decisions;
+- action items;
+- risks;
+- open questions.
 
-```bash
-mm doctor --source /path/to/meeting_minutes.sqlite
-mm scan --source /path/to/meeting_minutes.sqlite
-```
+## Principles
 
-The source may be a Meetily SQLite file or a directory that contains
-`meeting_minutes.sqlite` or the legacy `meeting_minutes.db`. Discovery is
-best-effort and platform-aware; explicit `--source` is the stable path.
-
-## v1 Quick Start
-
-```bash
-uv sync
-uv run mm doctor --source /path/to/meeting_minutes.sqlite
-uv run mm scan --source /path/to/meeting_minutes.sqlite
-uv run mm s "pricing decision"
-uv run mm c "what did we decide about pricing?"
-uv run mm ls
-uv run mm last
-uv run mm last --person Robert
-uv run mm p Robert
-```
-
-By default, Meetily Memory stores its index in the platform data directory via
-`platformdirs`. You can override it for any command:
-
-```bash
-uv run mm --index /path/to/index.sqlite scan --source /path/to/meeting_minutes.sqlite
-```
-
-## CLI
-
-```bash
-mm doctor
-mm scan
-mm s "query"
-mm c "question"
-mm ls
-mm last
-mm last --person "Robert"
-mm p "Robert"
-mm open <meeting-id>
-```
-
-`people` support in v1 is best-effort. It uses available speaker and metadata
-values, and may fall back to text search when Meetily does not provide reliable
-participant identity.
+- Local-first: no required cloud services.
+- Private by default: no uploads and no required LLM calls.
+- Read-only upstream: Meetily data is never modified.
+- Minimal infrastructure: no Docker, Postgres, queues, or background services.
+- Fast local search with SQLite and FTS5.
+- Plugin/MCP-ready architecture for later versions.
 
 ## Development
 

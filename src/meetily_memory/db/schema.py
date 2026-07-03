@@ -3,9 +3,77 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
+STRUCTURED_SCHEMA_VERSION = 2
 
-SCHEMA_SQL = """
+STRUCTURED_ENTITIES_SQL = """
+CREATE TABLE IF NOT EXISTS decisions (
+  id INTEGER PRIMARY KEY,
+  meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  source_chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+  ordinal INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  source TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  raw_metadata_json TEXT,
+  UNIQUE(meeting_id, fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS action_items (
+  id INTEGER PRIMARY KEY,
+  meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  source_chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+  ordinal INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  source TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  raw_metadata_json TEXT,
+  UNIQUE(meeting_id, fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS risks (
+  id INTEGER PRIMARY KEY,
+  meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  source_chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+  ordinal INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  source TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  raw_metadata_json TEXT,
+  UNIQUE(meeting_id, fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS open_questions (
+  id INTEGER PRIMARY KEY,
+  meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+  source_chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL,
+  ordinal INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  source TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  raw_metadata_json TEXT,
+  UNIQUE(meeting_id, fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_meeting ON decisions(meeting_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_action_items_meeting ON action_items(meeting_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_risks_meeting ON risks(meeting_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_open_questions_meeting ON open_questions(meeting_id, ordinal);
+"""
+
+SCHEMA_SQL = f"""
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -122,6 +190,8 @@ CREATE TABLE IF NOT EXISTS plugin_state (
   PRIMARY KEY (plugin_name, key)
 );
 
+{STRUCTURED_ENTITIES_SQL}
+
 CREATE INDEX IF NOT EXISTS idx_meetings_updated_at ON meetings(updated_at);
 CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at);
 CREATE INDEX IF NOT EXISTS idx_chunks_meeting_ordinal ON chunks(meeting_id, ordinal);
@@ -151,5 +221,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         raise RuntimeError(message)
     if version < 1:
         conn.executescript(SCHEMA_SQL)
-        conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+        version = 1
+    if version < STRUCTURED_SCHEMA_VERSION:
+        conn.executescript(STRUCTURED_ENTITIES_SQL)
+        version = STRUCTURED_SCHEMA_VERSION
+    if version != conn.execute("PRAGMA user_version").fetchone()[0]:
+        conn.execute(f"PRAGMA user_version={version}")
         conn.commit()

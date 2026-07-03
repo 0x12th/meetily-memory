@@ -32,24 +32,33 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert context.exit_code == 0
     assert "# Question" in context.stdout
     assert "# Relevant meetings" in context.stdout
-    assert "## Meeting: Robert Follow-up" in context.stdout
+    assert "## Meeting: Vladimir Follow-up" in context.stdout
     assert "Date: 2026-07-02T09:30:00Z" in context.stdout
+    assert "Source: meeting-2 / transcript-2" in context.stdout
     assert "### Relevant excerpt" in context.stdout
-    assert "Robert agreed to send migration risks by Friday." in context.stdout
+    assert "Vladimir agreed to send migration risks by Friday." in context.stdout
     assert context.stdout.count("Who owns migration risks?") == 2
+
+    analyze = runner.invoke(app, ["--index", str(index_path), "analyze", "meeting-2"])
+    assert analyze.exit_code == 0
+    assert "meetings analyzed: 1" in analyze.stdout
+    assert "action items:" in analyze.stdout
+    assert "risks:" in analyze.stdout
 
     listing = runner.invoke(app, ["--index", str(index_path), "ls"])
     assert listing.exit_code == 0
-    assert "Robert Follow-up" in listing.stdout
+    assert "Vladimir Follow-up" in listing.stdout
     assert "Launch Planning" in listing.stdout
 
-    last_for_person = runner.invoke(app, ["--index", str(index_path), "last", "--person", "Robert"])
+    last_for_person = runner.invoke(
+        app, ["--index", str(index_path), "last", "--person", "Vladimir"]
+    )
     assert last_for_person.exit_code == 0
-    assert "Robert Follow-up" in last_for_person.stdout
+    assert "Vladimir Follow-up" in last_for_person.stdout
 
-    person = runner.invoke(app, ["--index", str(index_path), "p", "Robert"])
+    person = runner.invoke(app, ["--index", str(index_path), "p", "Vladimir"])
     assert person.exit_code == 0
-    assert "Robert Follow-up" in person.stdout
+    assert "Vladimir Follow-up" in person.stdout
 
     doctor = runner.invoke(
         app,
@@ -58,7 +67,46 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert doctor.exit_code == 0
     assert "source readable: yes" in doctor.stdout
     assert "fts5: yes" in doctor.stdout
+    assert "decisions:" in doctor.stdout
+    assert "action items:" in doctor.stdout
 
     opened = runner.invoke(app, ["--index", str(index_path), "open", "meeting-2", "--print-path"])
     assert opened.exit_code == 0
-    assert "Robert Follow-up" in opened.stdout
+    assert "Vladimir Follow-up" in opened.stdout
+
+
+def test_cli_lists_structured_entities_with_source_evidence(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    decisions = runner.invoke(app, ["--index", str(index_path), "decisions"])
+    assert decisions.exit_code == 0
+    assert "Launch Planning" in decisions.stdout
+    assert "meeting-1" in decisions.stdout
+    assert "transcript-1" in decisions.stdout
+    assert "confidence" in decisions.stdout
+    assert "pricing decision" in decisions.stdout
+
+    tasks = runner.invoke(app, ["--index", str(index_path), "tasks"])
+    assert tasks.exit_code == 0
+    assert "Vladimir Follow-up" in tasks.stdout
+    assert "meeting-2" in tasks.stdout
+    assert "transcript-2" in tasks.stdout
+    assert "Vladimir agreed to send migration risks by Friday." in tasks.stdout
+
+    risks_json = runner.invoke(app, ["--index", str(index_path), "risks", "--json"])
+    assert risks_json.exit_code == 0
+    assert '"kind":"risks"' in risks_json.stdout
+    assert '"meeting_external_id":"meeting-2"' in risks_json.stdout
+
+    questions = runner.invoke(app, ["--index", str(index_path), "questions"])
+    assert questions.exit_code == 0
+    assert "Open question: who owns partner review?" in questions.stdout

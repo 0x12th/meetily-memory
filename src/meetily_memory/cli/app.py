@@ -15,9 +15,16 @@ from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import dumps_json
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
+from meetily_memory.structure_analyzer import StructureAnalyzer
 
 app = typer.Typer(no_args_is_help=True, help="Local Meetily history index.")
 console = Console()
+ENTITY_COMMANDS = {
+    "decisions": "decisions",
+    "tasks": "action_items",
+    "risks": "risks",
+    "questions": "open_questions",
+}
 
 
 def _index_option(
@@ -71,6 +78,37 @@ def scan(
     console.print(f"meetings inserted: {result.meetings_inserted}")
     console.print(f"meetings updated: {result.meetings_updated}")
     console.print(f"chunks seen: {result.chunks_seen}")
+
+
+@app.command()
+def analyze(
+    ctx: typer.Context,
+    meeting_id: Annotated[
+        str | None,
+        typer.Argument(help="Meeting external id or internal id. Omit to analyze all meetings."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    analyzer = StructureAnalyzer(repo)
+    if meeting_id:
+        meeting = repo.get_meeting(meeting_id)
+        if not meeting:
+            message = f"Meeting not found: {meeting_id}"
+            raise typer.BadParameter(message)
+        result = analyzer.analyze_meeting(int(meeting["id"]))
+    else:
+        result = analyzer.analyze_all()
+
+    payload = result.as_payload()
+    if json_output:
+        console.print(dumps_json(payload))
+        return
+    console.print(f"meetings analyzed: {payload['meetings_analyzed']}")
+    console.print(f"decisions: {payload['decisions']}")
+    console.print(f"action items: {payload['action_items']}")
+    console.print(f"risks: {payload['risks']}")
+    console.print(f"open questions: {payload['open_questions']}")
 
 
 @app.command("s")
@@ -165,6 +203,74 @@ def person(
         console.print(f"{row['title']} [{row['external_id']}]")
 
 
+@app.command("decisions")
+def decisions(
+    ctx: typer.Context,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    print_structured_entities(ctx, ENTITY_COMMANDS["decisions"], limit, json_output=json_output)
+
+
+@app.command("tasks")
+def tasks(
+    ctx: typer.Context,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    print_structured_entities(ctx, ENTITY_COMMANDS["tasks"], limit, json_output=json_output)
+
+
+@app.command("risks")
+def risks(
+    ctx: typer.Context,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    print_structured_entities(ctx, ENTITY_COMMANDS["risks"], limit, json_output=json_output)
+
+
+@app.command("questions")
+def questions(
+    ctx: typer.Context,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    print_structured_entities(ctx, ENTITY_COMMANDS["questions"], limit, json_output=json_output)
+
+
+def print_structured_entities(
+    ctx: typer.Context,
+    kind: str,
+    limit: int,
+    *,
+    json_output: bool,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    rows = repo.list_structured_entity_details(kind, limit)
+    if json_output:
+        console.print(dumps_json(rows))
+        return
+    if not rows:
+        console.print("No structured entities found. Run `mm analyze` after scanning.")
+        return
+
+    for row in rows:
+        source_parts = [
+            str(row["meeting_external_id"]),
+            str(row.get("chunk_external_id") or row.get("source_chunk_id") or ""),
+        ]
+        source = " / ".join(part for part in source_parts if part)
+        if row.get("chunk_timestamp_label"):
+            source = f"{source} @ {row['chunk_timestamp_label']}"
+        console.print(f"{row['meeting_title']} [{row['meeting_external_id']}]")
+        console.print(f"Date: {row.get('meeting_date') or ''}")
+        console.print(f"Source: {source}")
+        console.print(f"confidence: {float(row['confidence']):.2f}")
+        console.print(str(row["text"]))
+        console.print()
+
+
 @app.command("open")
 def open_command(
     ctx: typer.Context,
@@ -216,6 +322,10 @@ def doctor(
     console.print(f"fts5: {'yes' if fts5 else 'no'}")
     console.print(f"meetings: {stats['meetings']}")
     console.print(f"chunks: {stats['chunks']}")
+    console.print(f"decisions: {stats['decisions']}")
+    console.print(f"action items: {stats['action_items']}")
+    console.print(f"risks: {stats['risks']}")
+    console.print(f"open questions: {stats['open_questions']}")
 
 
 def sqlite_has_fts5() -> bool:

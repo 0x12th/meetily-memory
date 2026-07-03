@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from meetily_memory.db.schema import index_connection
+from meetily_memory.meeting_structure import ENTITY_KINDS, StructuredEntity, empty_entity_counts
 
 FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 MAX_FTS_QUERY_TOKENS = 16
@@ -43,6 +44,124 @@ FTS_STOPWORDS = frozenset(
         "что",
     }
 )
+ENTITY_INSERT_SQL = {
+    "decisions": """
+        INSERT INTO decisions (
+          meeting_id, source_chunk_id, ordinal, text, source, confidence,
+          fingerprint, created_at, updated_at, raw_metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    "action_items": """
+        INSERT INTO action_items (
+          meeting_id, source_chunk_id, ordinal, text, source, confidence,
+          fingerprint, created_at, updated_at, raw_metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    "risks": """
+        INSERT INTO risks (
+          meeting_id, source_chunk_id, ordinal, text, source, confidence,
+          fingerprint, created_at, updated_at, raw_metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    "open_questions": """
+        INSERT INTO open_questions (
+          meeting_id, source_chunk_id, ordinal, text, source, confidence,
+          fingerprint, created_at, updated_at, raw_metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+}
+ENTITY_DELETE_SQL = {
+    "decisions": "DELETE FROM decisions WHERE meeting_id = ?",
+    "action_items": "DELETE FROM action_items WHERE meeting_id = ?",
+    "risks": "DELETE FROM risks WHERE meeting_id = ?",
+    "open_questions": "DELETE FROM open_questions WHERE meeting_id = ?",
+}
+ENTITY_SELECT_SQL = {
+    "decisions": "SELECT * FROM decisions WHERE meeting_id = ? ORDER BY ordinal",
+    "action_items": "SELECT * FROM action_items WHERE meeting_id = ? ORDER BY ordinal",
+    "risks": "SELECT * FROM risks WHERE meeting_id = ? ORDER BY ordinal",
+    "open_questions": "SELECT * FROM open_questions WHERE meeting_id = ? ORDER BY ordinal",
+}
+ENTITY_COUNT_SQL = {
+    "decisions": "SELECT COUNT(*) FROM decisions",
+    "action_items": "SELECT COUNT(*) FROM action_items",
+    "risks": "SELECT COUNT(*) FROM risks",
+    "open_questions": "SELECT COUNT(*) FROM open_questions",
+}
+ENTITY_DETAIL_SQL = {
+    "decisions": """
+        SELECT
+          'decisions' AS kind,
+          e.*,
+          m.external_id AS meeting_external_id,
+          m.title AS meeting_title,
+          COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
+          c.external_id AS chunk_external_id,
+          c.kind AS chunk_kind,
+          c.speaker AS chunk_speaker,
+          c.timestamp_label AS chunk_timestamp_label
+        FROM decisions e
+        JOIN meetings m ON m.id = e.meeting_id
+        LEFT JOIN chunks c ON c.id = e.source_chunk_id
+        ORDER BY meeting_date DESC, e.ordinal ASC
+        LIMIT ?
+    """,
+    "action_items": """
+        SELECT
+          'action_items' AS kind,
+          e.*,
+          m.external_id AS meeting_external_id,
+          m.title AS meeting_title,
+          COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
+          c.external_id AS chunk_external_id,
+          c.kind AS chunk_kind,
+          c.speaker AS chunk_speaker,
+          c.timestamp_label AS chunk_timestamp_label
+        FROM action_items e
+        JOIN meetings m ON m.id = e.meeting_id
+        LEFT JOIN chunks c ON c.id = e.source_chunk_id
+        ORDER BY meeting_date DESC, e.ordinal ASC
+        LIMIT ?
+    """,
+    "risks": """
+        SELECT
+          'risks' AS kind,
+          e.*,
+          m.external_id AS meeting_external_id,
+          m.title AS meeting_title,
+          COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
+          c.external_id AS chunk_external_id,
+          c.kind AS chunk_kind,
+          c.speaker AS chunk_speaker,
+          c.timestamp_label AS chunk_timestamp_label
+        FROM risks e
+        JOIN meetings m ON m.id = e.meeting_id
+        LEFT JOIN chunks c ON c.id = e.source_chunk_id
+        ORDER BY meeting_date DESC, e.ordinal ASC
+        LIMIT ?
+    """,
+    "open_questions": """
+        SELECT
+          'open_questions' AS kind,
+          e.*,
+          m.external_id AS meeting_external_id,
+          m.title AS meeting_title,
+          COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
+          c.external_id AS chunk_external_id,
+          c.kind AS chunk_kind,
+          c.speaker AS chunk_speaker,
+          c.timestamp_label AS chunk_timestamp_label
+        FROM open_questions e
+        JOIN meetings m ON m.id = e.meeting_id
+        LEFT JOIN chunks c ON c.id = e.source_chunk_id
+        ORDER BY meeting_date DESC, e.ordinal ASC
+        LIMIT ?
+    """,
+}
 
 
 @dataclass(frozen=True)
@@ -242,10 +361,15 @@ class IndexRepository:
             return meeting_id, updated, inserted_chunks
 
     def _delete_meeting_children(self, conn: sqlite3.Connection, meeting_id: int) -> None:
+        self._delete_structured_entities(conn, meeting_id)
         conn.execute("DELETE FROM chunks_fts WHERE meeting_id = ?", (meeting_id,))
         conn.execute("DELETE FROM meeting_people WHERE meeting_id = ?", (meeting_id,))
         conn.execute("DELETE FROM chunks WHERE meeting_id = ?", (meeting_id,))
         conn.execute("DELETE FROM artifacts WHERE meeting_id = ?", (meeting_id,))
+
+    def _delete_structured_entities(self, conn: sqlite3.Connection, meeting_id: int) -> None:
+        for sql in ENTITY_DELETE_SQL.values():
+            conn.execute(sql, (meeting_id,))
 
     def _link_person(self, conn: sqlite3.Connection, meeting_id: int, display_name: str) -> None:
         normalized = display_name.casefold().strip()
@@ -282,6 +406,70 @@ class IndexRepository:
                 "SELECT * FROM chunks WHERE meeting_id = ? ORDER BY ordinal",
                 (meeting_id,),
             ).fetchall()
+            return rows_to_dicts(rows)
+
+    def replace_structured_entities(
+        self,
+        meeting_id: int,
+        entities: Iterable[StructuredEntity],
+        now: str,
+    ) -> dict[str, int]:
+        counts = empty_entity_counts()
+        with index_connection(self.index_path) as conn:
+            self._delete_structured_entities(conn, meeting_id)
+            for entity in entities:
+                assert_known_entity_kind(entity.kind)
+                conn.execute(
+                    ENTITY_INSERT_SQL[entity.kind],
+                    (
+                        meeting_id,
+                        entity.source_chunk_id,
+                        entity.ordinal,
+                        entity.text,
+                        entity.source,
+                        entity.confidence,
+                        entity.fingerprint,
+                        now,
+                        now,
+                        entity.raw_metadata_json,
+                    ),
+                )
+                counts[entity.kind] += 1
+            conn.commit()
+            return counts
+
+    def list_meeting_ids(self) -> list[int]:
+        with index_connection(self.index_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM meetings
+                ORDER BY COALESCE(updated_at, created_at, indexed_at) DESC
+                """
+            ).fetchall()
+            return [int(row["id"]) for row in rows]
+
+    def list_structured_entities(
+        self,
+        meeting_id: int,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if kind is not None:
+            assert_known_entity_kind(kind)
+            kinds = (kind,)
+        else:
+            kinds = ENTITY_KINDS
+        with index_connection(self.index_path) as conn:
+            rows: list[dict[str, Any]] = []
+            for entity_kind in kinds:
+                entity_rows = conn.execute(ENTITY_SELECT_SQL[entity_kind], (meeting_id,)).fetchall()
+                rows.extend({"kind": entity_kind, **dict(row)} for row in entity_rows)
+            return rows
+
+    def list_structured_entity_details(self, kind: str, limit: int = 20) -> list[dict[str, Any]]:
+        assert_known_entity_kind(kind)
+        with index_connection(self.index_path) as conn:
+            rows = conn.execute(ENTITY_DETAIL_SQL[kind], (limit,)).fetchall()
             return rows_to_dicts(rows)
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -409,11 +597,14 @@ class IndexRepository:
 
     def stats(self) -> dict[str, int]:
         with index_connection(self.index_path) as conn:
-            return {
+            stats = {
                 "meetings": int(conn.execute("SELECT COUNT(*) FROM meetings").fetchone()[0]),
                 "chunks": int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),
                 "sources": int(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]),
             }
+            for kind in ENTITY_KINDS:
+                stats[kind] = int(conn.execute(ENTITY_COUNT_SQL[kind]).fetchone()[0])
+            return stats
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -430,6 +621,12 @@ def build_fts_query(text: str) -> str:
         dict.fromkeys(token for token in tokens if len(token) > 1 and token not in FTS_STOPWORDS)
     )
     return " OR ".join(f'"{token}"' for token in unique_tokens[:MAX_FTS_QUERY_TOKENS])
+
+
+def assert_known_entity_kind(kind: str) -> None:
+    if kind not in ENTITY_KINDS:
+        message = f"Unknown structured entity kind: {kind}"
+        raise ValueError(message)
 
 
 def last_insert_id(cursor: sqlite3.Cursor) -> int:

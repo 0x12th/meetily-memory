@@ -76,10 +76,10 @@ def meetily_db(tmp_path: Path) -> Path:
         """,
         (
             "meeting-2",
-            "Robert Follow-up",
+            "Vladimir Follow-up",
             "2026-07-02T09:00:00Z",
             "2026-07-02T09:30:00Z",
-            str(tmp_path / "Robert Follow-up"),
+            str(tmp_path / "Vladimir Follow-up"),
         ),
     )
     conn.executemany(
@@ -104,12 +104,22 @@ def meetily_db(tmp_path: Path) -> Path:
             (
                 "transcript-2",
                 "meeting-2",
-                "Robert agreed to send migration risks by Friday.",
+                "Vladimir agreed to send migration risks by Friday.",
                 "09:10:00",
                 600.0,
                 620.0,
                 20.0,
-                "Robert",
+                "Vladimir",
+            ),
+            (
+                "transcript-3",
+                "meeting-1",
+                "Open question: who owns partner review?",
+                "10:15:00",
+                900.0,
+                910.0,
+                10.0,
+                "Alice",
             ),
         ],
     )
@@ -138,7 +148,7 @@ def meetily_db(tmp_path: Path) -> Path:
         """,
         (
             "meeting-2",
-            "Robert owns the migration risk list.",
+            "Vladimir owns the migration risk list.",
             None,
             "2026-07-02T09:31:00Z",
             "2026-07-02T09:32:00Z",
