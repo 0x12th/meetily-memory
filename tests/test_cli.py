@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -104,8 +105,9 @@ def test_cli_lists_structured_entities_with_source_evidence(
 
     risks_json = runner.invoke(app, ["--index", str(index_path), "risks", "--json"])
     assert risks_json.exit_code == 0
-    assert '"kind":"risks"' in risks_json.stdout
-    assert '"meeting_external_id":"meeting-2"' in risks_json.stdout
+    risks_payload = json.loads(risks_json.stdout)
+    assert risks_payload[0]["kind"] == "risks"
+    assert risks_payload[0]["meeting_external_id"] == "meeting-2"
 
     questions = runner.invoke(app, ["--index", str(index_path), "questions"])
     assert questions.exit_code == 0

@@ -33,6 +33,17 @@ def _index_option(
     return index or default_index_path()
 
 
+def print_json(payload: object) -> None:
+    sys.stdout.write(dumps_json(payload))
+    sys.stdout.write("\n")
+
+
+def print_text_block(text: str) -> None:
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+
+
 @app.callback()
 def callback(
     ctx: typer.Context,
@@ -72,7 +83,7 @@ def scan(
         "chunks_updated": result.chunks_updated,
     }
     if json_output:
-        console.print(dumps_json(payload))
+        print_json(payload)
         return
     console.print(f"meetings seen: {result.meetings_seen}")
     console.print(f"meetings inserted: {result.meetings_inserted}")
@@ -102,7 +113,7 @@ def analyze(
 
     payload = result.as_payload()
     if json_output:
-        console.print(dumps_json(payload))
+        print_json(payload)
         return
     console.print(f"meetings analyzed: {payload['meetings_analyzed']}")
     console.print(f"decisions: {payload['decisions']}")
@@ -121,7 +132,7 @@ def search(
     repo = IndexRepository(ctx.obj["index_path"])
     results = repo.search(query, limit)
     if json_output:
-        console.print(dumps_json(results))
+        print_json(results)
         return
     for result in results:
         console.print(f"{result['title']} [{result['meeting_external_id']}]")
@@ -136,7 +147,7 @@ def context(
 ) -> None:
     repo = IndexRepository(ctx.obj["index_path"])
     results = repo.search(question, limit)
-    console.print(build_context_markdown(question, results))
+    print_text_block(build_context_markdown(question, results))
 
 
 @app.command("ls")
@@ -148,7 +159,7 @@ def list_meetings(
     repo = IndexRepository(ctx.obj["index_path"])
     rows = repo.list_meetings(limit)
     if json_output:
-        console.print(dumps_json(rows))
+        print_json(rows)
         return
     table = Table("id", "title", "updated", "chunks")
     for row in rows:
@@ -175,7 +186,7 @@ def last(
         raise typer.Exit(1)
     meeting = rows[0]
     if json_output:
-        console.print(dumps_json(meeting))
+        print_json(meeting)
         return
     console.print(f"{meeting['title']} [{meeting['external_id']}]")
     if summary and meeting.get("summary_text"):
@@ -197,7 +208,7 @@ def person(
     repo = IndexRepository(ctx.obj["index_path"])
     rows = repo.list_meetings(limit=limit, person=name)
     if json_output:
-        console.print(dumps_json(rows))
+        print_json(rows)
         return
     for row in rows:
         console.print(f"{row['title']} [{row['external_id']}]")
@@ -249,7 +260,7 @@ def print_structured_entities(
     repo = IndexRepository(ctx.obj["index_path"])
     rows = repo.list_structured_entity_details(kind, limit)
     if json_output:
-        console.print(dumps_json(rows))
+        print_json(rows)
         return
     if not rows:
         console.print("No structured entities found. Run `mm analyze` after scanning.")
@@ -263,12 +274,12 @@ def print_structured_entities(
         source = " / ".join(part for part in source_parts if part)
         if row.get("chunk_timestamp_label"):
             source = f"{source} @ {row['chunk_timestamp_label']}"
-        console.print(f"{row['meeting_title']} [{row['meeting_external_id']}]")
-        console.print(f"Date: {row.get('meeting_date') or ''}")
-        console.print(f"Source: {source}")
-        console.print(f"confidence: {float(row['confidence']):.2f}")
-        console.print(str(row["text"]))
-        console.print()
+        print_text_block(f"{row['meeting_title']} [{row['meeting_external_id']}]")
+        print_text_block(f"Date: {row.get('meeting_date') or ''}")
+        print_text_block(f"Source: {source}")
+        print_text_block(f"confidence: {float(row['confidence']):.2f}")
+        print_text_block(str(row["text"]))
+        sys.stdout.write("\n")
 
 
 @app.command("open")
@@ -314,7 +325,7 @@ def doctor(
         **stats,
     }
     if json_output:
-        console.print(dumps_json(payload))
+        print_json(payload)
         return
     console.print(f"index path: {index_path}")
     console.print(f"source path: {source_path or 'not found'}")
