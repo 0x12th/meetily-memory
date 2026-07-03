@@ -28,6 +28,16 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert "Launch Planning" in search.stdout
     assert "pricing decision" in search.stdout
 
+    context = runner.invoke(app, ["--index", str(index_path), "c", "Who owns migration risks?"])
+    assert context.exit_code == 0
+    assert "# Question" in context.stdout
+    assert "# Relevant meetings" in context.stdout
+    assert "## Meeting: Robert Follow-up" in context.stdout
+    assert "Date: 2026-07-02T09:30:00Z" in context.stdout
+    assert "### Relevant excerpt" in context.stdout
+    assert "Robert agreed to send migration risks by Friday." in context.stdout
+    assert context.stdout.count("Who owns migration risks?") == 2
+
     listing = runner.invoke(app, ["--index", str(index_path), "ls"])
     assert listing.exit_code == 0
     assert "Robert Follow-up" in listing.stdout

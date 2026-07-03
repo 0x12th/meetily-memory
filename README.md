@@ -54,6 +54,7 @@ uv sync
 uv run mm doctor --source /path/to/meeting_minutes.sqlite
 uv run mm scan --source /path/to/meeting_minutes.sqlite
 uv run mm s "pricing decision"
+uv run mm c "what did we decide about pricing?"
 uv run mm ls
 uv run mm last
 uv run mm last --person Robert
@@ -73,6 +74,7 @@ uv run mm --index /path/to/index.sqlite scan --source /path/to/meeting_minutes.s
 mm doctor
 mm scan
 mm s "query"
+mm c "question"
 mm ls
 mm last
 mm last --person "Robert"

@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from meetily_memory.db.repository import IndexRepository
+from meetily_memory.context_builder import build_context_markdown
+from meetily_memory.db.repository import IndexRepository, build_fts_query
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
 
@@ -60,6 +61,22 @@ def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path:
     search_results = repo.search("pricing decision")
     assert search_results[0]["meeting_external_id"] == "meeting-1"
     assert "pricing decision" in search_results[0]["text"]
+
+    question_results = repo.search("What was the pricing decision?")
+    assert question_results[0]["meeting_external_id"] == "meeting-1"
+
+    context = build_context_markdown("What was the pricing decision?", question_results)
+    assert context.startswith("# Question\n\nWhat was the pricing decision?")
+    assert "## Meeting: Launch Planning" in context
+    assert "### Relevant excerpt" in context
+    assert context.endswith("# Question\n\nWhat was the pricing decision?\n")
+
+
+def test_fts_query_filters_natural_language_noise() -> None:
+    assert build_fts_query("What was the pricing decision?") == '"pricing" OR "decision"'
+    assert (
+        build_fts_query("что решили про migration risks?") == '"решили" OR "migration" OR "risks"'
+    )
 
 
 def test_scan_is_incremental_and_replaces_changed_meeting_chunks(

@@ -1,3 +1,4 @@
+import re
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
@@ -5,6 +6,43 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from meetily_memory.db.schema import index_connection
+
+FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+MAX_FTS_QUERY_TOKENS = 16
+FTS_STOPWORDS = frozenset(
+    {
+        "a",
+        "about",
+        "and",
+        "are",
+        "by",
+        "did",
+        "do",
+        "for",
+        "how",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "was",
+        "we",
+        "what",
+        "when",
+        "where",
+        "who",
+        "why",
+        "как",
+        "кто",
+        "мы",
+        "на",
+        "по",
+        "про",
+        "что",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -247,7 +285,8 @@ class IndexRepository:
             return rows_to_dicts(rows)
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        if not query.strip():
+        fts_query = build_fts_query(query)
+        if not fts_query:
             return []
         with index_connection(self.index_path) as conn:
             rows = conn.execute(
@@ -275,7 +314,7 @@ class IndexRepository:
                 ORDER BY f.rank
                 LIMIT ?
                 """,
-                (query, limit),
+                (fts_query, limit),
             ).fetchall()
             return rows_to_dicts(rows)
 
@@ -383,6 +422,14 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+def build_fts_query(text: str) -> str:
+    tokens = [token.casefold() for token in FTS_TOKEN_RE.findall(text)]
+    unique_tokens = list(
+        dict.fromkeys(token for token in tokens if len(token) > 1 and token not in FTS_STOPWORDS)
+    )
+    return " OR ".join(f'"{token}"' for token in unique_tokens[:MAX_FTS_QUERY_TOKENS])
 
 
 def last_insert_id(cursor: sqlite3.Cursor) -> int:

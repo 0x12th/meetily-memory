@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.table import Table
 
 from meetily_memory.config.paths import default_index_path, discover_meetily_db
+from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, build_context_markdown
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import dumps_json
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
@@ -87,6 +88,17 @@ def search(
     for result in results:
         console.print(f"{result['title']} [{result['meeting_external_id']}]")
         console.print(result["text"])
+
+
+@app.command("c")
+def context(
+    ctx: typer.Context,
+    question: str,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = DEFAULT_CONTEXT_LIMIT,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    results = repo.search(question, limit)
+    console.print(build_context_markdown(question, results))
 
 
 @app.command("ls")
