@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test before release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --dev --python 3.12
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run ty check --error all
+      - run: uv run pytest -q
+
+  build-macos:
+    name: Build ${{ matrix.suffix }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            suffix: macos-arm64
+          - os: macos-26-intel
+            suffix: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --dev --python 3.12
+      - run: scripts/build-binary.sh
+      - run: scripts/package-release-asset.sh "${{ github.ref_name }}" "${{ matrix.suffix }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meetily-memory-${{ github.ref_name }}-${{ matrix.suffix }}
+          path: target/release-assets/meetily-memory-${{ github.ref_name }}-${{ matrix.suffix }}.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: target/release-assets
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd target/release-assets
+          sha256sum *.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGELOG.md
+          files: |
+            target/release-assets/*.tar.gz
+            target/release-assets/SHA256SUMS

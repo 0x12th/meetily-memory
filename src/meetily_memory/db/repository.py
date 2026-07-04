@@ -10,6 +10,7 @@ from meetily_memory.meeting_structure import ENTITY_KINDS, StructuredEntity, emp
 
 FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 MAX_FTS_QUERY_TOKENS = 16
+NO_MATCH_FTS_QUERY = '"meetilymemorynomatchtoken"'
 FTS_STOPWORDS = frozenset(
     {
         "a",
@@ -509,25 +510,29 @@ class IndexRepository:
     def list_meetings(self, limit: int = 20, person: str | None = None) -> list[dict[str, Any]]:
         params: list[Any] = []
         if person:
+            fts_query = build_fts_query(person) or NO_MATCH_FTS_QUERY
             person_like = f"%{person.casefold()}%"
-            params.extend([person_like, person_like, person_like])
+            params.extend([person_like, fts_query])
             sql = """
                 SELECT
                   m.*,
                   COUNT(c.id) AS chunk_count
                 FROM meetings m
                 LEFT JOIN chunks c ON c.meeting_id = m.id
-                WHERE EXISTS (
-                  SELECT 1
-                  FROM chunks person_chunks
-                  LEFT JOIN people p ON p.normalized_name LIKE ?
-                  LEFT JOIN meeting_people mp ON mp.person_id = p.id AND mp.meeting_id = m.id
-                  WHERE person_chunks.meeting_id = m.id
-                    AND (
-                      lower(COALESCE(person_chunks.speaker, '')) LIKE ?
-                      OR lower(person_chunks.text) LIKE ?
-                      OR mp.meeting_id IS NOT NULL
-                    )
+                WHERE (
+                  EXISTS (
+                    SELECT 1
+                    FROM meeting_people mp
+                    JOIN people p ON p.id = mp.person_id
+                    WHERE mp.meeting_id = m.id
+                      AND p.normalized_name LIKE ?
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                    FROM chunks_fts
+                    WHERE chunks_fts.meeting_id = m.id
+                      AND chunks_fts MATCH ?
+                  )
                 )
                 GROUP BY m.id
                 ORDER BY COALESCE(m.updated_at, m.created_at, m.indexed_at) DESC

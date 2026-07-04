@@ -121,6 +121,16 @@ def meetily_db(tmp_path: Path) -> Path:
                 10.0,
                 "Alice",
             ),
+            (
+                "transcript-4",
+                "meeting-2",
+                "Никита подтвердил план миграции.",
+                "09:20:00",
+                1200.0,
+                1210.0,
+                10.0,
+                None,
+            ),
         ],
     )
     conn.execute(

@@ -6,10 +6,7 @@ from typer.testing import CliRunner
 from meetily_memory.cli.app import app
 
 
-def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    runner = CliRunner()
-
+def scan_twice(runner: CliRunner, index_path: Path, meetily_db: Path) -> None:
     scan = runner.invoke(
         app,
         ["--index", str(index_path), "scan", "--source", str(meetily_db)],
@@ -24,10 +21,19 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert force_scan.exit_code == 0
     assert "meetings updated: 2" in force_scan.stdout
 
+
+def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    scan_twice(runner, index_path, meetily_db)
+
     search = runner.invoke(app, ["--index", str(index_path), "s", "pricing decision"])
     assert search.exit_code == 0
     assert "Launch Planning" in search.stdout
     assert "pricing decision" in search.stdout
+    assert "chunk #" in search.stdout
+    assert "open: mm open 1" in search.stdout
 
     context = runner.invoke(app, ["--index", str(index_path), "c", "Who owns migration risks?"])
     assert context.exit_code == 0
@@ -50,6 +56,7 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert listing.exit_code == 0
     assert "Vladimir Follow-up" in listing.stdout
     assert "Launch Planning" in listing.stdout
+    assert "mm open 1" in listing.stdout
 
     last_for_person = runner.invoke(
         app, ["--index", str(index_path), "last", "--person", "Vladimir"]
@@ -60,6 +67,12 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     person = runner.invoke(app, ["--index", str(index_path), "p", "Vladimir"])
     assert person.exit_code == 0
     assert "Vladimir Follow-up" in person.stdout
+    assert "mm open 2" in person.stdout
+
+    cyrillic_person = runner.invoke(app, ["--index", str(index_path), "p", "Никита"])
+    assert cyrillic_person.exit_code == 0
+    assert "Vladimir Follow-up" in cyrillic_person.stdout
+    assert "mm open 2" in cyrillic_person.stdout
 
     doctor = runner.invoke(
         app,

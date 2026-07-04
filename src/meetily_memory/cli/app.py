@@ -44,6 +44,29 @@ def print_text_block(text: str) -> None:
         sys.stdout.write("\n")
 
 
+def meeting_label(row: dict[str, object]) -> str:
+    date = compact_date(row.get("updated_at") or row.get("created_at"))
+    suffix = f" ({date})" if date else ""
+    return f"#{row['id']} {row['title']}{suffix}"
+
+
+def print_meeting_table(rows: list[dict[str, object]]) -> None:
+    table = Table("id", "date", "chunks", "open", "title")
+    for row in rows:
+        table.add_row(
+            str(row["id"]),
+            compact_date(row.get("updated_at") or row.get("created_at")),
+            str(row["chunk_count"]),
+            f"mm open {row['id']}",
+            str(row["title"]),
+        )
+    console.print(table)
+
+
+def compact_date(value: object) -> str:
+    return str(value or "")[:10]
+
+
 @app.callback()
 def callback(
     ctx: typer.Context,
@@ -135,8 +158,18 @@ def search(
         print_json(results)
         return
     for result in results:
-        console.print(f"{result['title']} [{result['meeting_external_id']}]")
+        date = compact_date(result.get("updated_at") or result.get("created_at"))
+        suffix = f" ({date})" if date else ""
+        console.print(f"#{result['meeting_id']} {result['title']}{suffix}")
+        source_parts = [
+            f"chunk #{result['chunk_id']}",
+            f"open: mm open {result['meeting_id']}",
+        ]
+        if result.get("timestamp_label"):
+            source_parts.insert(0, str(result["timestamp_label"]))
+        console.print(" | ".join(source_parts))
         console.print(result["text"])
+        console.print()
 
 
 @app.command("c")
@@ -161,15 +194,7 @@ def list_meetings(
     if json_output:
         print_json(rows)
         return
-    table = Table("id", "title", "updated", "chunks")
-    for row in rows:
-        table.add_row(
-            row["external_id"],
-            row["title"],
-            row.get("updated_at") or "",
-            str(row["chunk_count"]),
-        )
-    console.print(table)
+    print_meeting_table(rows)
 
 
 @app.command()
@@ -188,7 +213,8 @@ def last(
     if json_output:
         print_json(meeting)
         return
-    console.print(f"{meeting['title']} [{meeting['external_id']}]")
+    console.print(meeting_label(meeting))
+    console.print(f"open: mm open {meeting['id']}")
     if summary and meeting.get("summary_text"):
         console.print(meeting["summary_text"])
     if transcript:
@@ -210,8 +236,7 @@ def person(
     if json_output:
         print_json(rows)
         return
-    for row in rows:
-        console.print(f"{row['title']} [{row['external_id']}]")
+    print_meeting_table(rows)
 
 
 @app.command("decisions")

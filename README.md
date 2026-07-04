@@ -27,7 +27,21 @@ Meetily history -> local sync -> search -> LLM context
 
 ## Install
 
-From the repository:
+For macOS, the release channel is a Homebrew tap. After a release is published
+and the tap formula is updated:
+
+```bash
+brew tap 0x12th/meetily-memory
+brew install meetily-memory
+```
+
+Then run:
+
+```bash
+mm --help
+```
+
+From a local checkout:
 
 ```bash
 uv sync
@@ -41,32 +55,35 @@ uv run mm --help
 
 The CLI is exposed as both `meetily-memory` and `mm`.
 
+If you are running from a checkout instead of Homebrew, prefix commands below
+with `uv run`.
+
 ## First Run
 
 Meetily Memory can often find the Meetily database automatically:
 
 ```bash
-uv run mm doctor
-uv run mm scan
+mm doctor
+mm scan
 ```
 
 If autodiscovery does not find it, pass the source explicitly:
 
 ```bash
-uv run mm doctor --source /path/to/meeting_minutes.sqlite
+mm doctor --source /path/to/meeting_minutes.sqlite
 ```
 
 Then sync it into the private local index:
 
 ```bash
-uv run mm scan --source /path/to/meeting_minutes.sqlite
+mm scan --source /path/to/meeting_minutes.sqlite
 ```
 
 Now try the two main workflows:
 
 ```bash
-uv run mm s "pricing decision"
-uv run mm c "what did we decide about pricing?"
+mm s "pricing decision"
+mm c "what did we decide about pricing?"
 ```
 
 `mm s` searches the meeting history. `mm c` builds Markdown context you can
@@ -78,7 +95,7 @@ paste into ChatGPT, Claude, or another LLM.
 |---|---|
 | `mm doctor` | Checks autodiscovery, the Meetily DB, local index path, SQLite, and FTS5. |
 | `mm scan` | Syncs Meetily history into the local `index.sqlite`. |
-| `mm s "query"` | Searches transcript chunks with SQLite FTS5. |
+| `mm s "query"` | Searches transcript chunks and shows meeting/chunk ids plus `mm open` hints. |
 | `mm c "question"` | Builds LLM-ready Markdown context from relevant meetings. |
 | `mm analyze` | Extracts decisions, action items, risks, and open questions. |
 | `mm decisions` | Lists extracted decisions with meeting and source chunk evidence. |
@@ -86,20 +103,22 @@ paste into ChatGPT, Claude, or another LLM.
 | `mm risks` | Lists extracted risks with meeting and source chunk evidence. |
 | `mm questions` | Lists extracted open questions with meeting and source chunk evidence. |
 | `mm last` | Shows the latest indexed meeting. |
-| `mm p "Vladimir"` | Finds recent meetings related to a person, best-effort. |
+| `mm p "Vladimir"` | Finds recent meetings related to a person and shows ids usable with `mm open`. |
 | `mm open <meeting-id>` | Opens the source meeting folder or prints its path. |
 
 ## Example Workflow
 
 ```bash
-uv run mm doctor --source ~/Library/Application\ Support/com.meetily.ai/meeting_minutes.sqlite
-uv run mm scan --source ~/Library/Application\ Support/com.meetily.ai/meeting_minutes.sqlite
-uv run mm analyze
+mm doctor --source ~/Library/Application\ Support/com.meetily.ai/meeting_minutes.sqlite
+mm scan --source ~/Library/Application\ Support/com.meetily.ai/meeting_minutes.sqlite
+mm analyze
 
-uv run mm s "migration risk"
-uv run mm c "what risks did we discuss for the migration?"
-uv run mm risks
-uv run mm last --person Vladimir
+mm s "migration risk"
+mm c "what risks did we discuss for the migration?"
+mm risks
+mm last --person Vladimir
+mm p "Vladimir"
+mm open 2
 ```
 
 ## Source Discovery
@@ -124,15 +143,15 @@ export MEETILY_MEMORY_SOURCE=/path/to/meeting_minutes.sqlite
 Then run:
 
 ```bash
-uv run mm doctor
-uv run mm scan
+mm doctor
+mm scan
 ```
 
 By default, Meetily Memory stores its own index in the platform data directory
 via `platformdirs`. Override it when needed:
 
 ```bash
-uv run mm --index /path/to/index.sqlite scan --source /path/to/meeting_minutes.sqlite
+mm --index /path/to/index.sqlite scan --source /path/to/meeting_minutes.sqlite
 ```
 
 ## Data Contract
