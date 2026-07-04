@@ -1,9 +1,38 @@
 import json
+from importlib.metadata import version
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
+
+
+def test_cli_help_uses_plain_click_format() -> None:
+    runner = CliRunner()
+
+    help_result = runner.invoke(app, ["--help"])
+    assert help_result.exit_code == 0
+    assert "Options:" in help_result.stdout
+    assert "Commands:" in help_result.stdout
+    assert "--version" in help_result.stdout
+    assert "--install-completion" not in help_result.stdout
+    assert "--show-completion" not in help_result.stdout
+    assert "╭" not in help_result.stdout
+
+    spotlight_help = runner.invoke(app, ["spotlight", "--help"])
+    assert spotlight_help.exit_code == 0
+    assert "Options:" in spotlight_help.stdout
+    assert "Commands:" in spotlight_help.stdout
+    assert "╭" not in spotlight_help.stdout
+
+
+def test_cli_version_outputs_package_version() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.stdout == f"meetily-memory {version('meetily-memory')}\n"
 
 
 def scan_twice(runner: CliRunner, index_path: Path, meetily_db: Path) -> None:

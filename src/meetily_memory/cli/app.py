@@ -2,6 +2,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import closing
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Annotated
 
@@ -9,6 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from meetily_memory import __version__ as fallback_version
 from meetily_memory.config.paths import default_index_path, discover_meetily_db
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, build_context_markdown
 from meetily_memory.db.repository import IndexRepository
@@ -21,8 +23,24 @@ from meetily_memory.spotlight_export import (
 )
 from meetily_memory.structure_analyzer import StructureAnalyzer
 
-app = typer.Typer(no_args_is_help=True, help="Local Meetily history index.")
-spotlight_app = typer.Typer(no_args_is_help=True, help="Export Spotlight-friendly files.")
+PACKAGE_NAME = "meetily-memory"
+
+app = typer.Typer(
+    no_args_is_help=True,
+    help="Local Meetily history index.",
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    rich_markup_mode=None,
+    suggest_commands=False,
+)
+spotlight_app = typer.Typer(
+    no_args_is_help=True,
+    help="Export Spotlight-friendly files.",
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    rich_markup_mode=None,
+    suggest_commands=False,
+)
 app.add_typer(spotlight_app, name="spotlight")
 console = Console()
 ENTITY_COMMANDS = {
@@ -37,6 +55,19 @@ def _index_option(
     index: Path | None,
 ) -> Path:
     return index or default_index_path()
+
+
+def package_version() -> str:
+    try:
+        return version(PACKAGE_NAME)
+    except PackageNotFoundError:
+        return fallback_version
+
+
+def version_callback(value: bool) -> None:  # noqa: FBT001
+    if value:
+        print_text_block(f"{PACKAGE_NAME} {package_version()}")
+        raise typer.Exit
 
 
 def print_json(payload: object) -> None:
@@ -80,7 +111,17 @@ def callback(
         Path | None,
         typer.Option("--index", help="Path to Meetily Memory index.sqlite."),
     ] = None,
+    version_output: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=version_callback,
+            help="Show version and exit.",
+            is_eager=True,
+        ),
+    ] = False,
 ) -> None:
+    del version_output
     ctx.obj = {"index_path": _index_option(index)}
 
 
