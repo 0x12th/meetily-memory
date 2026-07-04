@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add SQLite knowledge nodes/edges, topic memory, topic graph projection, and local task status overrides.
 - License the project under Apache License 2.0.
 - Up perfomance.
 

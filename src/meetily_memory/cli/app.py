@@ -4,7 +4,7 @@ import sys
 from contextlib import closing
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import typer
 from rich.console import Console
@@ -673,6 +673,73 @@ def person_memory(
     print_grouped_entity_bullets(memory.structured_signals)
 
 
+@app.command("topic")
+def topic_memory(
+    ctx: typer.Context,
+    query: str,
+    alias: Annotated[
+        list[str] | None,
+        typer.Option("--alias", help="Add an alias for this topic."),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    if alias:
+        topic = repo.ensure_topic(query, aliases=alias)
+        if json_output:
+            print_json(topic)
+            return
+        for added_alias in topic["added_aliases"]:
+            print_text_block(f"alias added: {added_alias} -> {topic['title']}")
+    memory = repo.topic_memory(query, limit)
+    if json_output:
+        print_json(memory)
+        return
+    print_topic_memory(memory)
+
+
+@app.command("graph")
+def graph(
+    ctx: typer.Context,
+    query: str,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 50,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    payload = repo.graph_for_topic(query, limit)
+    if json_output:
+        print_json(payload)
+        return
+    print_text_block(f"Graph: {payload['topic']['title']}")
+    for edge in payload["edges"]:
+        from_node = graph_node_title(payload["nodes"], int(edge["from_node_id"]))
+        to_node = graph_node_title(payload["nodes"], int(edge["to_node_id"]))
+        print_text_block(f"- [[{from_node}]] --{edge['relation']}--> [[{to_node}]]")
+
+
+@app.command("task-status")
+def task_status(
+    ctx: typer.Context,
+    task_id: int,
+    status: str,
+    note: Annotated[str | None, typer.Option("--note")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    try:
+        row = repo.set_task_status(task_id, status, note=note)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        print_json(row)
+        return
+    print_text_block(f"task status: {row['status']}")
+    print_text_block(str(row["text"]))
+    if row.get("status_note"):
+        print_text_block(str(row["status_note"]))
+
+
 @app.command("decisions")
 def decisions(
     ctx: typer.Context,
@@ -686,9 +753,16 @@ def decisions(
 def tasks(
     ctx: typer.Context,
     limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    status: Annotated[str, typer.Option("--status")] = "open",
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    print_structured_entities(ctx, ENTITY_COMMANDS["tasks"], limit, json_output=json_output)
+    print_structured_entities(
+        ctx,
+        ENTITY_COMMANDS["tasks"],
+        limit,
+        json_output=json_output,
+        status=status,
+    )
 
 
 @app.command("risks")
@@ -715,9 +789,13 @@ def print_structured_entities(
     limit: int,
     *,
     json_output: bool,
+    status: str = "all",
 ) -> None:
     repo = IndexRepository(ctx.obj["index_path"])
-    rows = repo.list_structured_entity_details(kind, limit)
+    try:
+        rows = repo.list_structured_entity_details(kind, limit, status=status)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if json_output:
         print_json(rows)
         return
@@ -738,6 +816,10 @@ def print_structured_entities(
         print_text_block(f"Date: {row.get('meeting_date') or ''}")
         print_text_block(f"Source: {source}")
         print_text_block(f"confidence: {float(row['confidence']):.2f}")
+        if kind == "action_items":
+            print_text_block(f"status: {row.get('status', 'open')}")
+            if row.get("status_note"):
+                print_text_block(f"status note: {row['status_note']}")
         print_text_block(str(row["text"]))
         sys.stdout.write("\n")
 
@@ -779,7 +861,7 @@ def print_entity_bullets(rows: list[dict[str, object]]) -> None:
         return
     for row in rows:
         label = ENTITY_LABELS.get(str(row["kind"]), str(row["kind"]))
-        print_text_block(f"- {label}: {row['text']} ({entity_source(row)})")
+        print_text_block(f"- {label}: {row['text']} | Source: {entity_source(row)}")
 
 
 def print_grouped_entity_bullets(rows: list[dict[str, object]]) -> None:
@@ -792,6 +874,46 @@ def print_grouped_entity_bullets(rows: list[dict[str, object]]) -> None:
             continue
         print_text_block(f"\n{ENTITY_LABELS[kind]}")
         print_entity_bullets(kind_rows)
+
+
+def print_topic_memory(memory: dict[str, object]) -> None:
+    topic = cast("dict[str, object]", memory["topic"])
+    print_text_block(f"Topic memory: {topic['title']}")
+    aliases = cast("list[str]", topic.get("aliases", []))
+    for alias in aliases:
+        print_text_block(f"alias: {alias}")
+    print_text_block("\nRelated meetings")
+    print_search_meeting_summaries(cast("list[dict[str, object]]", memory["meetings"]))
+    print_text_block("Latest decisions")
+    print_entity_bullets(entity_rows_for_kind(memory, "decisions"))
+    print_text_block("Unresolved tasks")
+    open_tasks = [
+        row
+        for row in entity_rows_for_kind(memory, "action_items")
+        if row.get("status", "open") in {"open", "unknown"}
+    ]
+    print_entity_bullets(open_tasks)
+    print_text_block("Active risks")
+    print_entity_bullets(entity_rows_for_kind(memory, "risks"))
+    print_text_block("Open questions")
+    print_entity_bullets(entity_rows_for_kind(memory, "open_questions"))
+    people = cast("list[dict[str, object]]", memory.get("related_people", []))
+    if people:
+        print_text_block("Related people")
+        for person in people:
+            print_text_block(f"- {person['display_name']}")
+
+
+def entity_rows_for_kind(memory: dict[str, object], kind: str) -> list[dict[str, object]]:
+    rows = cast("list[dict[str, object]]", memory.get("structured_signals", []))
+    return [row for row in rows if row["kind"] == kind]
+
+
+def graph_node_title(nodes: list[dict[str, object]], node_id: int) -> str:
+    for node in nodes:
+        if int(str(node["id"])) == node_id:
+            return str(node["title"])
+    return str(node_id)
 
 
 def entity_source(row: dict[str, object]) -> str:

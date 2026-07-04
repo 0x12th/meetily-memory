@@ -293,8 +293,8 @@ def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
 
     assert status.exit_code == 0
     assert f"index path: {index_path}" in status.stdout
-    assert "schema version: 2" in status.stdout
-    assert "current schema version: 2" in status.stdout
+    assert "schema version: 3" in status.stdout
+    assert "current schema version: 3" in status.stdout
 
 
 def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path: Path) -> None:
@@ -428,6 +428,72 @@ def test_cli_local_memory_commands_aggregate_across_meetings(
     assert "Vladimir Follow-up" in person.stdout
     assert "Action items" in person.stdout
     assert "Vladimir agreed to send migration risks by Friday." in person.stdout
+
+
+def test_cli_v5_topic_graph_alias_and_task_status_memory(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    topic = runner.invoke(app, ["--index", str(index_path), "topic", "migration"])
+    assert topic.exit_code == 0
+    assert "Topic memory: migration" in topic.stdout
+    assert "Unresolved tasks" in topic.stdout
+    assert "Vladimir agreed to send migration risks by Friday." in topic.stdout
+    assert "Source: meeting-2 / transcript-2" in topic.stdout
+
+    alias = runner.invoke(
+        app,
+        ["--index", str(index_path), "topic", "migration", "--alias", "миграция"],
+    )
+    assert alias.exit_code == 0
+    assert "alias added: миграция -> migration" in alias.stdout
+
+    alias_lookup = runner.invoke(app, ["--index", str(index_path), "topic", "миграция"])
+    assert alias_lookup.exit_code == 0
+    assert "Topic memory: migration" in alias_lookup.stdout
+    assert "alias: миграция" in alias_lookup.stdout
+
+    graph = runner.invoke(app, ["--index", str(index_path), "graph", "migration", "--json"])
+    assert graph.exit_code == 0
+    graph_payload = json.loads(graph.stdout)
+    assert graph_payload["topic"]["title"] == "migration"
+    assert {node["type"] for node in graph_payload["nodes"]} >= {"Topic", "Meeting", "Task"}
+    assert {edge["relation"] for edge in graph_payload["edges"]} >= {"contains", "belongs_to"}
+    assert all(edge.get("source_meeting_id") for edge in graph_payload["edges"])
+
+    tasks_payload = json.loads(
+        runner.invoke(app, ["--index", str(index_path), "tasks", "--json"]).stdout
+    )
+    task_id = tasks_payload[0]["id"]
+    done = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "task-status",
+            str(task_id),
+            "done",
+            "--note",
+            "confirmed manually",
+        ],
+    )
+    assert done.exit_code == 0
+    assert "task status: done" in done.stdout
+
+    open_tasks = runner.invoke(app, ["--index", str(index_path), "tasks", "--status", "open"])
+    assert open_tasks.exit_code == 0
+    assert "Vladimir agreed to send migration risks by Friday." not in open_tasks.stdout
+
+    all_tasks = runner.invoke(app, ["--index", str(index_path), "tasks", "--status", "all"])
+    assert all_tasks.exit_code == 0
+    assert "status: done" in all_tasks.stdout
+    assert "confirmed manually" in all_tasks.stdout
 
 
 def test_cli_exports_and_cleans_spotlight_markdown(meetily_db: Path, tmp_path: Path) -> None:

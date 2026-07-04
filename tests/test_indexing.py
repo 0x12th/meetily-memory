@@ -15,6 +15,12 @@ EMPTY_ENTITY_COUNT_SQL = (
     "SELECT COUNT(*) FROM risks",
     "SELECT COUNT(*) FROM open_questions",
 )
+EMPTY_KNOWLEDGE_COUNT_SQL = (
+    "SELECT COUNT(*) FROM knowledge_nodes",
+    "SELECT COUNT(*) FROM knowledge_edges",
+    "SELECT COUNT(*) FROM topic_aliases",
+    "SELECT COUNT(*) FROM task_status_overrides",
+)
 
 
 def test_readonly_meetily_connection_is_context_managed(meetily_db: Path) -> None:
@@ -38,9 +44,11 @@ def test_index_schema_uses_builtin_sqlite_migration(tmp_path: Path) -> None:
     repo = IndexRepository(index_path)
 
     with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
         assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0
         for sql in EMPTY_ENTITY_COUNT_SQL:
+            assert conn.execute(sql).fetchone()[0] == 0
+        for sql in EMPTY_KNOWLEDGE_COUNT_SQL:
             assert conn.execute(sql).fetchone()[0] == 0
         repo.stats()
 
@@ -59,6 +67,8 @@ def test_index_schema_runs_explicit_migrations_from_v1(tmp_path: Path) -> None:
         for target_version in range(1, CURRENT_SCHEMA_VERSION + 1):
             assert target_version in MIGRATIONS
         for sql in EMPTY_ENTITY_COUNT_SQL:
+            assert conn.execute(sql).fetchone()[0] == 0
+        for sql in EMPTY_KNOWLEDGE_COUNT_SQL:
             assert conn.execute(sql).fetchone()[0] == 0
 
 
@@ -96,6 +106,8 @@ def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path:
     assert stats["action_items"] >= 1
     assert stats["risks"] >= 1
     assert stats["open_questions"] >= 1
+    assert stats["knowledge_nodes"] >= 1
+    assert stats["knowledge_edges"] >= 1
 
     search_results = repo.search("pricing decision")
     assert search_results[0]["meeting_external_id"] == "meeting-1"

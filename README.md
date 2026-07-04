@@ -109,13 +109,18 @@ mm c "what did we decide about pricing?"
 | Command | What it does |
 |---|---|
 | `mm decisions` | Lists heuristic decision signals with source evidence. |
-| `mm tasks` | Lists heuristic action-item signals with source evidence. |
+| `mm tasks` | Lists open heuristic action-item signals with source evidence. |
+| `mm tasks --status all` | Lists action-item signals including local manual status overrides. |
+| `mm task-status <task-id> done` | Locally marks an action item as `open`, `done`, `cancelled`, or `unknown`. |
 | `mm risks` | Lists heuristic risk signals with source evidence. |
 | `mm questions` | Lists heuristic open-question signals with source evidence. |
 | `mm summary` | Shows a summary of the indexed local memory. |
 | `mm timeline "topic"` | Shows the timeline for a topic across meetings. |
+| `mm topic "topic"` | Shows source-backed topic memory across meetings. |
+| `mm topic "topic" --alias "alias"` | Adds a local alias for a topic. |
 | `mm project "topic"` | Aggregates meetings and structured knowledge for a project or topic. |
 | `mm person "name"` | Aggregates meetings and structured knowledge for a person. |
+| `mm graph "topic"` | Projects topic memory as local graph edges; use `--json` for agents. |
 
 ### Navigation
 
@@ -162,6 +167,8 @@ mm s "migration risk"
 mm c "what risks did we discuss for the migration?"
 
 mm decisions
+mm topic "migration"
+mm graph "migration" --json
 mm project "migration"
 mm person "Vladimir"
 
@@ -240,6 +247,9 @@ The local index contains:
 - searchable transcript chunks;
 - people metadata (best effort);
 - structured meeting entities;
+- knowledge nodes and source-backed relation edges;
+- topic aliases;
+- local task status overrides;
 - local scan history;
 - local semantic embeddings;
 - SQLite FTS5 and sqlite-vec indexes.
@@ -253,6 +263,11 @@ Structured meeting entities currently include:
 
 These are structured signals extracted by local heuristics, not a verified
 fact database. Use the source evidence shown by the CLI when accuracy matters.
+
+The knowledge layer is a SQLite projection over those source-backed records, not
+a standalone graph database. `mm topic` and `mm graph` create local topic links
+from matching cited signals, while complex inferred relations remain out of the
+fact model until they have explicit evidence or manual review.
 
 ## Semantic Search
 
