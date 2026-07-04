@@ -6,7 +6,7 @@ name="${1:-mm}"
 rm -rf dist build/pyinstaller
 
 uv run pyinstaller \
-  --onefile \
+  --onedir \
   --name "$name" \
   --clean \
   --distpath dist \
@@ -14,4 +14,4 @@ uv run pyinstaller \
   --specpath build/pyinstaller \
   src/meetily_memory/__main__.py
 
-"./dist/$name" --help >/dev/null
+"./dist/$name/$name" --help >/dev/null

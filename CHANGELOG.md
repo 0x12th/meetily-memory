@@ -3,6 +3,7 @@
 ## Unreleased
 
 - License the project under Apache License 2.0.
+- Up perfomance.
 
 ## 0.2.0 - 2026-07-04
 
