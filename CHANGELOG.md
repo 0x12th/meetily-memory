@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add export-only integration adapters for Obsidian notes, Gbrain JSONL, Markdown bundles, and generic task tracker drafts.
+- Add a local MCP server that exposes Core API tools over FastMCP.
+- Add a versioned Core API for retrieval, context, memory, topic, graph, and task-status operations.
 - Add SQLite knowledge nodes/edges, topic memory, topic graph projection, and local task status overrides.
 - License the project under Apache License 2.0.
 - Up perfomance.

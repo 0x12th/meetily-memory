@@ -389,6 +389,101 @@ def test_cli_semantic_setup_is_real_subcommand() -> None:
     assert "--show" in setup_help.stdout
 
 
+def test_cli_mcp_serve_is_real_subcommand() -> None:
+    runner = CliRunner()
+
+    mcp_help = runner.invoke(app, ["mcp", "--help"])
+    assert mcp_help.exit_code == 0
+    assert "Commands:" in mcp_help.stdout
+    assert "serve" in mcp_help.stdout
+
+    serve_help = runner.invoke(app, ["mcp", "serve", "--help"])
+    assert serve_help.exit_code == 0
+    assert "Usage: root mcp serve" in serve_help.stdout
+    assert "--transport" in serve_help.stdout
+
+
+def test_cli_export_commands_are_real_subcommands() -> None:
+    runner = CliRunner()
+
+    export_help = runner.invoke(app, ["export", "--help"])
+    assert export_help.exit_code == 0
+    assert "Commands:" in export_help.stdout
+    assert "obsidian" in export_help.stdout
+    assert "gbrain" in export_help.stdout
+    assert "markdown" in export_help.stdout
+    assert "task-draft" in export_help.stdout
+
+    obsidian_help = runner.invoke(app, ["export", "obsidian", "--help"])
+    assert obsidian_help.exit_code == 0
+    assert "Usage: root export obsidian" in obsidian_help.stdout
+    assert "--output" in obsidian_help.stdout
+
+
+def test_cli_exports_core_backed_integration_files(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    export_dir = tmp_path / "exports"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    obsidian = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "export",
+            "obsidian",
+            "migration",
+            "--output",
+            str(export_dir / "obsidian"),
+        ],
+    )
+    assert obsidian.exit_code == 0
+    obsidian_note = export_dir / "obsidian" / "migration.md"
+    assert obsidian_note.exists()
+    assert "[[Vladimir Follow-up]]" in obsidian_note.read_text(encoding="utf-8")
+
+    gbrain = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "export",
+            "gbrain",
+            "migration",
+            "--output",
+            str(export_dir / "gbrain.jsonl"),
+            "--json",
+        ],
+    )
+    assert gbrain.exit_code == 0
+    gbrain_payload = json.loads(gbrain.stdout)
+    assert gbrain_payload["format"] == "gbrain-jsonl"
+    assert (export_dir / "gbrain.jsonl").exists()
+
+    task_draft = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "export",
+            "task-draft",
+            "migration risks",
+            "--output",
+            str(export_dir / "task.md"),
+        ],
+    )
+    assert task_draft.exit_code == 0
+    task_text = (export_dir / "task.md").read_text(encoding="utf-8")
+    assert "Tracker: generic" in task_text
+    assert "Draft only; no tracker write-back was performed." in task_text
+
+
 def test_cli_local_memory_commands_aggregate_across_meetings(
     meetily_db: Path, tmp_path: Path
 ) -> None:

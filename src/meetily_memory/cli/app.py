@@ -12,21 +12,19 @@ from rich.table import Table
 
 from meetily_memory import __version__ as fallback_version
 from meetily_memory.config.paths import default_index_path, discover_meetily_db
-from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, build_context_markdown
+from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT
+from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import index_connection
+from meetily_memory.integrations import (
+    export_gbrain_bundle,
+    export_markdown_bundle,
+    export_obsidian_topic,
+    export_task_tracker_draft,
+)
 from meetily_memory.json_codec import dumps_json
-from meetily_memory.local_memory import (
-    person_memory as build_person_memory,
-)
-from meetily_memory.local_memory import (
-    project_memory as build_project_memory,
-)
-from meetily_memory.local_memory import (
-    summary_memory,
-    timeline_signals,
-)
+from meetily_memory.mcp_server import MCPTransport, run_mcp_server
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
 from meetily_memory.semantic_search import (
@@ -79,9 +77,27 @@ db_app = typer.Typer(
     rich_markup_mode=None,
     suggest_commands=False,
 )
+mcp_app = typer.Typer(
+    no_args_is_help=True,
+    help="Run the MCP server.",
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    rich_markup_mode=None,
+    suggest_commands=False,
+)
+export_app = typer.Typer(
+    no_args_is_help=True,
+    help="Export Core API-backed integration files.",
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    rich_markup_mode=None,
+    suggest_commands=False,
+)
 app.add_typer(semantic_app, name="semantic")
 app.add_typer(spotlight_app, name="spotlight")
 app.add_typer(db_app, name="db")
+app.add_typer(mcp_app, name="mcp")
+app.add_typer(export_app, name="export")
 console = Console()
 ENTITY_COMMANDS = {
     "decisions": "decisions",
@@ -125,6 +141,10 @@ def print_text_block(text: str) -> None:
     sys.stdout.write(text)
     if not text.endswith("\n"):
         sys.stdout.write("\n")
+
+
+def core_from_context(ctx: typer.Context) -> MeetilyMemoryCore:
+    return MeetilyMemoryCore(ctx.obj["index_path"])
 
 
 def meeting_label(row: dict[str, object]) -> str:
@@ -289,6 +309,102 @@ def db_status(
     print_text_block(f"current schema version: {CURRENT_SCHEMA_VERSION}")
 
 
+@mcp_app.command("serve")
+def mcp_serve(
+    ctx: typer.Context,
+    transport: Annotated[
+        str,
+        typer.Option("--transport", help="MCP transport: stdio, sse, or streamable-http."),
+    ] = "stdio",
+) -> None:
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        message = "MCP transport must be one of: stdio, sse, streamable-http."
+        raise typer.BadParameter(message)
+    run_mcp_server(ctx.obj["index_path"], transport=cast("MCPTransport", transport))
+
+
+@export_app.command("obsidian")
+def export_obsidian(
+    ctx: typer.Context,
+    topic: Annotated[str, typer.Argument(help="Topic to export as an Obsidian note.")],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Obsidian vault or notes directory."),
+    ],
+    limit: Annotated[int, typer.Option("--limit", help="Maximum source-backed rows.")] = 10,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    result = export_obsidian_topic(ctx.obj["index_path"], topic, output, limit=limit)
+    if json_output:
+        print_json(result.as_payload())
+        return
+    console.print(f"obsidian path: {result.output_dir}")
+    for path in result.files:
+        console.print(f"exported: {path}")
+
+
+@export_app.command("gbrain")
+def export_gbrain(
+    ctx: typer.Context,
+    query: Annotated[str, typer.Argument(help="Topic or question to export.")],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="JSONL output path."),
+    ],
+    limit: Annotated[int, typer.Option("--limit", help="Maximum source-backed rows.")] = 10,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    result = export_gbrain_bundle(ctx.obj["index_path"], query, output, limit=limit)
+    if json_output:
+        print_json(result.as_payload())
+        return
+    console.print(f"gbrain export: {result.path}")
+
+
+@export_app.command("markdown")
+def export_markdown(
+    ctx: typer.Context,
+    query: Annotated[str, typer.Argument(help="Topic or question to export.")],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Markdown output path."),
+    ],
+    limit: Annotated[int, typer.Option("--limit", help="Maximum source-backed rows.")] = 10,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    result = export_markdown_bundle(ctx.obj["index_path"], query, output, limit=limit)
+    if json_output:
+        print_json(result.as_payload())
+        return
+    console.print(f"markdown export: {result.path}")
+
+
+@export_app.command("task-draft")
+def export_task_draft(
+    ctx: typer.Context,
+    task_query: Annotated[str, typer.Argument(help="Task query for the draft.")],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Markdown draft output path."),
+    ],
+    tracker: Annotated[
+        str,
+        typer.Option("--tracker", help="Tracker label, for example generic, jira, yandex."),
+    ] = "generic",
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    result = export_task_tracker_draft(
+        ctx.obj["index_path"],
+        task_query=task_query,
+        output_path=output,
+        tracker=tracker,
+    )
+    if json_output:
+        print_json(result.as_payload())
+        return
+    console.print(f"task draft: {result.path}")
+
+
 @app.command()
 def analyze(
     ctx: typer.Context,
@@ -327,8 +443,7 @@ def search(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    results = repo.search(query, limit)
+    results = core_from_context(ctx).search(query, limit).data["results"]
     if json_output:
         print_json(results)
         return
@@ -534,9 +649,8 @@ def context(
     question: str,
     limit: Annotated[int, typer.Option("--limit", "-n")] = DEFAULT_CONTEXT_LIMIT,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    results = repo.search(question, limit)
-    print_text_block(build_context_markdown(question, results))
+    data = core_from_context(ctx).build_context(question, limit).data
+    print_text_block(str(data["markdown"]))
 
 
 @app.command("ls")
@@ -545,8 +659,7 @@ def list_meetings(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    rows = repo.list_meetings(limit)
+    rows = core_from_context(ctx).meetings(limit).data["meetings"]
     if json_output:
         print_json(rows)
         return
@@ -561,11 +674,10 @@ def last(
     summary: Annotated[bool, typer.Option("--summary")] = False,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    rows = repo.list_meetings(limit=1, person=person)
-    if not rows:
+    core = core_from_context(ctx)
+    meeting = core.latest_meeting(person=person).data["meeting"]
+    if not meeting:
         raise typer.Exit(1)
-    meeting = rows[0]
     if json_output:
         print_json(meeting)
         return
@@ -574,7 +686,7 @@ def last(
     if summary and meeting.get("summary_text"):
         console.print(meeting["summary_text"])
     if transcript:
-        chunks = repo.get_chunks_for_meeting(meeting["id"])
+        chunks = core.meeting_chunks(int(meeting["id"])).data["chunks"]
         for chunk in chunks:
             if chunk["kind"] == "transcript":
                 console.print(chunk["text"])
@@ -587,8 +699,7 @@ def person(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    rows = repo.list_meetings(limit=limit, person=name)
+    rows = core_from_context(ctx).meetings(limit=limit, person=name).data["meetings"]
     if json_output:
         print_json(rows)
         return
@@ -600,17 +711,16 @@ def local_summary(
     ctx: typer.Context,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    memory = summary_memory(repo)
+    memory = core_from_context(ctx).summary().data
     if json_output:
-        print_json(memory.as_payload())
+        print_json(memory)
         return
-    stats = memory.stats
+    stats = memory["stats"]
     print_text_block("Local memory summary")
     print_text_block(f"meetings: {stats['meetings']}")
     print_text_block(f"chunks: {stats['chunks']}")
-    if memory.latest_meeting:
-        print_text_block(f"latest meeting: {meeting_label(memory.latest_meeting)}")
+    if memory["latest_meeting"]:
+        print_text_block(f"latest meeting: {meeting_label(memory['latest_meeting'])}")
     print_text_block(f"decisions: {stats['decisions']}")
     print_text_block(f"action items: {stats['action_items']}")
     print_text_block(f"risks: {stats['risks']}")
@@ -624,8 +734,7 @@ def timeline(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    rows = timeline_signals(repo, query, limit)
+    rows = core_from_context(ctx).timeline(query, limit).data["signals"]
     if json_output:
         print_json(rows)
         return
@@ -643,16 +752,15 @@ def project_memory(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    memory = build_project_memory(repo, query, limit)
+    memory = core_from_context(ctx).project(query, limit).data
     if json_output:
-        print_json(memory.as_payload())
+        print_json(memory)
         return
     print_text_block(f"Project memory: {query}")
     print_text_block("\nMeetings")
-    print_search_meeting_summaries(memory.meetings)
+    print_search_meeting_summaries(memory["meetings"])
     print_text_block("Structured signals")
-    print_entity_bullets(memory.structured_signals)
+    print_entity_bullets(memory["structured_signals"])
 
 
 @app.command("person")
@@ -662,15 +770,14 @@ def person_memory(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    memory = build_person_memory(repo, name, limit)
+    memory = core_from_context(ctx).person(name, limit).data
     if json_output:
-        print_json(memory.as_payload())
+        print_json(memory)
         return
     print_text_block(f"Person memory: {name}")
     print_text_block("\nLatest meetings")
-    print_meeting_summaries(memory.meetings)
-    print_grouped_entity_bullets(memory.structured_signals)
+    print_meeting_summaries(memory["meetings"])
+    print_grouped_entity_bullets(memory["structured_signals"])
 
 
 @app.command("topic")
@@ -684,15 +791,15 @@ def topic_memory(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
+    core = core_from_context(ctx)
     if alias:
-        topic = repo.ensure_topic(query, aliases=alias)
+        topic = core.add_topic_alias(query, alias).data
         if json_output:
             print_json(topic)
             return
         for added_alias in topic["added_aliases"]:
             print_text_block(f"alias added: {added_alias} -> {topic['title']}")
-    memory = repo.topic_memory(query, limit)
+    memory = core.topic(query, limit).data
     if json_output:
         print_json(memory)
         return
@@ -706,8 +813,7 @@ def graph(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 50,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    payload = repo.graph_for_topic(query, limit)
+    payload = core_from_context(ctx).graph(query, limit).data
     if json_output:
         print_json(payload)
         return
@@ -726,9 +832,8 @@ def task_status(
     note: Annotated[str | None, typer.Option("--note")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
     try:
-        row = repo.set_task_status(task_id, status, note=note)
+        row = core_from_context(ctx).set_task_status(task_id, status, note=note).data
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -791,9 +896,10 @@ def print_structured_entities(
     json_output: bool,
     status: str = "all",
 ) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
     try:
-        rows = repo.list_structured_entity_details(kind, limit, status=status)
+        rows = (
+            core_from_context(ctx).structured_entities(kind, limit, status=status).data["entities"]
+        )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
