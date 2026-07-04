@@ -325,7 +325,7 @@ def open_command(
         message = f"Meeting has no path: {meeting_id}"
         raise typer.BadParameter(message)
     if print_path:
-        console.print(path)
+        print_text_block(str(path))
         return
     open_path(Path(path))
 
