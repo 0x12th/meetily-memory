@@ -4,6 +4,8 @@ version = "0.2.0"
 description = "Local-first Meetily history index and CLI"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
   "orjson>=3.10.0",
   "platformdirs>=4.3.0",

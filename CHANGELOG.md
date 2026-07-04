@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- License the project under Apache License 2.0.
+
 ## 0.2.0 - 2026-07-04
 
 - Add Spotlight-friendly Markdown export and clean commands.

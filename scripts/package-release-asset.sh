@@ -22,6 +22,7 @@ mkdir -p "$package_dir"
 cp dist/mm "$package_dir/mm"
 cp README.md "$package_dir/README.md"
 cp CHANGELOG.md "$package_dir/CHANGELOG.md"
+cp LICENSE "$package_dir/LICENSE"
 
 tar -C "$release_root" -czf "$archive" "$name"
 

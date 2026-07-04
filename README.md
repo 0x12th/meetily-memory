@@ -197,6 +197,10 @@ Structured meeting entities currently include:
 - Fast local search with SQLite and FTS5.
 - Plugin/MCP-ready architecture for later versions.
 
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
 ## Development
 
 ```bash
