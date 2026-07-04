@@ -6,11 +6,18 @@ from platformdirs import user_data_dir
 
 
 def default_data_dir() -> Path:
+    env_data_dir = os.environ.get("MEETILY_MEMORY_DATA_DIR")
+    if env_data_dir:
+        return Path(env_data_dir).expanduser()
     return Path(user_data_dir("meetily-memory", appauthor=False))
 
 
 def default_index_path() -> Path:
     return default_data_dir() / "index.sqlite"
+
+
+def semantic_config_path() -> Path:
+    return default_data_dir() / "config.json"
 
 
 def candidate_meetily_db_paths(

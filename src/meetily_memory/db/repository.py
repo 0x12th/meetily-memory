@@ -473,6 +473,15 @@ class IndexRepository:
             rows = conn.execute(ENTITY_DETAIL_SQL[kind], (limit,)).fetchall()
             return rows_to_dicts(rows)
 
+    def list_all_structured_entity_details(self, limit: int = 100) -> list[dict[str, Any]]:
+        with index_connection(self.index_path) as conn:
+            rows: list[dict[str, Any]] = []
+            for kind in ENTITY_KINDS:
+                entity_rows = conn.execute(ENTITY_DETAIL_SQL[kind], (limit,)).fetchall()
+                rows.extend(rows_to_dicts(entity_rows))
+            rows.sort(key=structured_entity_sort_key, reverse=True)
+            return rows[:limit]
+
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         fts_query = build_fts_query(query)
         if not fts_query:
@@ -618,6 +627,10 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+def structured_entity_sort_key(row: dict[str, Any]) -> tuple[str, int]:
+    return (str(row.get("meeting_date") or ""), -int(row.get("ordinal") or 0))
 
 
 def build_fts_query(text: str) -> str:

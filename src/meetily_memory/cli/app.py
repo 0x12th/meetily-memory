@@ -15,8 +15,27 @@ from meetily_memory.config.paths import default_index_path, discover_meetily_db
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, build_context_markdown
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import dumps_json
+from meetily_memory.local_memory import (
+    person_memory as build_person_memory,
+)
+from meetily_memory.local_memory import (
+    project_memory as build_project_memory,
+)
+from meetily_memory.local_memory import (
+    summary_memory,
+    timeline_signals,
+)
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
+from meetily_memory.semantic_search import (
+    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OLLAMA_URL,
+    SemanticSearchConfig,
+    load_semantic_config,
+    resolve_embedding_provider,
+    save_semantic_config,
+    semantic_search,
+)
 from meetily_memory.spotlight_export import (
     clean_spotlight_markdown,
     export_spotlight_markdown,
@@ -33,6 +52,14 @@ app = typer.Typer(
     rich_markup_mode=None,
     suggest_commands=False,
 )
+semantic_app = typer.Typer(
+    no_args_is_help=True,
+    help="Experimental semantic search commands.",
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    rich_markup_mode=None,
+    suggest_commands=False,
+)
 spotlight_app = typer.Typer(
     no_args_is_help=True,
     help="Export Spotlight-friendly files.",
@@ -41,6 +68,7 @@ spotlight_app = typer.Typer(
     rich_markup_mode=None,
     suggest_commands=False,
 )
+app.add_typer(semantic_app, name="semantic")
 app.add_typer(spotlight_app, name="spotlight")
 console = Console()
 ENTITY_COMMANDS = {
@@ -48,6 +76,12 @@ ENTITY_COMMANDS = {
     "tasks": "action_items",
     "risks": "risks",
     "questions": "open_questions",
+}
+ENTITY_LABELS = {
+    "decisions": "Decisions",
+    "action_items": "Action items",
+    "risks": "Risks",
+    "open_questions": "Open questions",
 }
 
 
@@ -219,6 +253,145 @@ def search(
         console.print()
 
 
+def semantic_search_command(
+    ctx: typer.Context,
+    query: Annotated[str, typer.Argument(help="Search query.")],
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+    embedding_provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            "--embedding-provider",
+            help="Embedding provider: ollama or hash.",
+        ),
+    ] = None,
+    embedding_model: Annotated[
+        str | None,
+        typer.Option("--model", "--embedding-model", help="Ollama embedding model name."),
+    ] = None,
+    ollama_url: Annotated[
+        str | None,
+        typer.Option("--ollama-url", help="Ollama base URL."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        provider = resolve_embedding_provider(
+            embedding_provider,
+            ollama_model=embedding_model,
+            ollama_url=ollama_url,
+        )
+        results = semantic_search(ctx.obj["index_path"], query, limit, embedding_provider=provider)
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        print_json(results)
+        return
+    if not results:
+        console.print("No semantic matches found. Run `mm scan` first.")
+        return
+    for result in results:
+        date = compact_date(result.get("updated_at") or result.get("created_at"))
+        suffix = f" ({date})" if date else ""
+        console.print(f"#{result['meeting_id']} {result['title']}{suffix}")
+        distance = float_value(result["distance"], "semantic distance")
+        console.print(
+            f"semantic distance: {distance:.4f} | "
+            f"embedding: {embedding_label(result, provider)} | "
+            f"open: mm open {result['meeting_id']}"
+        )
+        source_parts = [f"chunk #{result['chunk_id']}"]
+        if result.get("timestamp_label"):
+            source_parts.insert(0, str(result["timestamp_label"]))
+        console.print(" | ".join(source_parts))
+        console.print(result["text"])
+        console.print()
+
+
+semantic_app.command("search")(semantic_search_command)
+app.command("sem")(semantic_search_command)
+
+
+@semantic_app.command("setup")
+def semantic_setup_command(
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            "--embedding-provider",
+            help="Embedding provider: ollama or hash.",
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", "--embedding-model", help="Ollama embedding model name."),
+    ] = None,
+    ollama_url: Annotated[
+        str | None,
+        typer.Option("--ollama-url", help="Ollama base URL."),
+    ] = None,
+    show: Annotated[
+        bool,
+        typer.Option("--show", help="Show semantic search setup."),
+    ] = False,
+) -> None:
+    semantic_setup(provider, model, ollama_url, show=show)
+
+
+def semantic_setup(
+    provider: str | None,
+    model: str | None,
+    ollama_url: str | None,
+    *,
+    show: bool,
+) -> None:
+    existing = load_semantic_config()
+    if show and provider is None and model is None and ollama_url is None:
+        print_semantic_config(existing)
+        return
+
+    normalized_provider = normalize_semantic_provider(provider or existing.provider or "ollama")
+    existing_model = existing.ollama_model if existing.provider == normalized_provider else None
+    existing_ollama_url = existing.ollama_url if existing.provider == normalized_provider else None
+    configured_ollama_url = None
+    if normalized_provider == "ollama":
+        configured_ollama_url = ollama_url or existing_ollama_url or DEFAULT_OLLAMA_URL
+    config = SemanticSearchConfig(
+        provider=normalized_provider,
+        ollama_model=model or existing_model or default_model_for_provider(normalized_provider),
+        ollama_url=configured_ollama_url,
+    )
+    config_path = save_semantic_config(config)
+    print_semantic_config(config)
+    print_text_block(f"config path: {config_path}")
+
+
+def normalize_semantic_provider(provider: str) -> str:
+    value = provider.casefold()
+    if value in {"hash", "local-hash", "diagnostic"}:
+        return "hash"
+    if value == "ollama":
+        return "ollama"
+    message = "Unknown embedding provider. Use `ollama` or `hash`."
+    raise typer.BadParameter(message)
+
+
+def default_model_for_provider(provider: str) -> str:
+    if provider == "hash":
+        return "local-hash-v1"
+    return DEFAULT_OLLAMA_MODEL
+
+
+def print_semantic_config(config: SemanticSearchConfig) -> None:
+    provider = config.provider or "ollama"
+    model = config.ollama_model or default_model_for_provider(provider)
+    ollama_url = config.ollama_url or DEFAULT_OLLAMA_URL
+    print_text_block(f"semantic provider: {provider}")
+    print_text_block(f"model: {model}")
+    if provider == "ollama":
+        print_text_block(f"ollama url: {ollama_url}")
+
+
 @app.command("c")
 def context(
     ctx: typer.Context,
@@ -284,6 +457,84 @@ def person(
         print_json(rows)
         return
     print_meeting_table(rows)
+
+
+@app.command("summary")
+def local_summary(
+    ctx: typer.Context,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    memory = summary_memory(repo)
+    if json_output:
+        print_json(memory.as_payload())
+        return
+    stats = memory.stats
+    print_text_block("Local memory summary")
+    print_text_block(f"meetings: {stats['meetings']}")
+    print_text_block(f"chunks: {stats['chunks']}")
+    if memory.latest_meeting:
+        print_text_block(f"latest meeting: {meeting_label(memory.latest_meeting)}")
+    print_text_block(f"decisions: {stats['decisions']}")
+    print_text_block(f"action items: {stats['action_items']}")
+    print_text_block(f"risks: {stats['risks']}")
+    print_text_block(f"open questions: {stats['open_questions']}")
+
+
+@app.command("timeline")
+def timeline(
+    ctx: typer.Context,
+    query: Annotated[str | None, typer.Argument(help="Optional project/topic filter.")] = None,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    rows = timeline_signals(repo, query, limit)
+    if json_output:
+        print_json(rows)
+        return
+    if not rows:
+        console.print("No timeline signals found. Run `mm analyze` after scanning.")
+        return
+    for row in rows:
+        print_entity_timeline_row(row)
+
+
+@app.command("project")
+def project_memory(
+    ctx: typer.Context,
+    query: str,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    memory = build_project_memory(repo, query, limit)
+    if json_output:
+        print_json(memory.as_payload())
+        return
+    print_text_block(f"Project memory: {query}")
+    print_text_block("\nMeetings")
+    print_search_meeting_summaries(memory.meetings)
+    print_text_block("Structured signals")
+    print_entity_bullets(memory.structured_signals)
+
+
+@app.command("person")
+def person_memory(
+    ctx: typer.Context,
+    name: str,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    memory = build_person_memory(repo, name, limit)
+    if json_output:
+        print_json(memory.as_payload())
+        return
+    print_text_block(f"Person memory: {name}")
+    print_text_block("\nLatest meetings")
+    print_meeting_summaries(memory.meetings)
+    print_grouped_entity_bullets(memory.structured_signals)
 
 
 @app.command("decisions")
@@ -352,6 +603,84 @@ def print_structured_entities(
         print_text_block(f"confidence: {float(row['confidence']):.2f}")
         print_text_block(str(row["text"]))
         sys.stdout.write("\n")
+
+
+def print_entity_timeline_row(row: dict[str, object]) -> None:
+    print_text_block(f"{row.get('meeting_date') or ''} | {row['meeting_title']}")
+    print_text_block(str(ENTITY_LABELS.get(str(row["kind"]), row["kind"])))
+    print_text_block(f"Source: {entity_source(row)}")
+    print_text_block(str(row["text"]))
+    sys.stdout.write("\n")
+
+
+def print_search_meeting_summaries(rows: list[dict[str, object]]) -> None:
+    if not rows:
+        print_text_block("No matching meetings.")
+        return
+    seen: set[int] = set()
+    for row in rows:
+        meeting_id = int(str(row["meeting_id"]))
+        if meeting_id in seen:
+            continue
+        seen.add(meeting_id)
+        date = compact_date(row.get("updated_at") or row.get("created_at"))
+        suffix = f" ({date})" if date else ""
+        print_text_block(f"- #{meeting_id} {row['title']}{suffix} | open: mm open {meeting_id}")
+
+
+def print_meeting_summaries(rows: list[dict[str, object]]) -> None:
+    if not rows:
+        print_text_block("No matching meetings.")
+        return
+    for row in rows:
+        print_text_block(f"- {meeting_label(row)} | open: mm open {row['id']}")
+
+
+def print_entity_bullets(rows: list[dict[str, object]]) -> None:
+    if not rows:
+        print_text_block("No structured signals.")
+        return
+    for row in rows:
+        label = ENTITY_LABELS.get(str(row["kind"]), str(row["kind"]))
+        print_text_block(f"- {label}: {row['text']} ({entity_source(row)})")
+
+
+def print_grouped_entity_bullets(rows: list[dict[str, object]]) -> None:
+    if not rows:
+        print_text_block("No structured signals.")
+        return
+    for kind in ENTITY_COMMANDS.values():
+        kind_rows = [row for row in rows if row["kind"] == kind]
+        if not kind_rows:
+            continue
+        print_text_block(f"\n{ENTITY_LABELS[kind]}")
+        print_entity_bullets(kind_rows)
+
+
+def entity_source(row: dict[str, object]) -> str:
+    source_parts = [
+        str(row.get("meeting_external_id") or row.get("meeting_id") or ""),
+        str(row.get("chunk_external_id") or row.get("source_chunk_id") or ""),
+    ]
+    source = " / ".join(part for part in source_parts if part)
+    if row.get("chunk_timestamp_label"):
+        return f"{source} @ {row['chunk_timestamp_label']}"
+    return source
+
+
+def embedding_label(row: dict[str, object], provider: object) -> str:
+    provider_name = str(row.get("embedding_provider") or getattr(provider, "name", ""))
+    model = str(row.get("embedding_model") or getattr(provider, "model", ""))
+    dimensions = row.get("embedding_dimensions") or getattr(provider, "dims", None)
+    suffix = f"/{dimensions}d" if dimensions else ""
+    return f"{provider_name}/{model}{suffix}"
+
+
+def float_value(value: object, label: str) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    message = f"Expected numeric {label}."
+    raise RuntimeError(message)
 
 
 @app.command("open")

@@ -1,185 +1,245 @@
 # Meetily Memory
 
-Turn your local Meetily meeting history into a private, searchable memory.
+Turn your local Meetily meeting history into a private, searchable knowledge layer.
 
-Meetily Memory indexes your Meetily database into a local SQLite search index,
-then helps you find past decisions, tasks, risks, questions, and ready-to-paste
-LLM context from old meetings.
+Meetily Memory indexes your Meetily database into a local SQLite index, then
+helps you search past meetings, recover decisions, tasks, risks, and questions,
+and build ready-to-paste LLM context from your meeting history.
 
-It does not replace Meetily, record audio, transcribe meetings, upload data, or
-mutate the Meetily database.
+It does not replace Meetily, record meetings, transcribe audio, upload data, or
+modify the Meetily database.
 
 ## Why
 
-After enough meetings, the hard part is not recording another call. The hard
-part is answering questions like:
+Recording meetings is easy. Remembering what happened six months later is not.
+
+After enough meetings, the hard part becomes answering questions like:
 
 - What did we decide about pricing?
 - What did Vladimir promise last week?
 - Which risks came up during the migration discussion?
 - What context should I paste into ChatGPT or Claude before asking a follow-up?
 
-Meetily Memory gives you a local CLI for that workflow:
+Meetily Memory provides a local-first CLI for that workflow:
 
 ```text
-Meetily history -> local sync -> search -> LLM context
+Meetily history
+        ↓
+   Local index
+        ↓
+ Search / Memory
+        ↓
+ LLM context
 ```
 
 ## Install
 
-For macOS, the release channel is a Homebrew tap. After a release is published
-and the tap formula is updated:
+On macOS, install Meetily Memory from the Homebrew tap:
 
 ```bash
 brew tap 0x12th/meetily-memory
 brew install meetily-memory
 ```
 
-Then run:
+The CLI is available as both:
+
+```text
+meetily-memory
+mm
+```
+
+Verify the installation:
 
 ```bash
 mm --help
 ```
 
-The CLI is exposed as both `meetily-memory` and `mm`.
-
 ## First Run
 
-Meetily Memory can often find the Meetily database automatically:
+Meetily Memory automatically discovers the Meetily database in common locations
+when possible.
+
+Start with:
 
 ```bash
 mm doctor
 mm scan
 ```
 
-If autodiscovery does not find it, pass the source explicitly:
+If autodiscovery does not find your database, specify it explicitly:
 
 ```bash
 mm doctor --source /path/to/meeting_minutes.sqlite
-```
-
-Then sync it into the private local index:
-
-```bash
 mm scan --source /path/to/meeting_minutes.sqlite
 ```
 
-Now try the two main workflows:
+Once the local index is built, try the two primary workflows:
 
 ```bash
 mm s "pricing decision"
 mm c "what did we decide about pricing?"
 ```
 
-`mm s` searches the meeting history. `mm c` builds Markdown context you can
-paste into ChatGPT, Claude, or another LLM.
+- `mm s` searches your meeting history.
+- `mm c` builds Markdown context ready to paste into ChatGPT, Claude, or another LLM.
 
 ## First Useful Commands
 
+### Setup
+
 | Command | What it does |
 |---|---|
-| `mm doctor` | Checks autodiscovery, the Meetily DB, local index path, SQLite, and FTS5. |
-| `mm scan` | Syncs Meetily history into the local `index.sqlite`. |
-| `mm s "query"` | Searches transcript chunks and shows meeting/chunk ids plus `mm open` hints. |
-| `mm c "question"` | Builds LLM-ready Markdown context from relevant meetings. |
+| `mm doctor` | Checks Meetily autodiscovery, the local index, SQLite, and FTS5 support. |
+| `mm scan` | Syncs your Meetily history into the local `index.sqlite`. |
 | `mm analyze` | Extracts decisions, action items, risks, and open questions. |
-| `mm decisions` | Lists extracted decisions with meeting and source chunk evidence. |
-| `mm tasks` | Lists extracted action items with meeting and source chunk evidence. |
-| `mm risks` | Lists extracted risks with meeting and source chunk evidence. |
-| `mm questions` | Lists extracted open questions with meeting and source chunk evidence. |
+
+### Search
+
+| Command | What it does |
+|---|---|
+| `mm s "query"` | Fast full-text search across meeting history. |
+| `mm sem "query"` | Experimental semantic search using sqlite-vec. |
+| `mm c "question"` | Builds Markdown context ready for an LLM. |
+
+### Knowledge
+
+| Command | What it does |
+|---|---|
+| `mm decisions` | Lists extracted decisions with source evidence. |
+| `mm tasks` | Lists extracted action items with source evidence. |
+| `mm risks` | Lists extracted risks with source evidence. |
+| `mm questions` | Lists extracted open questions with source evidence. |
+| `mm summary` | Shows a summary of the indexed local memory. |
+| `mm timeline "topic"` | Shows the timeline for a topic across meetings. |
+| `mm project "topic"` | Aggregates meetings and structured knowledge for a project or topic. |
+| `mm person "name"` | Aggregates meetings and structured knowledge for a person. |
+
+### Navigation
+
+| Command | What it does |
+|---|---|
 | `mm last` | Shows the latest indexed meeting. |
-| `mm p "Vladimir"` | Finds recent meetings related to a person and shows ids usable with `mm open`. |
-| `mm open <meeting-id>` | Opens the source meeting folder or prints its path. |
-| `mm spotlight export` | Writes Spotlight-friendly Markdown files for indexed meetings. |
-| `mm spotlight clean` | Removes only files generated by `mm spotlight export`. |
+| `mm p "Vladimir"` | Finds meetings related to a person. |
+| `mm open <meeting-id>` | Opens the source meeting or prints its location. |
+
+### Spotlight (macOS)
+
+| Command | What it does |
+|---|---|
+| `mm spotlight export` | Exports searchable Markdown files for Spotlight. |
+| `mm spotlight clean` | Removes only files generated by Spotlight export. |
+
+### Semantic Search Setup
+
+Configure the local embedding provider once:
+
+```bash
+mm semantic setup \
+  --provider ollama \
+  --model nomic-embed-text
+```
+
+After that:
+
+```bash
+mm sem "migration blockers"
+```
+
+The explicit `mm semantic` namespace provides the same functionality and
+additional configuration commands.
 
 ## Example Workflow
 
 ```bash
-mm doctor --source ~/Library/Application\ Support/com.meetily.ai/meeting_minutes.sqlite
-mm scan --source ~/Library/Application\ Support/com.meetily.ai/meeting_minutes.sqlite
+mm doctor
+mm scan
 mm analyze
 
 mm s "migration risk"
 mm c "what risks did we discuss for the migration?"
-mm risks
-mm last --person Vladimir
-mm p "Vladimir"
-mm open 2
-mm spotlight export
-```
 
+mm decisions
+mm project "migration"
+mm person "Vladimir"
+
+mm open 2
+```
 ## Spotlight
 
-On macOS, `mm spotlight export` writes one Markdown file per meeting into:
+On macOS, `mm spotlight export` generates one Markdown file per meeting in:
 
 ```text
 ~/Documents/Meetily Memory
 ```
 
-Spotlight can index those normal local files without a separate macOS app,
-background agent, or cloud service. Each file includes the meeting title, date,
-ids, `mm open <id>` hint, extracted structured entities, and transcript text.
+Because the files are plain Markdown, Spotlight can index them without a
+separate macOS app, background agent, or cloud service.
 
-Use a custom directory when needed:
+Each exported file includes:
+
+- meeting title and date;
+- extracted decisions, tasks, risks, and questions;
+- transcript text;
+- a `mm open <meeting-id>` hint back to the original meeting.
+
+Use a custom output directory if needed:
 
 ```bash
 mm spotlight export --output ~/Documents/Meetily\ Memory
 mm spotlight clean --output ~/Documents/Meetily\ Memory
 ```
 
-`clean` removes only files named `meetily-memory-*.md` in the target directory.
+`mm spotlight clean` removes only files generated by Meetily Memory.
 
 ## Source Discovery
 
-`--source` is optional. Without it, `mm doctor` and `mm scan` try to discover
-the Meetily database in common app-data locations. Explicit `--source` is still
-the most reliable option when Meetily uses a non-default location or you want to
-index a specific database file.
+`--source` is optional.
+
+By default, `mm doctor` and `mm scan` search common application data locations
+for the Meetily database.
+
+If your database is stored elsewhere, specify it explicitly:
+
+```bash
+mm doctor --source /path/to/meeting_minutes.sqlite
+mm scan --source /path/to/meeting_minutes.sqlite
+```
 
 The source may be:
 
-- a Meetily SQLite file: `meeting_minutes.sqlite`;
-- a legacy Meetily DB: `meeting_minutes.db`;
+- `meeting_minutes.sqlite`;
+- legacy `meeting_minutes.db`;
 - a directory containing one of those files.
 
-You can also set:
+You can also configure the source once:
 
 ```bash
 export MEETILY_MEMORY_SOURCE=/path/to/meeting_minutes.sqlite
 ```
 
-Then run:
+Meetily Memory stores its own search index separately using the platform default
+data directory. Override the index location when needed:
 
 ```bash
-mm doctor
-mm scan
+mm --index /path/to/index.sqlite scan
 ```
 
-By default, Meetily Memory stores its own index in the platform data directory
-via `platformdirs`. Override it when needed:
+## Data Model
 
-```bash
-mm --index /path/to/index.sqlite scan --source /path/to/meeting_minutes.sqlite
-```
+Meetily is always treated as a read-only upstream source.
 
-## Data Contract
+Meetily Memory never modifies the Meetily database. Instead, it builds and
+maintains its own local `index.sqlite`.
 
-Meetily is treated as a read-only upstream source. Meetily Memory opens the
-source database read-only and writes all derived state into its own
-`index.sqlite`.
+The local index contains:
 
-```text
-source.kind = meetily_sqlite
-source.path = /path/to/meeting_minutes.sqlite
-meeting.external_id = Meetily meetings.id
-chunk.external_id = Meetily transcripts.id
-fingerprint = hash(normalized Meetily row data)
-```
-
-Derived data stored in `index.sqlite` includes normalized meetings, searchable
-chunks, best-effort people metadata, structured meeting entities, artifacts,
-scan history, and the FTS5 index.
+- normalized meetings;
+- searchable transcript chunks;
+- people metadata (best effort);
+- structured meeting entities;
+- local scan history;
+- local semantic embeddings;
+- SQLite FTS5 and sqlite-vec indexes.
 
 Structured meeting entities currently include:
 
@@ -188,33 +248,102 @@ Structured meeting entities currently include:
 - risks;
 - open questions.
 
+## Semantic Search
+
+Semantic search is optional and experimental.
+
+Configure a local embedding model once:
+
+```bash
+ollama pull nomic-embed-text
+
+mm semantic setup \
+  --provider ollama \
+  --model nomic-embed-text
+```
+
+Then search semantically:
+
+```bash
+mm sem "migration blockers"
+```
+
+You can inspect the saved configuration at any time:
+
+```bash
+mm semantic setup --show
+```
+
+To use another local Ollama model:
+
+```bash
+ollama pull mxbai-embed-large
+
+mm semantic setup \
+  --provider ollama \
+  --model mxbai-embed-large
+```
+
+A deterministic `hash` provider is also available for diagnostics and testing:
+
+```bash
+mm semantic setup --provider hash
+```
+
+`hash` is a dependency-free baseline and is not expected to outperform FTS5.
+
+FTS remains the default retrieval layer. Semantic search is experimental until
+it consistently improves retrieval quality on real-world query sets.
+
+Environment variables (`MM_EMBEDDING_PROVIDER`,
+`MM_OLLAMA_URL`, `MM_OLLAMA_MODEL`) remain available for automation and
+debugging, but `mm semantic setup` is the recommended interactive workflow.
 ## Principles
 
-- Local-first: no required cloud services.
-- Private by default: no uploads and no required LLM calls.
-- Read-only upstream: Meetily data is never modified.
-- Minimal infrastructure: no Docker, Postgres, queues, or background services.
-- Fast local search with SQLite and FTS5.
-- Plugin/MCP-ready architecture for later versions.
+Meetily Memory is built around a few simple principles:
 
-## License
-
-Apache License 2.0. See [LICENSE](LICENSE).
+- **Local-first** — no required cloud services.
+- **Private by default** — no uploads and no required LLM calls.
+- **Read-only upstream** — the Meetily database is never modified.
+- **Minimal infrastructure** — no Docker, Postgres, queues, or background services.
+- **Explainable retrieval** — every result should be traceable back to its source meeting.
+- **Fast local search** — SQLite, FTS5, and optional sqlite-vec.
+- **Extensible architecture** — prepared for future MCP and plugin integrations.
 
 ## Development
 
+Development setup:
+
 ```bash
 uv sync
+```
+
+Run the test suite:
+
+```bash
+uv run pytest -q
+```
+
+Run all quality checks:
+
+```bash
 uv run ruff check .
 uv run ruff format --check .
 uv run ty check --error all
-uv run pytest -q
+```
+
+Build the package:
+
+```bash
 uv build
 ```
 
-Pre-commit hooks are configured in `.pre-commit-config.yaml`. Install them after
-initializing the git repository:
+Enable pre-commit hooks:
 
 ```bash
 uv run pre-commit install
 ```
+
+## License
+
+Licensed under the Apache License 2.0. See [LICENSE](LICENSE).

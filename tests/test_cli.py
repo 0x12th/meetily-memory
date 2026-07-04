@@ -5,6 +5,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
+from meetily_memory.json_codec import loads_json
 
 
 def test_cli_help_uses_plain_click_format() -> None:
@@ -154,6 +155,183 @@ def test_cli_lists_structured_entities_with_source_evidence(
     questions = runner.invoke(app, ["--index", str(index_path), "questions"])
     assert questions.exit_code == 0
     assert "Open question: who owns partner review?" in questions.stdout
+
+
+def test_cli_semantic_search_lazily_indexes_chunk_embeddings(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    semantic = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "semantic",
+            "search",
+            "migration risks",
+            "--provider",
+            "hash",
+        ],
+    )
+    assert semantic.exit_code == 0
+    assert "Vladimir Follow-up" in semantic.stdout
+    assert "semantic distance:" in semantic.stdout
+    assert "embedding: hash/local-hash-v1/128d" in semantic.stdout
+    assert "open: mm open 2" in semantic.stdout
+
+    semantic_json = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "semantic",
+            "search",
+            "migration risks",
+            "--provider",
+            "hash",
+            "--json",
+        ],
+    )
+    assert semantic_json.exit_code == 0
+    payload = json.loads(semantic_json.stdout)
+    assert payload[0]["meeting_external_id"] == "meeting-2"
+    assert payload[0]["embedding_provider"] == "hash"
+    assert payload[0]["embedding_model"] == "local-hash-v1"
+    assert payload[0]["embedding_dimensions"] == 128
+    assert isinstance(payload[0]["distance"], float)
+
+
+def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    semantic_env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    setup = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "semantic",
+            "setup",
+            "--provider",
+            "hash",
+            "--model",
+            "local-hash-v1",
+        ],
+        env=semantic_env,
+    )
+    assert setup.exit_code == 0
+    assert "semantic provider: hash" in setup.stdout
+
+    config_path = data_dir / "config.json"
+    config = loads_json(config_path.read_text())
+    assert config["provider"] == "hash"
+    assert config["model"] == "local-hash-v1"
+    assert "ollama_url" not in config
+
+    shown = runner.invoke(
+        app,
+        ["--index", str(index_path), "semantic", "setup", "--show"],
+        env=semantic_env,
+    )
+    assert shown.exit_code == 0
+    assert "semantic provider: hash" in shown.stdout
+    assert "model: local-hash-v1" in shown.stdout
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    semantic_alias = runner.invoke(
+        app,
+        ["--index", str(index_path), "sem", "migration risks"],
+        env=semantic_env,
+    )
+    assert semantic_alias.exit_code == 0
+    assert "Vladimir Follow-up" in semantic_alias.stdout
+    assert "embedding: hash/local-hash-v1/128d" in semantic_alias.stdout
+
+    switch = runner.invoke(
+        app,
+        ["--index", str(index_path), "semantic", "setup", "--provider", "ollama"],
+        env=semantic_env,
+    )
+    assert switch.exit_code == 0
+    assert "semantic provider: ollama" in switch.stdout
+    assert "model: nomic-embed-text" in switch.stdout
+
+    config = loads_json(config_path.read_text())
+    assert config["provider"] == "ollama"
+    assert config["model"] == "nomic-embed-text"
+    assert config["ollama_url"] == "http://localhost:11434"
+
+
+def test_cli_semantic_setup_is_real_subcommand() -> None:
+    runner = CliRunner()
+
+    semantic_help = runner.invoke(app, ["semantic", "--help"])
+    assert semantic_help.exit_code == 0
+    assert "Commands:" in semantic_help.stdout
+    assert "setup" in semantic_help.stdout
+    assert "Search query, or `setup`" not in semantic_help.stdout
+
+    setup_help = runner.invoke(app, ["semantic", "setup", "--help"])
+    assert setup_help.exit_code == 0
+    assert "Usage: root semantic setup" in setup_help.stdout
+    assert "--provider" in setup_help.stdout
+    assert "--show" in setup_help.stdout
+
+
+def test_cli_local_memory_commands_aggregate_across_meetings(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    summary = runner.invoke(app, ["--index", str(index_path), "summary"])
+    assert summary.exit_code == 0
+    assert "Local memory summary" in summary.stdout
+    assert "meetings: 2" in summary.stdout
+    assert "latest meeting: #2 Vladimir Follow-up" in summary.stdout
+    assert "action items:" in summary.stdout
+
+    timeline = runner.invoke(app, ["--index", str(index_path), "timeline", "migration"])
+    assert timeline.exit_code == 0
+    assert "Vladimir Follow-up" in timeline.stdout
+    assert "Vladimir agreed to send migration risks by Friday." in timeline.stdout
+    assert "Source: meeting-2 / transcript-2" in timeline.stdout
+
+    project = runner.invoke(app, ["--index", str(index_path), "project", "migration"])
+    assert project.exit_code == 0
+    assert "Project memory: migration" in project.stdout
+    assert "Meetings" in project.stdout
+    assert "Vladimir Follow-up" in project.stdout
+    assert "Structured signals" in project.stdout
+
+    person = runner.invoke(app, ["--index", str(index_path), "person", "Vladimir"])
+    assert person.exit_code == 0
+    assert "Person memory: Vladimir" in person.stdout
+    assert "Latest meetings" in person.stdout
+    assert "Vladimir Follow-up" in person.stdout
+    assert "Action items" in person.stdout
+    assert "Vladimir agreed to send migration risks by Friday." in person.stdout
 
 
 def test_cli_exports_and_cleans_spotlight_markdown(meetily_db: Path, tmp_path: Path) -> None:
