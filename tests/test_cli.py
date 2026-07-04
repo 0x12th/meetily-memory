@@ -125,3 +125,46 @@ def test_cli_lists_structured_entities_with_source_evidence(
     questions = runner.invoke(app, ["--index", str(index_path), "questions"])
     assert questions.exit_code == 0
     assert "Open question: who owns partner review?" in questions.stdout
+
+
+def test_cli_exports_and_cleans_spotlight_markdown(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    output_dir = tmp_path / "Spotlight"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    analyze = runner.invoke(app, ["--index", str(index_path), "analyze"])
+    assert analyze.exit_code == 0
+
+    export = runner.invoke(
+        app,
+        ["--index", str(index_path), "spotlight", "export", "--output", str(output_dir)],
+    )
+    assert export.exit_code == 0
+    assert "meetings exported: 2" in export.stdout
+
+    exported_files = sorted(output_dir.glob("meetily-memory-*.md"))
+    assert len(exported_files) == 2
+    exported_text = "\n".join(path.read_text() for path in exported_files)
+    assert "# Vladimir Follow-up" in exported_text
+    assert "Open: mm open 2" in exported_text
+    assert "Vladimir agreed to send migration risks by Friday." in exported_text
+    assert "## Action Items" in exported_text
+    assert "## Transcript" in exported_text
+
+    user_file = output_dir / "notes.md"
+    user_file.write_text("keep me")
+
+    clean = runner.invoke(
+        app,
+        ["--index", str(index_path), "spotlight", "clean", "--output", str(output_dir)],
+    )
+    assert clean.exit_code == 0
+    assert "files removed: 2" in clean.stdout
+    assert not list(output_dir.glob("meetily-memory-*.md"))
+    assert user_file.read_text() == "keep me"

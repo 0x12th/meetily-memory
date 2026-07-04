@@ -27,6 +27,7 @@ intel_sha="$(shasum -a 256 "$tmpdir/$intel_archive" | awk '{print $1}')"
 perl -0pi -e "s{/download/v[0-9]+\\.[0-9]+\\.[0-9]+/}{/download/v$version/}g" "$formula"
 perl -0pi -e "s{meetily-memory-v[0-9]+\\.[0-9]+\\.[0-9]+-macos-arm64\\.tar\\.gz}{$arm_archive}g" "$formula"
 perl -0pi -e "s{meetily-memory-v[0-9]+\\.[0-9]+\\.[0-9]+-macos-x86_64\\.tar\\.gz}{$intel_archive}g" "$formula"
+perl -0pi -e "s/version \"[^\"]+\"/version \"$version\"/" "$formula"
 perl -0pi -e "s/sha256 \"[^\"]+\"/sha256 \"$arm_sha\"/s" "$formula"
 perl -0pi -e "s/sha256 \"$arm_sha\"(.*)sha256 \"[^\"]+\"/sha256 \"$arm_sha\"\$1sha256 \"$intel_sha\"/s" "$formula"
 

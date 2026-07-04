@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0 - 2026-07-04
+
+- Add Spotlight-friendly Markdown export and clean commands.
+
 ## 0.1.0 - 2026-07-04
 
 Initial public release of Meetily Memory.

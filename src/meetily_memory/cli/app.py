@@ -15,9 +15,15 @@ from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import dumps_json
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
+from meetily_memory.spotlight_export import (
+    clean_spotlight_markdown,
+    export_spotlight_markdown,
+)
 from meetily_memory.structure_analyzer import StructureAnalyzer
 
 app = typer.Typer(no_args_is_help=True, help="Local Meetily history index.")
+spotlight_app = typer.Typer(no_args_is_help=True, help="Export Spotlight-friendly files.")
+app.add_typer(spotlight_app, name="spotlight")
 console = Console()
 ENTITY_COMMANDS = {
     "decisions": "decisions",
@@ -328,6 +334,45 @@ def open_command(
         print_text_block(str(path))
         return
     open_path(Path(path))
+
+
+@spotlight_app.command("export")
+def spotlight_export(
+    ctx: typer.Context,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Directory for Spotlight Markdown files."),
+    ] = None,
+    transcript: Annotated[
+        bool,
+        typer.Option("--transcript/--no-transcript", help="Include transcript text."),
+    ] = True,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    result = export_spotlight_markdown(repo, output, include_transcript=transcript)
+    if json_output:
+        print_json(result.as_payload())
+        return
+    console.print(f"spotlight path: {result.output_dir}")
+    console.print(f"meetings exported: {result.meetings_exported}")
+    console.print(f"stale files removed: {result.files_removed}")
+
+
+@spotlight_app.command("clean")
+def spotlight_clean(
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Directory for Spotlight Markdown files."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    result = clean_spotlight_markdown(output)
+    if json_output:
+        print_json(result.as_payload())
+        return
+    console.print(f"spotlight path: {result.output_dir}")
+    console.print(f"files removed: {result.files_removed}")
 
 
 @app.command()
