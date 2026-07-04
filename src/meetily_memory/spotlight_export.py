@@ -52,10 +52,10 @@ def export_spotlight_markdown(
     include_transcript: bool = True,
 ) -> SpotlightExportResult:
     target_dir = output_dir or default_spotlight_output_dir()
-    removed = clean_spotlight_markdown(target_dir).files_removed
     target_dir.mkdir(parents=True, exist_ok=True)
 
     exported = 0
+    current_files: set[Path] = set()
     for meeting_id in repo.list_meeting_ids():
         meeting = repo.get_meeting(str(meeting_id))
         if meeting is None:
@@ -63,6 +63,7 @@ def export_spotlight_markdown(
         chunks = repo.get_chunks_for_meeting(meeting_id)
         entities = repo.list_structured_entities(meeting_id)
         file_path = target_dir / meeting_filename(meeting)
+        current_files.add(file_path)
         file_path.write_text(
             render_meeting_markdown(
                 meeting,
@@ -74,7 +75,20 @@ def export_spotlight_markdown(
         )
         exported += 1
 
+    removed = clean_stale_spotlight_markdown(target_dir, current_files).files_removed
     return SpotlightExportResult(target_dir, exported, removed)
+
+
+def clean_stale_spotlight_markdown(
+    output_dir: Path,
+    current_files: set[Path],
+) -> SpotlightCleanResult:
+    removed = 0
+    for path in output_dir.glob(EXPORT_FILE_GLOB):
+        if path.is_file() and path not in current_files:
+            path.unlink()
+            removed += 1
+    return SpotlightCleanResult(output_dir, removed)
 
 
 def clean_spotlight_markdown(output_dir: Path | None = None) -> SpotlightCleanResult:

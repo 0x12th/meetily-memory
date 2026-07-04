@@ -4,13 +4,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, ClassVar, override
 
+import pytest
+
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import (
     LocalHashEmbeddingProvider,
     OllamaEmbeddingProvider,
     SemanticSearchConfig,
+    assert_safe_identifier,
     embed_text,
+    index_semantic_embeddings,
     resolve_embedding_provider,
     semantic_search,
 )
@@ -70,6 +74,8 @@ def test_semantic_search_accepts_dynamic_embedding_provider(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
+    indexed = index_semantic_embeddings(index_path, embedding_provider=StubEmbeddingProvider())
+    assert indexed > 0
 
     results = semantic_search(
         index_path,
@@ -82,12 +88,31 @@ def test_semantic_search_accepts_dynamic_embedding_provider(
     assert results[0]["embedding_provider"] == "stub"
     assert results[0]["embedding_model"] == "3d"
     assert results[0]["embedding_dimensions"] == 3
-    embeddings_indexed = results[0]["embeddings_indexed"]
-    assert isinstance(embeddings_indexed, int)
-    assert embeddings_indexed > 0
-
     repo = IndexRepository(index_path)
     assert repo.stats()["chunks"] >= 4
+
+
+def test_semantic_search_does_not_index_missing_embeddings(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+
+    with pytest.raises(RuntimeError, match="Semantic index is empty"):
+        semantic_search(
+            index_path,
+            "migration blocker",
+            5,
+            embedding_provider=StubEmbeddingProvider(),
+        )
+
+
+def test_assert_safe_identifier_rejects_dynamic_sql_names() -> None:
+    assert assert_safe_identifier("chunk_embeddings_vec_128_deadbeef") == (
+        "chunk_embeddings_vec_128_deadbeef"
+    )
+    with pytest.raises(ValueError, match="Unsafe SQL identifier"):
+        assert_safe_identifier("chunk_embeddings_vec; DROP TABLE chunks")
 
 
 def test_local_hash_provider_remains_explicit_baseline() -> None:

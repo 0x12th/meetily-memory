@@ -23,6 +23,7 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ty check --error all
       - run: uv run pytest -q
+      - run: uv build
 
   build-macos:
     name: Build ${{ matrix.suffix }}

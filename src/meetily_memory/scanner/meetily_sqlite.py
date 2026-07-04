@@ -17,6 +17,7 @@ class ScanResult:
     meetings_seen: int = 0
     meetings_inserted: int = 0
     meetings_updated: int = 0
+    meetings_analyzed: int = 0
     chunks_seen: int = 0
     chunks_inserted: int = 0
     chunks_updated: int = 0
@@ -29,7 +30,7 @@ class MeetilySQLiteScanner:
         self.repo = IndexRepository(Path(index_path))
         self.structure_analyzer = StructureAnalyzer(self.repo)
 
-    def scan(self, source_path: Path, *, force: bool = False) -> ScanResult:
+    def scan(self, source_path: Path, *, force: bool = False, analyze: bool = True) -> ScanResult:
         source_path = Path(source_path)
         started_at = utc_now()
         with readonly_sqlite_connection(source_path) as conn:
@@ -51,8 +52,9 @@ class MeetilySQLiteScanner:
                     chunks,
                     force=force,
                 )
-                if existing is None or updated:
+                if analyze and (existing is None or updated):
                     self.structure_analyzer.analyze_meeting(meeting_id)
+                    result.meetings_analyzed += 1
                 result.chunks_inserted += inserted_chunks
                 if existing is None:
                     result.meetings_inserted += 1

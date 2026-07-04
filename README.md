@@ -63,14 +63,14 @@ Start with:
 
 ```bash
 mm doctor
-mm scan
+mm update
 ```
 
 If autodiscovery does not find your database, specify it explicitly:
 
 ```bash
 mm doctor --source /path/to/meeting_minutes.sqlite
-mm scan --source /path/to/meeting_minutes.sqlite
+mm update --source /path/to/meeting_minutes.sqlite
 ```
 
 Once the local index is built, try the two primary workflows:
@@ -90,25 +90,28 @@ mm c "what did we decide about pricing?"
 | Command | What it does |
 |---|---|
 | `mm doctor` | Checks Meetily autodiscovery, the local index, SQLite, and FTS5 support. |
-| `mm scan` | Syncs your Meetily history into the local `index.sqlite`. |
-| `mm analyze` | Extracts decisions, action items, risks, and open questions. |
+| `mm db status` | Shows the local index schema version. |
+| `mm update` | Syncs Meetily history and refreshes heuristic structured signals for new or changed meetings. |
+| `mm scan` | Low-level sync into the local `index.sqlite`; use `--no-analyze` to skip heuristic analysis. |
+| `mm analyze` | Rebuilds heuristic decisions, action items, risks, and open questions. |
 
 ### Search
 
 | Command | What it does |
 |---|---|
 | `mm s "query"` | Fast full-text search across meeting history. |
-| `mm sem "query"` | Experimental semantic search using sqlite-vec. |
+| `mm semantic index` | Builds or refreshes experimental sqlite-vec embeddings. |
+| `mm sem "query"` | Experimental semantic search over an existing semantic index. |
 | `mm c "question"` | Builds Markdown context ready for an LLM. |
 
 ### Knowledge
 
 | Command | What it does |
 |---|---|
-| `mm decisions` | Lists extracted decisions with source evidence. |
-| `mm tasks` | Lists extracted action items with source evidence. |
-| `mm risks` | Lists extracted risks with source evidence. |
-| `mm questions` | Lists extracted open questions with source evidence. |
+| `mm decisions` | Lists heuristic decision signals with source evidence. |
+| `mm tasks` | Lists heuristic action-item signals with source evidence. |
+| `mm risks` | Lists heuristic risk signals with source evidence. |
+| `mm questions` | Lists heuristic open-question signals with source evidence. |
 | `mm summary` | Shows a summary of the indexed local memory. |
 | `mm timeline "topic"` | Shows the timeline for a topic across meetings. |
 | `mm project "topic"` | Aggregates meetings and structured knowledge for a project or topic. |
@@ -142,6 +145,7 @@ mm semantic setup \
 After that:
 
 ```bash
+mm semantic index
 mm sem "migration blockers"
 ```
 
@@ -152,8 +156,7 @@ additional configuration commands.
 
 ```bash
 mm doctor
-mm scan
-mm analyze
+mm update
 
 mm s "migration risk"
 mm c "what risks did we discuss for the migration?"
@@ -178,7 +181,7 @@ separate macOS app, background agent, or cloud service.
 Each exported file includes:
 
 - meeting title and date;
-- extracted decisions, tasks, risks, and questions;
+- heuristic decisions, tasks, risks, and questions;
 - transcript text;
 - a `mm open <meeting-id>` hint back to the original meeting.
 
@@ -195,14 +198,14 @@ mm spotlight clean --output ~/Documents/Meetily\ Memory
 
 `--source` is optional.
 
-By default, `mm doctor` and `mm scan` search common application data locations
+By default, `mm doctor`, `mm update`, and `mm scan` search common application data locations
 for the Meetily database.
 
 If your database is stored elsewhere, specify it explicitly:
 
 ```bash
 mm doctor --source /path/to/meeting_minutes.sqlite
-mm scan --source /path/to/meeting_minutes.sqlite
+mm update --source /path/to/meeting_minutes.sqlite
 ```
 
 The source may be:
@@ -248,9 +251,15 @@ Structured meeting entities currently include:
 - risks;
 - open questions.
 
+These are structured signals extracted by local heuristics, not a verified
+fact database. Use the source evidence shown by the CLI when accuracy matters.
+
 ## Semantic Search
 
 Semantic search is optional and experimental.
+
+Ollama is not required for ordinary FTS search with `mm s` or context building
+with `mm c`.
 
 Configure a local embedding model once:
 
@@ -265,6 +274,7 @@ mm semantic setup \
 Then search semantically:
 
 ```bash
+mm semantic index
 mm sem "migration blockers"
 ```
 

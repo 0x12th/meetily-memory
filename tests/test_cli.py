@@ -116,7 +116,7 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
 
     opened = runner.invoke(app, ["--index", str(index_path), "open", "meeting-2", "--print-path"])
     assert opened.exit_code == 0
-    assert "Vladimir Follow-up" in opened.stdout
+    assert opened.stdout.strip() == str(meetily_db)
 
 
 def test_cli_lists_structured_entities_with_source_evidence(
@@ -157,9 +157,7 @@ def test_cli_lists_structured_entities_with_source_evidence(
     assert "Open question: who owns partner review?" in questions.stdout
 
 
-def test_cli_semantic_search_lazily_indexes_chunk_embeddings(
-    meetily_db: Path, tmp_path: Path
-) -> None:
+def test_cli_semantic_search_requires_explicit_index(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
 
@@ -168,6 +166,35 @@ def test_cli_semantic_search_lazily_indexes_chunk_embeddings(
         ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
     assert scan.exit_code == 0
+
+    semantic = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "semantic",
+            "search",
+            "migration risks",
+            "--provider",
+            "hash",
+        ],
+    )
+    assert semantic.exit_code != 0
+    assert "Semantic index is empty. Run: mm semantic index" in semantic.output
+
+    index = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "semantic",
+            "index",
+            "--provider",
+            "hash",
+        ],
+    )
+    assert index.exit_code == 0
+    assert "embeddings indexed:" in index.stdout
 
     semantic = runner.invoke(
         app,
@@ -207,6 +234,67 @@ def test_cli_semantic_search_lazily_indexes_chunk_embeddings(
     assert payload[0]["embedding_model"] == "local-hash-v1"
     assert payload[0]["embedding_dimensions"] == 128
     assert isinstance(payload[0]["distance"], float)
+
+
+def test_cli_open_folder_selects_meeting_folder(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    default_path = runner.invoke(
+        app,
+        ["--index", str(index_path), "open", "1", "--print-path"],
+    )
+    assert default_path.exit_code == 0
+    assert default_path.stdout.strip() == str(meetily_db)
+
+    folder_path = runner.invoke(
+        app,
+        ["--index", str(index_path), "open", "1", "--folder", "--print-path"],
+    )
+    assert folder_path.exit_code == 0
+    assert folder_path.stdout.strip() == str(tmp_path / "Launch Planning")
+
+
+def test_cli_scan_can_skip_structured_analysis(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db), "--no-analyze"],
+    )
+    assert scan.exit_code == 0
+
+    decisions = runner.invoke(app, ["--index", str(index_path), "decisions"])
+    assert decisions.exit_code == 0
+    expected_message = "No heuristic structured signals found. Run `mm analyze` after scanning."
+    assert expected_message in decisions.stdout
+
+    update = runner.invoke(
+        app,
+        ["--index", str(index_path), "update", "--source", str(meetily_db)],
+    )
+    assert update.exit_code == 0
+    assert "meetings seen: 2" in update.stdout
+    assert "meetings analyzed:" in update.stdout
+
+
+def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    status = runner.invoke(app, ["--index", str(index_path), "db", "status"])
+
+    assert status.exit_code == 0
+    assert f"index path: {index_path}" in status.stdout
+    assert "schema version: 2" in status.stdout
+    assert "current schema version: 2" in status.stdout
 
 
 def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path: Path) -> None:
@@ -252,6 +340,14 @@ def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path:
         ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
     assert scan.exit_code == 0
+
+    semantic_index = runner.invoke(
+        app,
+        ["--index", str(index_path), "semantic", "index"],
+        env=semantic_env,
+    )
+    assert semantic_index.exit_code == 0
+    assert "embeddings indexed:" in semantic_index.stdout
 
     semantic_alias = runner.invoke(
         app,

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from meetily_memory.context_builder import build_context_markdown
+from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION, MIGRATIONS, migrate_to_v1
 from meetily_memory.db.repository import IndexRepository, build_fts_query
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
@@ -42,6 +43,23 @@ def test_index_schema_uses_builtin_sqlite_migration(tmp_path: Path) -> None:
         for sql in EMPTY_ENTITY_COUNT_SQL:
             assert conn.execute(sql).fetchone()[0] == 0
         repo.stats()
+
+
+def test_index_schema_runs_explicit_migrations_from_v1(tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    with sqlite3.connect(index_path) as conn:
+        migrate_to_v1(conn)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+
+    IndexRepository(index_path)
+
+    with sqlite3.connect(index_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        for target_version in range(1, CURRENT_SCHEMA_VERSION + 1):
+            assert target_version in MIGRATIONS
+        for sql in EMPTY_ENTITY_COUNT_SQL:
+            assert conn.execute(sql).fetchone()[0] == 0
 
 
 def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path: Path) -> None:

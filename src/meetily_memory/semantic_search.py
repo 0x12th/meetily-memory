@@ -31,6 +31,7 @@ DEFAULT_OLLAMA_TIMEOUT_SECONDS = 30.0
 OLLAMA_BATCH_SIZE = 16
 VECTOR_TABLE_HASH_LENGTH = 12
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 FEATURE_HASH_SIZE = 8
 HASH_BUCKET_BYTES = 4
 LOAD_EXTENSION_DISABLED = False
@@ -137,7 +138,9 @@ def semantic_search(
     with index_connection(index_path) as conn:
         load_sqlite_vec(conn)
         ensure_semantic_schema(conn, vector_table, dimensions)
-        indexed = index_missing_embeddings(conn, provider, vector_table, dimensions)
+        if count_indexed_embeddings(conn, provider, dimensions) == 0:
+            message = "Semantic index is empty. Run: mm semantic index"
+            raise RuntimeError(message)
         semantic_sql = f"""
             WITH matches AS (
               SELECT rowid AS chunk_id, distance
@@ -164,8 +167,7 @@ def semantic_search(
               matches.distance AS distance,
               e.embedding_provider AS embedding_provider,
               e.embedding_model AS embedding_model,
-              e.embedding_dimensions AS embedding_dimensions,
-              ? AS embeddings_indexed
+              e.embedding_dimensions AS embedding_dimensions
             FROM matches
             JOIN chunks c ON c.id = matches.chunk_id
             JOIN meetings m ON m.id = c.meeting_id
@@ -181,13 +183,28 @@ def semantic_search(
             (
                 serialize_float32(query_embedding),
                 limit,
-                indexed,
                 provider.name,
                 provider.model,
                 dimensions,
             ),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def index_semantic_embeddings(
+    index_path: Path,
+    *,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> int:
+    provider = embedding_provider or resolve_embedding_provider()
+    dimensions = provider.dims
+    if dimensions is None:
+        dimensions = len(provider.embed([""])[0])
+    vector_table = vector_table_name(provider, dimensions)
+    with index_connection(index_path) as conn:
+        load_sqlite_vec(conn)
+        ensure_semantic_schema(conn, vector_table, dimensions)
+        return index_missing_embeddings(conn, provider, vector_table, dimensions)
 
 
 def resolve_embedding_provider(
@@ -271,6 +288,7 @@ def ensure_semantic_schema(
     vector_table: str,
     dimensions: int,
 ) -> None:
+    vector_table = assert_safe_identifier(vector_table)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS chunk_embeddings (
@@ -303,6 +321,7 @@ def index_missing_embeddings(
     vector_table: str,
     dimensions: int,
 ) -> int:
+    vector_table = assert_safe_identifier(vector_table)
     rows = conn.execute(
         """
         SELECT c.id, c.text, c.fingerprint
@@ -371,7 +390,33 @@ def ensure_embedding_metadata_columns(conn: sqlite3.Connection) -> None:
 def vector_table_name(provider: EmbeddingProvider, dimensions: int) -> str:
     model_key = f"{provider.name}:{provider.model}:{dimensions}"
     digest = hashlib.sha256(model_key.encode()).hexdigest()[:VECTOR_TABLE_HASH_LENGTH]
-    return f"chunk_embeddings_vec_{dimensions}_{digest}"
+    return assert_safe_identifier(f"chunk_embeddings_vec_{dimensions}_{digest}")
+
+
+def assert_safe_identifier(value: str) -> str:
+    if SQL_IDENTIFIER_RE.fullmatch(value) is None:
+        message = f"Unsafe SQL identifier: {value}"
+        raise ValueError(message)
+    return value
+
+
+def count_indexed_embeddings(
+    conn: sqlite3.Connection,
+    provider: EmbeddingProvider,
+    dimensions: int,
+) -> int:
+    return int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM chunk_embeddings
+            WHERE embedding_provider = ?
+              AND embedding_model = ?
+              AND embedding_dimensions = ?
+            """,
+            (provider.name, provider.model, dimensions),
+        ).fetchone()[0]
+    )
 
 
 def ollama_embed_endpoint(base_url: str) -> str:

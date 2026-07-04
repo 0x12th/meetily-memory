@@ -13,7 +13,9 @@ from rich.table import Table
 from meetily_memory import __version__ as fallback_version
 from meetily_memory.config.paths import default_index_path, discover_meetily_db
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, build_context_markdown
+from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.db.schema import index_connection
 from meetily_memory.json_codec import dumps_json
 from meetily_memory.local_memory import (
     person_memory as build_person_memory,
@@ -31,6 +33,7 @@ from meetily_memory.semantic_search import (
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OLLAMA_URL,
     SemanticSearchConfig,
+    index_semantic_embeddings,
     load_semantic_config,
     resolve_embedding_provider,
     save_semantic_config,
@@ -68,8 +71,17 @@ spotlight_app = typer.Typer(
     rich_markup_mode=None,
     suggest_commands=False,
 )
+db_app = typer.Typer(
+    no_args_is_help=True,
+    help="Inspect the local index database.",
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    rich_markup_mode=None,
+    suggest_commands=False,
+)
 app.add_typer(semantic_app, name="semantic")
 app.add_typer(spotlight_app, name="spotlight")
+app.add_typer(db_app, name="db")
 console = Console()
 ENTITY_COMMANDS = {
     "decisions": "decisions",
@@ -171,17 +183,26 @@ def scan(
         bool,
         typer.Option("--force", help="Reindex unchanged meetings and rebuild FTS rows."),
     ] = False,
+    analyze_output: Annotated[
+        bool,
+        typer.Option("--analyze/--no-analyze", help="Analyze new or changed meetings."),
+    ] = True,
 ) -> None:
     source_path = source or discover_meetily_db()
     if source_path is None:
         message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
         raise typer.BadParameter(message)
-    result = MeetilySQLiteScanner(ctx.obj["index_path"]).scan(source_path, force=force)
+    result = MeetilySQLiteScanner(ctx.obj["index_path"]).scan(
+        source_path,
+        force=force,
+        analyze=analyze_output,
+    )
     payload = {
         "source_id": result.source_id,
         "meetings_seen": result.meetings_seen,
         "meetings_inserted": result.meetings_inserted,
         "meetings_updated": result.meetings_updated,
+        "meetings_analyzed": result.meetings_analyzed,
         "chunks_seen": result.chunks_seen,
         "chunks_inserted": result.chunks_inserted,
         "chunks_updated": result.chunks_updated,
@@ -192,7 +213,80 @@ def scan(
     console.print(f"meetings seen: {result.meetings_seen}")
     console.print(f"meetings inserted: {result.meetings_inserted}")
     console.print(f"meetings updated: {result.meetings_updated}")
+    console.print(f"meetings analyzed: {result.meetings_analyzed}")
     console.print(f"chunks seen: {result.chunks_seen}")
+
+
+@app.command()
+def update(
+    ctx: typer.Context,
+    source: Annotated[
+        Path | None,
+        typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
+    ] = None,
+    semantic: Annotated[
+        bool,
+        typer.Option("--semantic", help="Also update configured semantic embeddings."),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    source_path = source or discover_meetily_db()
+    if source_path is None:
+        message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
+        raise typer.BadParameter(message)
+    result = MeetilySQLiteScanner(ctx.obj["index_path"]).scan(source_path, analyze=True)
+    embeddings_indexed = 0
+    if semantic:
+        try:
+            provider = resolve_embedding_provider()
+            embeddings_indexed = index_semantic_embeddings(
+                ctx.obj["index_path"],
+                embedding_provider=provider,
+            )
+        except RuntimeError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    payload = {
+        "source_id": result.source_id,
+        "meetings_seen": result.meetings_seen,
+        "meetings_inserted": result.meetings_inserted,
+        "meetings_updated": result.meetings_updated,
+        "meetings_analyzed": result.meetings_analyzed,
+        "chunks_seen": result.chunks_seen,
+        "chunks_inserted": result.chunks_inserted,
+        "chunks_updated": result.chunks_updated,
+        "embeddings_indexed": embeddings_indexed,
+    }
+    if json_output:
+        print_json(payload)
+        return
+    console.print(f"meetings seen: {result.meetings_seen}")
+    console.print(f"meetings inserted: {result.meetings_inserted}")
+    console.print(f"meetings updated: {result.meetings_updated}")
+    console.print(f"meetings analyzed: {result.meetings_analyzed}")
+    console.print(f"chunks seen: {result.chunks_seen}")
+    if semantic:
+        console.print(f"embeddings indexed: {embeddings_indexed}")
+
+
+@db_app.command("status")
+def db_status(
+    ctx: typer.Context,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    index_path = ctx.obj["index_path"]
+    with index_connection(index_path) as conn:
+        schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    payload = {
+        "index_path": str(index_path),
+        "schema_version": schema_version,
+        "current_schema_version": CURRENT_SCHEMA_VERSION,
+    }
+    if json_output:
+        print_json(payload)
+        return
+    print_text_block(f"index path: {index_path}")
+    print_text_block(f"schema version: {schema_version}")
+    print_text_block(f"current schema version: {CURRENT_SCHEMA_VERSION}")
 
 
 @app.command()
@@ -336,6 +430,48 @@ def semantic_setup_command(
     ] = False,
 ) -> None:
     semantic_setup(provider, model, ollama_url, show=show)
+
+
+@semantic_app.command("index")
+def semantic_index_command(
+    ctx: typer.Context,
+    embedding_provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider",
+            "--embedding-provider",
+            help="Embedding provider: ollama or hash.",
+        ),
+    ] = None,
+    embedding_model: Annotated[
+        str | None,
+        typer.Option("--model", "--embedding-model", help="Ollama embedding model name."),
+    ] = None,
+    ollama_url: Annotated[
+        str | None,
+        typer.Option("--ollama-url", help="Ollama base URL."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        provider = resolve_embedding_provider(
+            embedding_provider,
+            ollama_model=embedding_model,
+            ollama_url=ollama_url,
+        )
+        indexed = index_semantic_embeddings(ctx.obj["index_path"], embedding_provider=provider)
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = {
+        "embedding_provider": provider.name,
+        "embedding_model": provider.model,
+        "embeddings_indexed": indexed,
+    }
+    if json_output:
+        print_json(payload)
+        return
+    print_text_block(f"embedding: {provider.name}/{provider.model}")
+    print_text_block(f"embeddings indexed: {indexed}")
 
 
 def semantic_setup(
@@ -586,9 +722,10 @@ def print_structured_entities(
         print_json(rows)
         return
     if not rows:
-        console.print("No structured entities found. Run `mm analyze` after scanning.")
+        console.print("No heuristic structured signals found. Run `mm analyze` after scanning.")
         return
 
+    print_text_block(f"Heuristic {ENTITY_LABELS[kind].casefold()}")
     for row in rows:
         source_parts = [
             str(row["meeting_external_id"]),
@@ -690,13 +827,13 @@ def open_command(
     folder: Annotated[bool, typer.Option("--folder")] = False,
     print_path: Annotated[bool, typer.Option("--print-path")] = False,
 ) -> None:
-    del folder
     repo = IndexRepository(ctx.obj["index_path"])
     meeting = repo.get_meeting(meeting_id)
     if not meeting:
         message = f"Meeting not found: {meeting_id}"
         raise typer.BadParameter(message)
-    path = meeting.get("folder_path") or meeting.get("source_path")
+    path = meeting.get("folder_path") if folder else meeting.get("source_path")
+    path = path or meeting.get("folder_path") or meeting.get("source_path")
     if not path:
         message = f"Meeting has no path: {meeting_id}"
         raise typer.BadParameter(message)
