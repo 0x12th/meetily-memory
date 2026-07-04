@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Split the root README into a concise product overview and detailed docs under `docs/`.
 - Add export-only integration adapters for Obsidian notes, Gbrain JSONL, Markdown bundles, and generic task tracker drafts.
 - Add a local MCP server that exposes Core API tools over FastMCP.
 - Add a versioned Core API for retrieval, context, memory, topic, graph, and task-status operations.
