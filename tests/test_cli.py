@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from meetily_memory.cli.app import app
 from meetily_memory.cli.common import open_path
 from meetily_memory.json_codec import loads_json
+from tests.semantic_helpers import requires_sqlite_vec
 
 
 def test_cli_help_uses_plain_click_format() -> None:
@@ -181,6 +182,7 @@ def test_cli_topic_uses_meeting_language_for_russian_topic(
     assert "Добрыня подтвердил план миграции." in topic.stdout
 
 
+@requires_sqlite_vec
 def test_cli_semantic_search_requires_explicit_index(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
@@ -308,6 +310,7 @@ def test_cli_scan_can_skip_structured_analysis(meetily_db: Path, tmp_path: Path)
     assert "meetings analyzed:" in refresh.stdout
 
 
+@requires_sqlite_vec
 def test_cli_refresh_runs_configured_semantic_without_autosync(
     meetily_db: Path, tmp_path: Path
 ) -> None:
@@ -404,6 +407,7 @@ def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
     assert "current schema version: 3" in status.stdout
 
 
+@requires_sqlite_vec
 def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     semantic_env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}

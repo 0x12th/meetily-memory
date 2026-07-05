@@ -24,6 +24,7 @@ from meetily_memory.semantic_search import (
     semantic_search,
     vector_table_name,
 )
+from tests.semantic_helpers import requires_sqlite_vec
 
 
 class StubEmbeddingProvider:
@@ -88,6 +89,7 @@ class RecordingOllamaHandler(BaseHTTPRequestHandler):
         return None
 
 
+@requires_sqlite_vec
 def test_semantic_search_accepts_dynamic_embedding_provider(
     meetily_db: Path, tmp_path: Path
 ) -> None:
@@ -111,6 +113,7 @@ def test_semantic_search_accepts_dynamic_embedding_provider(
     assert repo.stats()["chunks"] >= 4
 
 
+@requires_sqlite_vec
 def test_semantic_index_batches_missing_embeddings(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
@@ -122,6 +125,7 @@ def test_semantic_index_batches_missing_embeddings(meetily_db: Path, tmp_path: P
     assert [len(call) for call in provider.calls] == [2, 2, 2]
 
 
+@requires_sqlite_vec
 def test_semantic_index_cleans_orphaned_vector_rows(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
@@ -148,6 +152,7 @@ def test_semantic_index_cleans_orphaned_vector_rows(meetily_db: Path, tmp_path: 
     assert orphaned == 0
 
 
+@requires_sqlite_vec
 def test_semantic_search_does_not_index_missing_embeddings(
     meetily_db: Path, tmp_path: Path
 ) -> None:
