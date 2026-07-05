@@ -21,7 +21,7 @@ from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import index_connection
 from meetily_memory.integrations import sync_obsidian_vault
-from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner, inspect_meetily_schema
 from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
 from meetily_memory.semantic_search import (
     index_semantic_embeddings,
@@ -237,7 +237,7 @@ def refresh(
         message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
         raise typer.BadParameter(message)
     settings = load_app_settings()
-    run_semantic = semantic or bool(load_semantic_config().provider and settings.autosync_enabled)
+    run_semantic = semantic or bool(load_semantic_config().provider)
     payload, _ = scan_update(ctx.obj["index_path"], source_path, semantic=run_semantic)
     settings = update_app_settings(source_path=str(source_path), last_update_at=utc_now_iso())
     obsidian_synced = False
@@ -355,12 +355,18 @@ def doctor(
     repo = IndexRepository(index_path)
     source_path = source or discover_meetily_db()
     source_readable = can_open_readonly_sqlite(source_path) if source_path else False
+    source_schema_valid = False
+    source_schema_error = None
+    if source_path and source_readable:
+        source_schema_valid, source_schema_error = inspect_meetily_schema(source_path)
     fts5 = sqlite_has_fts5()
     stats = repo.stats()
     payload = {
         "index_path": str(index_path),
         "source_path": str(source_path) if source_path else None,
         "source_readable": source_readable,
+        "source_schema_valid": source_schema_valid,
+        "source_schema_error": source_schema_error,
         "fts5": fts5,
         **stats,
     }
@@ -370,6 +376,9 @@ def doctor(
     console.print(f"index path: {index_path}")
     console.print(f"source path: {source_path or 'not found'}")
     console.print(f"source readable: {'yes' if source_readable else 'no'}")
+    console.print(f"source schema: {'valid' if source_schema_valid else 'invalid'}")
+    if source_schema_error:
+        console.print(f"source schema error: {source_schema_error}")
     console.print(f"fts5: {'yes' if fts5 else 'no'}")
     console.print(f"meetings: {stats['meetings']}")
     console.print(f"chunks: {stats['chunks']}")

@@ -1,10 +1,14 @@
 import json
+import sqlite3
 from importlib.metadata import version
 from pathlib import Path
 
+import pytest
+import typer
 from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
+from meetily_memory.cli.common import open_path
 from meetily_memory.json_codec import loads_json
 
 
@@ -261,6 +265,67 @@ def test_cli_scan_can_skip_structured_analysis(meetily_db: Path, tmp_path: Path)
     assert "meetings analyzed:" in refresh.stdout
 
 
+def test_cli_refresh_runs_configured_semantic_without_autosync(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    data_dir = tmp_path / "data"
+    env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+
+    init = runner.invoke(
+        app,
+        ["--index", str(index_path), "init", "--source", str(meetily_db), "--no-autosync"],
+        env=env,
+    )
+    assert init.exit_code == 0
+
+    semantic_init = runner.invoke(
+        app,
+        ["semantic", "init", "--provider", "hash", "--model", "local-hash-v1"],
+        env=env,
+    )
+    assert semantic_init.exit_code == 0
+
+    refresh = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db), "--json"],
+        env=env,
+    )
+
+    assert refresh.exit_code == 0
+    payload = loads_json(refresh.stdout)
+    assert payload["embeddings_indexed"] > 0
+
+
+def test_cli_doctor_reports_meetily_schema_status(tmp_path: Path) -> None:
+    source_path = tmp_path / "meeting_minutes.sqlite"
+    with sqlite3.connect(source_path) as conn:
+        conn.execute("CREATE TABLE meetings (id TEXT PRIMARY KEY)")
+        conn.commit()
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    doctor = runner.invoke(
+        app,
+        ["--index", str(index_path), "doctor", "--source", str(source_path), "--json"],
+    )
+
+    assert doctor.exit_code == 0
+    payload = loads_json(doctor.stdout)
+    assert payload["source_readable"] is True
+    assert payload["source_schema_valid"] is False
+    assert "Meetily DB schema is unsupported" in payload["source_schema_error"]
+    assert "meetings" in payload["source_schema_error"]
+
+
+def test_open_path_reports_missing_path(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+
+    with pytest.raises(typer.BadParameter, match="Path does not exist"):
+        open_path(missing)
+
+
 def test_cli_update_upgrades_homebrew_package(tmp_path: Path) -> None:
     runner = CliRunner()
     brew = tmp_path / "brew"
@@ -319,11 +384,11 @@ def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path:
     assert setup.exit_code == 0
     assert "semantic provider: hash" in setup.stdout
 
-    config_path = data_dir / "config.json"
+    config_path = data_dir / "settings.json"
     config = loads_json(config_path.read_text())
-    assert config["provider"] == "hash"
-    assert config["model"] == "local-hash-v1"
-    assert "ollama_url" not in config
+    assert config["semantic"]["provider"] == "hash"
+    assert config["semantic"]["model"] == "local-hash-v1"
+    assert config["semantic"]["ollama_url"] is None
 
     shown = runner.invoke(
         app,
@@ -367,9 +432,9 @@ def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path:
     assert "model: nomic-embed-text" in switch.stdout
 
     config = loads_json(config_path.read_text())
-    assert config["provider"] == "ollama"
-    assert config["model"] == "nomic-embed-text"
-    assert config["ollama_url"] == "http://localhost:11434"
+    assert config["semantic"]["provider"] == "ollama"
+    assert config["semantic"]["model"] == "nomic-embed-text"
+    assert config["semantic"]["ollama_url"] == "http://localhost:11434"
 
 
 def test_cli_semantic_init_is_real_subcommand() -> None:

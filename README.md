@@ -2,10 +2,10 @@
 
 Search.
 Context.
-Ask.
+Optional ask.
 
 Meetily Memory turns local Meetily meetings into a private, source-backed memory
-you can search, understand, and ask.
+you can search and turn into LLM-ready context.
 
 It is for the moment when:
 
@@ -21,7 +21,27 @@ service.
 
 ---
 
-## What You Can Do
+## What Works Today
+
+Core:
+
+- `mm s` searches indexed meetings.
+- `mm c` builds paste-ready Markdown context for ChatGPT, Claude, or Codex.
+- `mm topic` shows source-backed topic memory.
+- `mm refresh` updates the local index from the read-only Meetily database.
+
+Optional:
+
+- `mm ask` answers through a configured provider. In manual mode it prints the
+  prompt/context for you to paste into another LLM.
+- `mm semantic` adds local semantic search through Ollama or a deterministic
+  hash diagnostic baseline.
+- `mm obsidian` maintains a managed Obsidian vault when configured.
+
+Experimental:
+
+- `mm mcp serve` exposes an optional MCP adapter. It requires the MCP extra for
+  non-binary installs.
 
 Everyday flow:
 
@@ -37,12 +57,6 @@ Build clean context for ChatGPT, Claude, or Codex:
 mm c "what did we decide about the migration?"
 ```
 
-Ask your meeting history directly:
-
-```bash
-mm ask "what is still open?"
-```
-
 Open the original meeting folder:
 
 ```bash
@@ -54,8 +68,6 @@ Refresh the local index from Meetily:
 ```bash
 mm refresh
 ```
-
-Advanced views and integrations:
 
 See everything known about a topic:
 
@@ -141,8 +153,8 @@ Ask meeting memory:
 mm ask "what remains unresolved?"
 ```
 
-Use this when you want Meetily Memory to prepare the context and answer through
-the configured provider. In manual mode it prints the prompt instead.
+Use this only after `mm llm init`. In manual mode it prints the prompt/context
+instead of calling a model.
 
 Explore a topic:
 
@@ -224,17 +236,25 @@ mm llm init
 
 Supported providers:
 
-- Manual (prepare context for ChatGPT or Claude)
-- Ollama (local models)
+- Manual: prepare context for ChatGPT or Claude.
+- Ollama: call a local model.
 
-Then simply ask:
+Then ask:
 
 ```bash
 mm ask "what is still open?"
 ```
 
-Meetily Memory retrieves the relevant evidence first, then sends only the
-selected context to the configured provider.
+Meetily Memory retrieves the relevant evidence first, then either prints the
+manual prompt or sends only the selected context to the configured provider.
+
+---
+
+## Experimental: MCP
+
+`mm mcp serve` is an experimental adapter for external agents. It is optional
+for pip/uv installs via `meetily-memory[mcp]`; without that extra, the command
+prints an install hint instead of starting a server.
 
 ---
 
@@ -267,10 +287,10 @@ selected context to the configured provider.
                       │
         ┌─────────────┼──────────────┐
         ▼             ▼              ▼
-      CLI          Obsidian      LLM / Ask
+     CLI       Optional Obsidian   Optional Ask
                                      │
                                      ▼
-                            Experimental MCP
+                              Experimental MCP
 ```
 
 Meetily Memory stores only derived local state:

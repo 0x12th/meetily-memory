@@ -4,6 +4,7 @@ import sys
 from contextlib import closing
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from shutil import which
 
 import typer
 from rich.console import Console
@@ -98,8 +99,17 @@ def compact_date(value: object) -> str:
 
 
 def open_path(path: Path) -> None:
+    if not path.exists():
+        message = f"Path does not exist: {path}"
+        raise typer.BadParameter(message)
     opener = "open" if sys.platform == "darwin" else "xdg-open"
-    subprocess.run([opener, str(path)], check=False)
+    if which(opener) is None:
+        message = f"Path opener was not found: {opener}"
+        raise typer.BadParameter(message)
+    result = subprocess.run([opener, str(path)], check=False)
+    if result.returncode != 0:
+        message = f"Could not open path: {path}"
+        raise typer.BadParameter(message)
 
 
 def sqlite_has_fts5() -> bool:

@@ -1,4 +1,5 @@
 import hashlib
+import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,6 +36,7 @@ class MeetilySQLiteScanner:
         source_path = Path(source_path)
         started_at = utc_now()
         with readonly_sqlite_connection(source_path) as conn:
+            validate_meetily_schema(conn)
             result = ScanResult()
             source_id = self.repo.upsert_source(
                 self.source_kind,
@@ -107,6 +109,47 @@ class MeetilySQLiteScanner:
 def optional_row(conn: Any, query: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
     row = conn.execute(query, params).fetchone()
     return dict(row) if row else None
+
+
+REQUIRED_MEETILY_SCHEMA = {
+    "meetings": {"id", "title", "created_at", "updated_at", "folder_path"},
+    "transcripts": {
+        "id",
+        "meeting_id",
+        "transcript",
+        "timestamp",
+        "audio_start_time",
+        "audio_end_time",
+        "speaker",
+    },
+    "summary_processes": {"meeting_id", "result"},
+    "meeting_notes": {"meeting_id", "notes_markdown"},
+}
+
+
+def inspect_meetily_schema(source_path: Path) -> tuple[bool, str | None]:
+    try:
+        with readonly_sqlite_connection(source_path) as conn:
+            validate_meetily_schema(conn)
+    except (RuntimeError, sqlite3.Error) as exc:
+        return False, str(exc)
+    return True, None
+
+
+def validate_meetily_schema(conn: Any) -> None:
+    for table, required_columns in REQUIRED_MEETILY_SCHEMA.items():
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if not rows:
+            message = f"Meetily DB schema is unsupported: missing table {table}"
+            raise RuntimeError(message)
+        actual_columns = {str(row["name"]) for row in rows}
+        missing_columns = sorted(required_columns - actual_columns)
+        if missing_columns:
+            message = (
+                "Meetily DB schema is unsupported: "
+                f"missing columns {table}.{', '.join(missing_columns)}"
+            )
+            raise RuntimeError(message)
 
 
 def normalize_meeting(

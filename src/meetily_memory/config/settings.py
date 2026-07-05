@@ -22,12 +22,20 @@ class LLMSettings:
 
 
 @dataclass(frozen=True)
+class SemanticSettings:
+    provider: str | None = None
+    model: str | None = None
+    ollama_url: str | None = None
+
+
+@dataclass(frozen=True)
 class AppSettings:
     source_path: str | None = None
     autosync_enabled: bool = False
     last_update_at: str | None = None
     obsidian: ObsidianSettings = ObsidianSettings()
     llm: LLMSettings = LLMSettings()
+    semantic: SemanticSettings = SemanticSettings()
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -45,6 +53,11 @@ class AppSettings:
                 "model": self.llm.model,
                 "ollama_url": self.llm.ollama_url,
             },
+            "semantic": {
+                "provider": self.semantic.provider,
+                "model": self.semantic.model,
+                "ollama_url": self.semantic.ollama_url,
+            },
         }
 
 
@@ -57,14 +70,17 @@ def load_app_settings() -> AppSettings:
         return AppSettings()
     obsidian_payload = payload.get("obsidian")
     llm_payload = payload.get("llm")
+    semantic_payload = payload.get("semantic")
     obsidian = obsidian_from_payload(obsidian_payload if isinstance(obsidian_payload, dict) else {})
     llm = llm_from_payload(llm_payload if isinstance(llm_payload, dict) else {})
+    semantic = semantic_from_payload(semantic_payload if isinstance(semantic_payload, dict) else {})
     return AppSettings(
         source_path=optional_str(payload.get("source_path")),
         autosync_enabled=bool(payload.get("autosync_enabled", False)),
         last_update_at=optional_str(payload.get("last_update_at")),
         obsidian=obsidian,
         llm=llm,
+        semantic=semantic,
     )
 
 
@@ -87,6 +103,7 @@ def update_app_settings(**changes: object) -> AppSettings:
         last_update_at=string_change(changes, "last_update_at", settings.last_update_at),
         obsidian=obsidian_change(changes.get("obsidian"), settings.obsidian),
         llm=llm_change(changes.get("llm"), settings.llm),
+        semantic=semantic_change(changes.get("semantic"), settings.semantic),
     )
     save_app_settings(updated)
     return updated
@@ -109,6 +126,14 @@ def llm_from_payload(payload: dict[str, Any]) -> LLMSettings:
     )
 
 
+def semantic_from_payload(payload: dict[str, Any]) -> SemanticSettings:
+    return SemanticSettings(
+        provider=optional_str(payload.get("provider")),
+        model=optional_str(payload.get("model")),
+        ollama_url=optional_str(payload.get("ollama_url")),
+    )
+
+
 def obsidian_change(value: object, current: ObsidianSettings) -> ObsidianSettings:
     if isinstance(value, ObsidianSettings):
         return value
@@ -117,6 +142,12 @@ def obsidian_change(value: object, current: ObsidianSettings) -> ObsidianSetting
 
 def llm_change(value: object, current: LLMSettings) -> LLMSettings:
     if isinstance(value, LLMSettings):
+        return value
+    return current
+
+
+def semantic_change(value: object, current: SemanticSettings) -> SemanticSettings:
+    if isinstance(value, SemanticSettings):
         return value
     return current
 

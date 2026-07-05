@@ -7,6 +7,7 @@ from typing import Any, ClassVar, override
 import pytest
 
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.db.schema import index_connection
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import (
     LocalHashEmbeddingProvider,
@@ -14,9 +15,14 @@ from meetily_memory.semantic_search import (
     SemanticSearchConfig,
     assert_safe_identifier,
     embed_text,
+    ensure_semantic_schema,
+    index_missing_embeddings,
     index_semantic_embeddings,
+    load_semantic_config,
+    load_sqlite_vec,
     resolve_embedding_provider,
     semantic_search,
+    vector_table_name,
 )
 
 
@@ -36,6 +42,19 @@ class StubEmbeddingProvider:
             else:
                 embeddings.append([0.0, 0.0, 1.0])
         return embeddings
+
+
+class RecordingBatchEmbeddingProvider:
+    name = "recording"
+    model = "3d"
+    dims: int | None = 3
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(texts)
+        return [[1.0, 0.0, 0.0] for _ in texts]
 
 
 class RecordingOllamaHandler(BaseHTTPRequestHandler):
@@ -90,6 +109,43 @@ def test_semantic_search_accepts_dynamic_embedding_provider(
     assert results[0]["embedding_dimensions"] == 3
     repo = IndexRepository(index_path)
     assert repo.stats()["chunks"] >= 4
+
+
+def test_semantic_index_batches_missing_embeddings(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    provider = RecordingBatchEmbeddingProvider()
+
+    indexed = index_semantic_embeddings(index_path, embedding_provider=provider, batch_size=2)
+
+    assert indexed > 2
+    assert [len(call) for call in provider.calls] == [2, 2, 2]
+
+
+def test_semantic_index_cleans_orphaned_vector_rows(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    provider = StubEmbeddingProvider()
+    index_semantic_embeddings(index_path, embedding_provider=provider)
+
+    vector_table = vector_table_name(provider, 3)
+    with index_connection(index_path) as conn:
+        load_sqlite_vec(conn)
+        conn.execute("DELETE FROM chunks WHERE id = (SELECT MIN(id) FROM chunks)")
+        conn.commit()
+        ensure_semantic_schema(conn, vector_table, 3)
+
+        indexed = index_missing_embeddings(conn, provider, vector_table, 3, batch_size=2)
+        orphaned = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM {vector_table}
+            WHERE rowid NOT IN (SELECT id FROM chunks)
+            """  # noqa: S608
+        ).fetchone()[0]
+
+    assert indexed == 0
+    assert orphaned == 0
 
 
 def test_semantic_search_does_not_index_missing_embeddings(
@@ -161,6 +217,26 @@ def test_resolve_embedding_provider_reads_persisted_config() -> None:
     assert isinstance(provider, OllamaEmbeddingProvider)
     assert provider.model == "mxbai-embed-large"
     assert provider.base_url == "http://configured.test:11434"
+
+
+def test_load_semantic_config_reads_legacy_config_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MEETILY_MEMORY_DATA_DIR", str(tmp_path))
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "provider": "hash",
+                "model": "local-hash-v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_semantic_config()
+
+    assert config.provider == "hash"
+    assert config.ollama_model == "local-hash-v1"
 
 
 def test_ollama_embedding_provider_uses_current_embed_endpoint() -> None:

@@ -7,10 +7,10 @@ This page describes the public command model after scope narrowing.
 | Command | Public role |
 |---|---|
 | `mm init` | First-run setup. Discovers the Meetily DB, creates `index.sqlite`, runs the first refresh, and asks before enabling automatic index refreshes. |
-| `mm refresh` | Main manual index refresh. Reads the Meetily DB, updates the local index, and rebuilds structured memory. If configured, it also runs semantic indexing and Obsidian sync after the refresh. |
+| `mm refresh` | Main manual index refresh. Reads the Meetily DB, updates the local index, and rebuilds structured memory. If semantic search or Obsidian are configured, it also refreshes those derived layers. |
 | `mm update` | Updates the installed `meetily-memory` utility through Homebrew. |
 | `mm status` | Short system state: Meetily DB path, index path, last refresh, autosync, Obsidian, LLM, and semantic status. |
-| `mm doctor` | Diagnostics only. Checks Meetily DB access, SQLite/FTS5/sqlite-vec support, index permissions, and config. It does not change state. |
+| `mm doctor` | Diagnostics only. Checks Meetily DB access/schema, SQLite/FTS5/sqlite-vec support, index permissions, and config. It does not change state. |
 
 ## Search And Context
 
@@ -23,27 +23,27 @@ This page describes the public command model after scope narrowing.
 | `mm c "what did we decide about migration?"` | Builds paste-ready Markdown context with sources for ChatGPT, Claude, Codex, or another LLM. Use when you want to copy context elsewhere. |
 | `mm topic "migration"` | Advanced topic dossier: related meetings, decisions, tasks, risks, questions, people, and sources. Internally uses the knowledge layer and graph projection. |
 
-## Semantic Search
+## Optional: Semantic Search
 
 | Command | Public role |
 |---|---|
-| `mm semantic init` | Configures the embedding provider, such as Ollama or a deterministic hash diagnostic baseline. |
-| `mm semantic index` | Explicitly builds or refreshes embeddings for chunks. It is not hidden behind search. |
+| `mm semantic init` | Configures the embedding provider, such as Ollama or a deterministic hash diagnostic baseline. Settings are stored in the main app settings file. |
+| `mm semantic index` | Explicitly builds or refreshes embeddings for chunks. `mm refresh` also updates embeddings once semantic search is configured. |
 | `mm sem "migration blockers"` | Semantic search. If embeddings are missing, it asks the user to run `mm semantic index`. |
 
-## LLM / Ask
+## Optional: LLM / Ask
 
 | Command | Public role |
 |---|---|
 | `mm llm init` | Configures the provider used by `mm ask`. Initial modes are `manual` and `ollama`; `agent` is reserved for later. |
-| `mm ask "what did we decide about migration?"` | Retrieves relevant context and asks through the configured provider. |
+| `mm ask "what did we decide about migration?"` | Retrieves relevant context and asks through the configured provider. In manual mode, it prints the prompt/context instead of answering directly. |
 | `mm ask --meeting 12 "what are the action items?"` | Asks within one meeting. |
 | `mm ask --topic "migration" "what is still open?"` | Asks against topic memory. |
 
 In `manual` mode, `mm ask` outputs the prompt/context for manual use instead of
 calling a model.
 
-## Obsidian
+## Optional: Obsidian
 
 | Command | Public role |
 |---|---|

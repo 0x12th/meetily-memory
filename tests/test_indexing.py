@@ -164,6 +164,64 @@ def test_fts_query_filters_natural_language_noise() -> None:
     )
 
 
+def test_search_prefers_strict_token_matches_before_or_fallback(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    scanner = MeetilySQLiteScanner(index_path)
+    scanner.scan(meetily_db)
+    with sqlite3.connect(meetily_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "meeting-3",
+                "Migration Only",
+                "2026-07-03T10:00:00Z",
+                "2026-07-03T10:30:00Z",
+                str(tmp_path / "Migration Only"),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO transcripts (
+                id, meeting_id, transcript, timestamp, audio_start_time,
+                audio_end_time, duration, speaker
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "transcript-5",
+                "meeting-3",
+                "Migration notes were reviewed.",
+                "10:05:00",
+                300.0,
+                310.0,
+                10.0,
+                "Alice",
+            ),
+        )
+        conn.commit()
+    scanner.scan(meetily_db)
+
+    results = IndexRepository(index_path).search("migration risks")
+
+    assert results[0]["meeting_external_id"] == "meeting-2"
+    assert "migration risks" in str(results[0]["text"])
+
+
+def test_scan_reports_unsupported_meetily_schema(tmp_path: Path) -> None:
+    source_path = tmp_path / "meeting_minutes.sqlite"
+    with sqlite3.connect(source_path) as conn:
+        conn.execute("CREATE TABLE meetings (id TEXT PRIMARY KEY)")
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="Meetily DB schema is unsupported"):
+        MeetilySQLiteScanner(tmp_path / "index.sqlite").scan(source_path)
+
+
 def test_scan_is_incremental_and_replaces_changed_meeting_chunks(
     meetily_db: Path, tmp_path: Path
 ) -> None:

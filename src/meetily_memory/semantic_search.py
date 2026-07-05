@@ -17,9 +17,10 @@ from urllib.request import Request, urlopen
 import sqlite_vec
 from sqlite_vec import serialize_float32
 
-from meetily_memory.config.paths import semantic_config_path
+from meetily_memory.config.paths import app_config_path, semantic_config_path
+from meetily_memory.config.settings import SemanticSettings, load_app_settings, update_app_settings
 from meetily_memory.db.schema import index_connection
-from meetily_memory.json_codec import dumps_json, loads_json
+from meetily_memory.json_codec import loads_json
 
 EMBEDDING_DIMENSIONS = 128
 Row = dict[str, object]
@@ -29,6 +30,7 @@ DEFAULT_OLLAMA_MODEL = "nomic-embed-text"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 30.0
 OLLAMA_BATCH_SIZE = 16
+DEFAULT_SEMANTIC_INDEX_BATCH_SIZE = 128
 VECTOR_TABLE_HASH_LENGTH = 12
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -195,6 +197,7 @@ def index_semantic_embeddings(
     index_path: Path,
     *,
     embedding_provider: EmbeddingProvider | None = None,
+    batch_size: int = DEFAULT_SEMANTIC_INDEX_BATCH_SIZE,
 ) -> int:
     provider = embedding_provider or resolve_embedding_provider()
     dimensions = provider.dims
@@ -204,7 +207,13 @@ def index_semantic_embeddings(
     with index_connection(index_path) as conn:
         load_sqlite_vec(conn)
         ensure_semantic_schema(conn, vector_table, dimensions)
-        return index_missing_embeddings(conn, provider, vector_table, dimensions)
+        return index_missing_embeddings(
+            conn,
+            provider,
+            vector_table,
+            dimensions,
+            batch_size=batch_size,
+        )
 
 
 def resolve_embedding_provider(
@@ -244,10 +253,21 @@ def resolve_embedding_provider(
 
 
 def load_semantic_config() -> SemanticSearchConfig:
+    settings = load_app_settings()
+    if settings.semantic.provider:
+        return SemanticSearchConfig(
+            provider=settings.semantic.provider,
+            ollama_model=settings.semantic.model,
+            ollama_url=settings.semantic.ollama_url,
+        )
+    return load_legacy_semantic_config()
+
+
+def load_legacy_semantic_config() -> SemanticSearchConfig:
     path = semantic_config_path()
     if not path.exists():
         return SemanticSearchConfig()
-    payload = loads_json(path.read_text())
+    payload = loads_json(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         return SemanticSearchConfig()
     return SemanticSearchConfig(
@@ -258,10 +278,14 @@ def load_semantic_config() -> SemanticSearchConfig:
 
 
 def save_semantic_config(config: SemanticSearchConfig) -> Path:
-    path = semantic_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dumps_json(config.as_payload()) + "\n")
-    return path
+    update_app_settings(
+        semantic=SemanticSettings(
+            provider=config.provider,
+            model=config.ollama_model,
+            ollama_url=config.ollama_url,
+        )
+    )
+    return app_config_path()
 
 
 def optional_str(value: object) -> str | None:
@@ -320,55 +344,75 @@ def index_missing_embeddings(
     provider: EmbeddingProvider,
     vector_table: str,
     dimensions: int,
+    *,
+    batch_size: int = DEFAULT_SEMANTIC_INDEX_BATCH_SIZE,
 ) -> int:
     vector_table = assert_safe_identifier(vector_table)
-    rows = conn.execute(
-        """
-        SELECT c.id, c.text, c.fingerprint
-        FROM chunks c
-        LEFT JOIN chunk_embeddings e
-          ON e.chunk_id = c.id
-         AND e.embedding_provider = ?
-         AND e.embedding_model = ?
-         AND e.embedding_dimensions = ?
-        WHERE e.chunk_id IS NULL
-           OR e.chunk_fingerprint != c.fingerprint
-        ORDER BY c.id
-        """,
-        (provider.name, provider.model, dimensions),
-    ).fetchall()
-    if not rows:
-        return 0
-    embeddings = provider.embed([str(row["text"] or "") for row in rows])
-    for row, embedding in zip(rows, embeddings, strict=True):
-        chunk_id = int(row["id"])
-        conn.execute(
+    if batch_size < 1:
+        message = "Semantic index batch size must be at least 1."
+        raise ValueError(message)
+    cleanup_orphaned_vector_rows(conn, vector_table)
+    indexed = 0
+    while True:
+        rows = conn.execute(
             """
-            DELETE FROM chunk_embeddings
-            WHERE chunk_id = ?
-              AND embedding_provider = ?
-              AND embedding_model = ?
-              AND embedding_dimensions = ?
+            SELECT c.id, c.text, c.fingerprint
+            FROM chunks c
+            LEFT JOIN chunk_embeddings e
+              ON e.chunk_id = c.id
+             AND e.embedding_provider = ?
+             AND e.embedding_model = ?
+             AND e.embedding_dimensions = ?
+            WHERE e.chunk_id IS NULL
+               OR e.chunk_fingerprint != c.fingerprint
+            ORDER BY c.id
+            LIMIT ?
             """,
-            (chunk_id, provider.name, provider.model, len(embedding)),
-        )
-        conn.execute(f"DELETE FROM {vector_table} WHERE rowid = ?", (chunk_id,))
-        conn.execute(
-            """
-            INSERT INTO chunk_embeddings (
-              chunk_id, embedding_provider, embedding_model, embedding_dimensions,
-              chunk_fingerprint, created_at, updated_at
+            (provider.name, provider.model, dimensions, batch_size),
+        ).fetchall()
+        if not rows:
+            conn.commit()
+            return indexed
+        embeddings = provider.embed([str(row["text"] or "") for row in rows])
+        for row, embedding in zip(rows, embeddings, strict=True):
+            chunk_id = int(row["id"])
+            conn.execute(
+                """
+                DELETE FROM chunk_embeddings
+                WHERE chunk_id = ?
+                  AND embedding_provider = ?
+                  AND embedding_model = ?
+                  AND embedding_dimensions = ?
+                """,
+                (chunk_id, provider.name, provider.model, len(embedding)),
             )
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """,
-            (chunk_id, provider.name, provider.model, len(embedding), row["fingerprint"]),
-        )
-        conn.execute(
-            f"INSERT INTO {vector_table}(rowid, embedding) VALUES (?, ?)",
-            (chunk_id, serialize_float32(embedding)),
-        )
-    conn.commit()
-    return len(rows)
+            conn.execute(f"DELETE FROM {vector_table} WHERE rowid = ?", (chunk_id,))
+            conn.execute(
+                """
+                INSERT INTO chunk_embeddings (
+                  chunk_id, embedding_provider, embedding_model, embedding_dimensions,
+                  chunk_fingerprint, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (chunk_id, provider.name, provider.model, len(embedding), row["fingerprint"]),
+            )
+            conn.execute(
+                f"INSERT INTO {vector_table}(rowid, embedding) VALUES (?, ?)",
+                (chunk_id, serialize_float32(embedding)),
+            )
+        conn.commit()
+        indexed += len(rows)
+
+
+def cleanup_orphaned_vector_rows(conn: sqlite3.Connection, vector_table: str) -> None:
+    vector_table = assert_safe_identifier(vector_table)
+    conn.execute(
+        f"""
+        DELETE FROM {vector_table}
+        WHERE rowid NOT IN (SELECT id FROM chunks)
+        """
+    )
 
 
 def ensure_embedding_metadata_columns(conn: sqlite3.Connection) -> None:

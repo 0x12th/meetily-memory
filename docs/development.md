@@ -26,6 +26,14 @@ Build the package:
 uv build
 ```
 
+Repository boundary:
+
+`IndexRepository` is a compatibility facade for the public core API and legacy
+call sites. New low-level persistence behavior should live in concrete
+repositories such as search, meetings, knowledge, entities, or task status.
+New user-facing workflows should be added in `core`, not as pass-through
+methods on the facade.
+
 Enable pre-commit hooks:
 
 ```bash
