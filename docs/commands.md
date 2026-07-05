@@ -1,66 +1,94 @@
 # Command Reference
 
-This page lists the primary CLI commands. Use `mm <command> --help` for exact
-options.
+This page describes the public command model after scope narrowing.
 
-## Setup
+## Core
 
-| Command | What it does |
+| Command | Public role |
 |---|---|
-| `mm doctor` | Checks Meetily autodiscovery, the local index, SQLite, and FTS5 support. |
-| `mm db status` | Shows the local index schema version. |
-| `mm update` | Syncs Meetily history and refreshes heuristic structured signals for new or changed meetings. |
-| `mm scan` | Low-level sync into the local `index.sqlite`; use `--no-analyze` to skip heuristic analysis. |
-| `mm analyze` | Rebuilds heuristic decisions, action items, risks, and open questions. |
+| `mm init` | First-run setup. Discovers the Meetily DB, creates `index.sqlite`, runs the first update, and asks before enabling automatic updates. |
+| `mm update` | Main manual refresh. Reads the Meetily DB, updates the local index, and rebuilds structured memory. If configured, it also runs semantic indexing and Obsidian sync after the update. |
+| `mm status` | Short system state: Meetily DB path, index path, last update, autosync, Obsidian, LLM, and semantic status. |
+| `mm doctor` | Diagnostics only. Checks Meetily DB access, SQLite/FTS5/sqlite-vec support, index permissions, and config. It does not change state. |
 
-## Search
+## Search And Context
 
-| Command | What it does |
+| Command | Public role |
 |---|---|
-| `mm s "query"` | Fast full-text search across meeting history. |
-| `mm c "question"` | Builds Markdown context ready for an LLM. |
-| `mm semantic index` | Builds or refreshes experimental sqlite-vec embeddings. |
-| `mm sem "query"` | Experimental semantic search over an existing semantic index. |
+| `mm s "migration risk"` | Fast FTS search over indexed meetings. Returns meeting id, title, chunk id, timestamp/source, and enough evidence to open the source. |
+| `mm open 12` | Opens the source meeting. |
+| `mm open 12 --folder` | Opens the meeting folder. |
+| `mm open 12 --print-path` | Prints the source path without opening it. |
+| `mm c "what did we decide about migration?"` | Builds paste-ready Markdown context with sources for ChatGPT, Claude, Codex, or another LLM. |
+| `mm topic "migration"` | Shows topic memory: related meetings, decisions, tasks, risks, questions, people, and sources. Internally uses the knowledge layer and graph projection. |
 
-## Knowledge
+## Semantic Search
 
-| Command | What it does |
+| Command | Public role |
 |---|---|
-| `mm decisions` | Lists heuristic decision signals with source evidence. |
-| `mm tasks` | Lists open heuristic action-item signals with source evidence. |
-| `mm tasks --status all` | Lists action-item signals including local manual status overrides. |
-| `mm task-status <task-id> done` | Locally marks an action item as `open`, `done`, `cancelled`, or `unknown`. |
-| `mm risks` | Lists heuristic risk signals with source evidence. |
-| `mm questions` | Lists heuristic open-question signals with source evidence. |
-| `mm summary` | Shows a summary of the indexed local memory. |
-| `mm timeline "topic"` | Shows the timeline for a topic across meetings. |
-| `mm topic "topic"` | Shows source-backed topic memory across meetings. |
-| `mm topic "topic" --alias "alias"` | Adds a local alias for a topic. |
-| `mm project "topic"` | Aggregates meetings and structured knowledge for a project or topic. |
-| `mm person "name"` | Aggregates meetings and structured knowledge for a person. |
-| `mm graph "topic"` | Projects topic memory as local graph edges; use `--json` for agents. |
+| `mm semantic init` | Configures the embedding provider, such as Ollama or a deterministic hash diagnostic baseline. |
+| `mm semantic index` | Explicitly builds or refreshes embeddings for chunks. It is not hidden behind search. |
+| `mm sem "migration blockers"` | Semantic search. If embeddings are missing, it asks the user to run `mm semantic index`. |
 
-## Navigation
+## LLM / Ask
 
-| Command | What it does |
+| Command | Public role |
 |---|---|
-| `mm last` | Shows the latest indexed meeting. |
-| `mm p "Vladimir"` | Finds meetings related to a person. |
-| `mm open <meeting-id>` | Opens the source meeting or prints its location. |
+| `mm llm init` | Configures the provider used by `mm ask`. Initial modes are `manual` and `ollama`; `agent` is reserved for later. |
+| `mm ask "what did we decide about migration?"` | Retrieves relevant context and asks through the configured provider. |
+| `mm ask --meeting 12 "what are the action items?"` | Asks within one meeting. |
+| `mm ask --topic "migration" "what is still open?"` | Asks against topic memory. |
 
-## Exports
+In `manual` mode, `mm ask` outputs the prompt/context for manual use instead of
+calling a model.
 
-| Command | What it does |
+## Obsidian
+
+| Command | Public role |
 |---|---|
-| `mm spotlight export` | Exports searchable Markdown files for Spotlight. |
-| `mm spotlight clean` | Removes only files generated by Spotlight export. |
-| `mm export obsidian "topic" --output ~/Vault/Meetily` | Exports a source-backed Obsidian topic note with wiki links. |
-| `mm export gbrain "topic" --output ./gbrain.jsonl` | Exports Core API envelopes as JSONL for Gbrain-style import. |
-| `mm export markdown "topic" --output ./topic.md` | Exports a portable Markdown context bundle. |
-| `mm export task-draft "query" --output ./task.md` | Creates a generic task tracker draft without write-back. |
+| `mm obsidian init` | Configures the vault path, folder, and whether to sync after every `mm update`. |
+| `mm obsidian sync` | Creates or updates the managed Obsidian note network. |
+| `mm obsidian status` | Shows Obsidian settings and the last sync state. |
 
-## Agents
+The default vault path is `~/Documents/Obsidian`. The default folder is
+`Meetily Memory`.
 
-| Command | What it does |
+`mm obsidian sync` should maintain:
+
+```text
+Topics/
+Meetings/
+People/
+Tasks/
+Decisions/
+Risks/
+Questions/
+```
+
+Managed notes use:
+
+```html
+<!-- meetily-memory:managed -->
+```
+
+## Automatic Updates
+
+| Command | Public role |
 |---|---|
-| `mm mcp serve` | Runs the local MCP server over stdio by default. |
+| `mm autosync start` | Installs or starts the background update job. On macOS this is launchd; on Linux it is systemd when available. |
+| `mm autosync stop` | Disables automatic updates and removes generated launchd/systemd files when present. |
+| `mm autosync status` | Shows whether automatic updates are enabled and when they last ran. |
+
+The background cycle runs `mm update`, then semantic indexing if configured, then
+Obsidian sync if configured.
+
+There should be no separate public watch command.
+
+## Low-Level And Advanced
+
+| Command | Role |
+|---|---|
+| `mm scan` | Low-level Meetily DB indexing for debugging and tests. Ordinary users use `mm update`. |
+| `mm analyze` | Rebuilds structured memory manually for debug or repair. |
+| `mm db status` | Shows schema version and local index internals. |
+| `mm mcp serve` | Experimental MCP adapter for external agents. It is optional for pip/uv installs via `meetily-memory[mcp]`. |

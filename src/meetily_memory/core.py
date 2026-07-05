@@ -52,6 +52,22 @@ class MeetilyMemoryCore:
             },
         )
 
+    def build_meeting_context(self, question: str, meeting_id: str, limit: int = 8) -> CoreResponse:
+        meeting = self.repo.get_meeting(meeting_id)
+        if meeting is None:
+            message = f"Meeting not found: {meeting_id}"
+            raise ValueError(message)
+        evidence = self.repo.search(question, limit, meeting_id=int(meeting["id"]))
+        return CoreResponse(
+            "meeting_context",
+            {
+                "question": question,
+                "meeting": meeting,
+                "markdown": build_context_markdown(question, evidence),
+                "evidence": evidence,
+            },
+        )
+
     def meetings(self, limit: int = 20, person: str | None = None) -> CoreResponse:
         return CoreResponse(
             "meetings",

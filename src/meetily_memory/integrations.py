@@ -3,223 +3,243 @@ from pathlib import Path
 from typing import Any, cast
 
 from meetily_memory.core import MeetilyMemoryCore
-from meetily_memory.json_codec import dumps_json
-from meetily_memory.spotlight_export import slugify
+from meetily_memory.db.repository import IndexRepository
 
 
 @dataclass(frozen=True)
-class FileExportResult:
-    path: Path
-    format: str
-
-    def as_payload(self) -> dict[str, str]:
-        return {
-            "path": str(self.path),
-            "format": self.format,
-        }
-
-
-@dataclass(frozen=True)
-class MultiFileExportResult:
-    output_dir: Path
-    files: list[Path]
-    format: str
+class ObsidianSyncResult:
+    root_dir: Path
+    files_written: int
+    files_skipped: int
 
     def as_payload(self) -> dict[str, Any]:
         return {
-            "output_dir": str(self.output_dir),
-            "files": [str(path) for path in self.files],
-            "format": self.format,
+            "root_dir": str(self.root_dir),
+            "files_written": self.files_written,
+            "files_skipped": self.files_skipped,
         }
 
 
-def export_obsidian_topic(
+MANAGED_MARKER = "<!-- meetily-memory:managed -->"
+OBSIDIAN_DIRS = (
+    "Topics",
+    "Meetings",
+    "People",
+    "Tasks",
+    "Decisions",
+    "Risks",
+    "Questions",
+)
+
+
+def sync_obsidian_vault(
     index_path: Path,
-    topic: str,
-    output_dir: Path,
+    vault_path: Path,
+    folder: str = "Meetily Memory",
     *,
-    limit: int = 10,
-) -> MultiFileExportResult:
+    limit: int = 100,
+) -> ObsidianSyncResult:
+    root_dir = vault_path.expanduser() / folder
+    for directory in OBSIDIAN_DIRS:
+        (root_dir / directory).mkdir(parents=True, exist_ok=True)
+
     core = MeetilyMemoryCore(index_path)
-    topic_payload = core.topic(topic, limit).data
-    graph_payload = core.graph(topic).data
-    output_dir.mkdir(parents=True, exist_ok=True)
-    topic_path = output_dir / f"{slugify(str(topic_payload['topic']['title'])) or 'topic'}.md"
-    topic_path.write_text(
-        render_obsidian_topic(topic_payload, graph_payload),
-        encoding="utf-8",
+    repo = core.repo
+    files_written = 0
+    files_skipped = 0
+    people: dict[str, dict[str, Any]] = {}
+
+    written, skipped = sync_obsidian_meetings(root_dir, repo, limit)
+    files_written += written
+    files_skipped += skipped
+
+    written, skipped, topic_people = sync_obsidian_topics(root_dir, core, limit)
+    files_written += written
+    files_skipped += skipped
+    people.update(topic_people)
+
+    written, skipped, entity_people = sync_obsidian_entities(root_dir, repo, limit)
+    files_written += written
+    files_skipped += skipped
+    people.update(entity_people)
+
+    written, skipped = sync_obsidian_people(root_dir, people)
+    files_written += written
+    files_skipped += skipped
+
+    return ObsidianSyncResult(
+        root_dir=root_dir,
+        files_written=files_written,
+        files_skipped=files_skipped,
     )
-    return MultiFileExportResult(output_dir=output_dir, files=[topic_path], format="obsidian")
 
 
-def export_gbrain_bundle(
-    index_path: Path,
-    query: str,
-    output_path: Path,
-    *,
-    limit: int = 10,
-) -> FileExportResult:
-    core = MeetilyMemoryCore(index_path)
-    records = [
-        core.topic(query, limit).as_payload(),
-        core.build_context(f"What do we know about {query}?", limit).as_payload(),
-        core.graph(query).as_payload(),
-        core.timeline(query, limit).as_payload(),
+def sync_obsidian_meetings(
+    root_dir: Path,
+    repo: IndexRepository,
+    limit: int,
+) -> tuple[int, int]:
+    files_written = 0
+    files_skipped = 0
+    for meeting in repo.list_meetings(limit=limit):
+        path = root_dir / "Meetings" / f"{safe_note_name(str(meeting['title']))}.md"
+        written = write_managed_note(path, render_obsidian_meeting_note(meeting))
+        files_written += int(written)
+        files_skipped += int(not written)
+    return files_written, files_skipped
+
+
+def sync_obsidian_topics(
+    root_dir: Path,
+    core: MeetilyMemoryCore,
+    limit: int,
+) -> tuple[int, int, dict[str, dict[str, Any]]]:
+    files_written = 0
+    files_skipped = 0
+    people: dict[str, dict[str, Any]] = {}
+    for topic in core.repo.list_topics(limit=limit):
+        title = str(topic["title"])
+        payload = core.topic(title).data
+        path = root_dir / "Topics" / f"{safe_note_name(title)}.md"
+        written = write_managed_note(path, render_obsidian_topic_memory(payload))
+        files_written += int(written)
+        files_skipped += int(not written)
+        people.update(people_from_topic_payload(payload))
+    return files_written, files_skipped, people
+
+
+def sync_obsidian_entities(
+    root_dir: Path,
+    repo: IndexRepository,
+    limit: int,
+) -> tuple[int, int, dict[str, dict[str, Any]]]:
+    files_written = 0
+    files_skipped = 0
+    people: dict[str, dict[str, Any]] = {}
+    entity_dirs = {
+        "action_items": "Tasks",
+        "decisions": "Decisions",
+        "risks": "Risks",
+        "open_questions": "Questions",
+    }
+    for entity in repo.list_all_structured_entity_details(limit=limit):
+        directory = entity_dirs.get(str(entity["kind"]))
+        if directory is None:
+            continue
+        filename = safe_note_name(str(entity["text"])[:80]) or f"{entity['kind']}-{entity['id']}"
+        path = root_dir / directory / f"{filename}.md"
+        written = write_managed_note(path, render_obsidian_entity_note(entity))
+        files_written += int(written)
+        files_skipped += int(not written)
+        for person in payload_people(entity):
+            people[person.casefold()] = {"display_name": person}
+    return files_written, files_skipped, people
+
+
+def sync_obsidian_people(
+    root_dir: Path,
+    people: dict[str, dict[str, Any]],
+) -> tuple[int, int]:
+    files_written = 0
+    files_skipped = 0
+    for person in people.values():
+        display_name = str(person["display_name"])
+        path = root_dir / "People" / f"{safe_note_name(display_name)}.md"
+        written = write_managed_note(path, render_obsidian_person_note(display_name))
+        files_written += int(written)
+        files_skipped += int(not written)
+    return files_written, files_skipped
+
+
+def write_managed_note(path: Path, text: str) -> bool:
+    if path.exists() and MANAGED_MARKER not in path.read_text(encoding="utf-8"):
+        return False
+    write_text_file(path, text)
+    return True
+
+
+def render_obsidian_meeting_note(meeting: dict[str, Any]) -> str:
+    lines = [
+        f"# {meeting['title']}",
+        "",
+        MANAGED_MARKER,
+        "",
+        f"- Meetily ID: `{meeting['external_id']}`",
+        f"- Date: {meeting.get('updated_at') or meeting.get('created_at') or ''}",
+        f"- Open: `mm open {meeting['id']}`",
     ]
-    write_text_file(output_path, "\n".join(dumps_json(record) for record in records) + "\n")
-    return FileExportResult(path=output_path, format="gbrain-jsonl")
+    return "\n".join(lines).rstrip() + "\n"
 
 
-def export_markdown_bundle(
-    index_path: Path,
-    query: str,
-    output_path: Path,
-    *,
-    limit: int = 10,
-) -> FileExportResult:
-    core = MeetilyMemoryCore(index_path)
-    topic_payload = core.topic(query, limit).data
-    context_payload = core.build_context(f"What do we know about {query}?", limit).data
-    timeline_payload = core.timeline(query, limit).data
-    write_text_file(
-        output_path,
-        render_markdown_bundle(query, topic_payload, context_payload, timeline_payload),
-    )
-    return FileExportResult(path=output_path, format="markdown")
-
-
-def export_task_tracker_draft(
-    index_path: Path,
-    *,
-    task_query: str,
-    output_path: Path,
-    tracker: str = "generic",
-    limit: int = 20,
-) -> FileExportResult:
-    core = MeetilyMemoryCore(index_path)
-    task_payload = core.structured_entities("action_items", limit, status="open").data
-    matching_tasks = [
-        task for task in task_payload["entities"] if row_matches_text(task, task_query)
-    ]
-    selected_task = matching_tasks[0] if matching_tasks else None
-    context_payload = core.build_context(task_query, limit=5).data
-    write_text_file(
-        output_path,
-        render_task_tracker_draft(tracker, task_query, selected_task, context_payload),
-    )
-    return FileExportResult(path=output_path, format="task-tracker-draft")
-
-
-def render_obsidian_topic(
-    topic_payload: dict[str, Any],
-    graph_payload: dict[str, Any],
-) -> str:
+def render_obsidian_topic_memory(topic_payload: dict[str, Any]) -> str:
     topic = topic_payload["topic"]
     lines = [
         f"# {topic['title']}",
         "",
-        "<!-- meetily-memory obsidian export -->",
+        MANAGED_MARKER,
         "",
-        "## Summary",
+        "## Meetings",
         "",
-        f"- Topic: [[{topic['title']}]]",
-        "- Source: Meetily Memory Core API",
     ]
-    related_meetings = unique_meeting_titles(topic_payload.get("meetings", []))
-    if related_meetings:
-        lines.extend(["", "## Related Meetings", ""])
-        lines.extend(f"- [[{title}]]" for title in related_meetings)
-
+    meetings = unique_meeting_titles(topic_payload.get("meetings", []))
+    lines.extend(f"- [[{title}]]" for title in meetings)
     lines.extend(render_signal_sections(topic_payload.get("structured_signals", []), obsidian=True))
-
-    edges = graph_payload.get("edges", [])
-    if edges:
-        lines.extend(["", "## Graph Edges", ""])
-        nodes = [
-            cast("dict[str, Any]", node)
-            for node in graph_payload.get("nodes", [])
-            if isinstance(node, dict)
-        ]
-        node_titles = {int(node["id"]): str(node["title"]) for node in nodes}
-        for edge in edges:
-            if not isinstance(edge, dict):
-                continue
-            from_title = node_titles.get(int(edge["from_node_id"]), str(edge["from_node_id"]))
-            to_title = node_titles.get(int(edge["to_node_id"]), str(edge["to_node_id"]))
-            lines.append(f"- [[{from_title}]] --{edge['relation']}--> [[{to_title}]]")
-
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def render_markdown_bundle(
-    query: str,
-    topic_payload: dict[str, Any],
-    context_payload: dict[str, Any],
-    timeline_payload: dict[str, Any],
-) -> str:
-    lines = [
-        f"# Meetily Memory: {query}",
-        "",
-        "<!-- meetily-memory markdown export -->",
-        "",
-        "## Topic Summary",
-        "",
-    ]
-    lines.extend(
-        render_signal_sections(topic_payload.get("structured_signals", []), obsidian=False)
-    )
-    lines.extend(["", "## Timeline", ""])
-    signals = timeline_payload.get("signals", [])
-    if signals:
+    people = topic_payload.get("related_people", [])
+    if isinstance(people, list) and people:
+        lines.extend(["", "## People", ""])
         lines.extend(
-            f"- {signal.get('meeting_date') or ''}: {signal['text']} ({source_label(signal)})"
-            for signal in signals
+            f"- [[{person['display_name']}]]"
+            for person in people
+            if isinstance(person, dict) and person.get("display_name")
         )
-    else:
-        lines.append("No timeline signals.")
-    lines.extend(["", "## LLM Context", "", str(context_payload["markdown"])])
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_task_tracker_draft(
-    tracker: str,
-    task_query: str,
-    task: dict[str, Any] | None,
-    context_payload: dict[str, Any],
-) -> str:
-    title = str(task["text"]) if task else task_query
+def render_obsidian_entity_note(entity: dict[str, Any]) -> str:
+    title = str(entity["text"])
     lines = [
-        "# Task Draft",
+        f"# {title}",
         "",
-        f"Tracker: {tracker}",
-        f"Title: {title}",
+        MANAGED_MARKER,
         "",
-        "## Description",
+        f"- Kind: `{entity['kind']}`",
+        f"- Meeting: [[{entity['meeting_title']}]]",
+        f"- Source: {source_label(entity)}",
+        f"- Confidence: {float(entity['confidence']):.2f}",
         "",
         title,
     ]
-    if task:
-        lines.extend(
-            [
-                "",
-                "## Source Evidence",
-                "",
-                f"- Source: {source_label(task)}",
-                f"- Status: {task.get('status', 'open')}",
-                f"- Confidence: {float(task['confidence']):.2f}",
-            ]
-        )
-    lines.extend(["", "## Context", "", str(context_payload["markdown"])])
-    lines.extend(
-        [
-            "",
-            "## Integration Notes",
-            "",
-            "- Draft only; no tracker write-back was performed.",
-            "- Copy this into Jira, Yandex Tracker, or another task tracker.",
-        ]
-    )
+    if entity.get("status"):
+        lines.insert(6, f"- Status: `{entity['status']}`")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def render_obsidian_person_note(display_name: str) -> str:
+    lines = [
+        f"# {display_name}",
+        "",
+        MANAGED_MARKER,
+        "",
+        f"- Person: {display_name}",
+    ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def payload_people(entity: dict[str, Any]) -> list[str]:
+    value = entity.get("assignee") or entity.get("owner") or entity.get("person")
+    return [str(value)] if value else []
+
+
+def people_from_topic_payload(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    people: dict[str, dict[str, Any]] = {}
+    related_people = payload.get("related_people", [])
+    if not isinstance(related_people, list):
+        return people
+    for person in related_people:
+        if isinstance(person, dict) and person.get("display_name"):
+            display_name = str(person["display_name"])
+            people[display_name.casefold()] = {"display_name": display_name}
+    return people
 
 
 def render_signal_sections(rows: object, *, obsidian: bool) -> list[str]:
@@ -276,21 +296,10 @@ def source_label(row: dict[str, Any]) -> str:
     return source
 
 
-def row_matches_text(row: dict[str, Any], query: str) -> bool:
-    terms = [term.casefold() for term in query.split() if term.strip()]
-    haystack = " ".join(
-        str(row.get(key) or "")
-        for key in (
-            "text",
-            "meeting_title",
-            "meeting_external_id",
-            "chunk_external_id",
-            "chunk_speaker",
-        )
-    ).casefold()
-    return all(term in haystack for term in terms)
-
-
 def write_text_file(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def safe_note_name(value: str) -> str:
+    return "".join("_" if char in '/\\:*?"<>|' else char for char in value).strip()

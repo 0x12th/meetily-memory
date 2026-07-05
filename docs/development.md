@@ -31,8 +31,3 @@ Enable pre-commit hooks:
 ```bash
 uv run pre-commit install
 ```
-
-## Documentation Layout
-
-The root `README.md` is intentionally short and product-facing. Detailed user
-and developer docs live in `docs/`.

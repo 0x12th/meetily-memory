@@ -390,7 +390,6 @@ name = "meetily-memory"
 version = "0.2.1"
 source = { editable = "." }
 dependencies = [
-    { name = "mcp", extra = ["cli"] },
     { name = "orjson" },
     { name = "platformdirs" },
     { name = "rich" },
@@ -398,8 +397,14 @@ dependencies = [
     { name = "typer" },
 ]
 
+[package.optional-dependencies]
+mcp = [
+    { name = "mcp", extra = ["cli"] },
+]
+
 [package.dev-dependencies]
 dev = [
+    { name = "mcp", extra = ["cli"] },
     { name = "pre-commit" },
     { name = "pyinstaller" },
     { name = "pytest" },
@@ -409,16 +414,18 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", extras = ["cli"], specifier = ">=1.27,<2" },
+    { name = "mcp", extras = ["cli"], marker = "extra == 'mcp'", specifier = ">=1.27,<2" },
     { name = "orjson", specifier = ">=3.10.0" },
     { name = "platformdirs", specifier = ">=4.3.0" },
     { name = "rich", specifier = ">=13.9.0" },
     { name = "sqlite-vec", specifier = ">=0.1.9,<0.2.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
+provides-extras = ["mcp"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "mcp", extras = ["cli"], specifier = ">=1.27,<2" },
     { name = "pre-commit", specifier = ">=4.0.0" },
     { name = "pyinstaller", specifier = ">=6.11.0" },
     { name = "pytest", specifier = ">=8.3.0" },

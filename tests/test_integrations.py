@@ -1,63 +1,39 @@
-import json
 from pathlib import Path
 
-from meetily_memory.integrations import (
-    export_gbrain_bundle,
-    export_markdown_bundle,
-    export_obsidian_topic,
-    export_task_tracker_draft,
-)
+from meetily_memory.integrations import MANAGED_MARKER, sync_obsidian_vault
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 
 
-def test_obsidian_topic_export_contains_links_summary_and_evidence(
-    meetily_db: Path, tmp_path: Path
-) -> None:
+def test_obsidian_sync_creates_managed_note_network(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
-    output_dir = tmp_path / "vault"
+    vault_path = tmp_path / "vault"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
 
-    result = export_obsidian_topic(index_path, "migration", output_dir)
+    result = sync_obsidian_vault(index_path, vault_path, "Meetily Memory")
 
-    topic_note = result.files[0]
-    text = topic_note.read_text(encoding="utf-8")
-    assert topic_note.name == "migration.md"
-    assert "[[Vladimir Follow-up]]" in text
-    assert "## Unresolved Tasks" in text
-    assert "Vladimir agreed to send migration risks by Friday." in text
-    assert "Source: meeting-2 / transcript-2" in text
+    root = vault_path / "Meetily Memory"
+    assert result.root_dir == root
+    assert result.files_written >= 6
+    assert (root / "Meetings" / "Vladimir Follow-up.md").exists()
+    assert (root / "Tasks").is_dir()
+    task_notes = list((root / "Tasks").glob("*.md"))
+    assert task_notes
+    task_text = task_notes[0].read_text(encoding="utf-8")
+    assert MANAGED_MARKER in task_text
+    assert "[[Vladimir Follow-up]]" in task_text
+    assert "Source: meeting-2 /" in task_text
 
 
-def test_gbrain_and_markdown_exports_are_core_backed(meetily_db: Path, tmp_path: Path) -> None:
+def test_obsidian_sync_does_not_overwrite_unmanaged_notes(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
-    output_dir = tmp_path / "exports"
+    vault_path = tmp_path / "vault"
+    root = vault_path / "Meetily Memory"
+    unmanaged = root / "Meetings" / "Vladimir Follow-up.md"
+    unmanaged.parent.mkdir(parents=True)
+    unmanaged.write_text("personal note", encoding="utf-8")
     MeetilySQLiteScanner(index_path).scan(meetily_db)
 
-    gbrain = export_gbrain_bundle(index_path, "migration", output_dir / "gbrain.jsonl")
-    lines = [json.loads(line) for line in gbrain.path.read_text(encoding="utf-8").splitlines()]
-    assert {line["kind"] for line in lines} >= {"topic", "context", "graph"}
-    assert all(line["contract_version"] == "meetily-memory.core.v1" for line in lines)
-    assert any("meeting-2" in json.dumps(line) for line in lines)
+    result = sync_obsidian_vault(index_path, vault_path, "Meetily Memory")
 
-    markdown = export_markdown_bundle(index_path, "migration", output_dir / "bundle.md")
-    text = markdown.path.read_text(encoding="utf-8")
-    assert "# Meetily Memory: migration" in text
-    assert "## Topic Summary" in text
-    assert "Source: meeting-2 / transcript-2" in text
-
-
-def test_task_tracker_draft_is_write_back_free(meetily_db: Path, tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    output_path = tmp_path / "draft.md"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
-
-    result = export_task_tracker_draft(
-        index_path, task_query="migration risks", output_path=output_path
-    )
-
-    text = result.path.read_text(encoding="utf-8")
-    assert "# Task Draft" in text
-    assert "Tracker: generic" in text
-    assert "Vladimir agreed to send migration risks by Friday." in text
-    assert "Source: meeting-2 / transcript-2" in text
-    assert "Status: open" in text
+    assert result.files_skipped >= 1
+    assert unmanaged.read_text(encoding="utf-8") == "personal note"

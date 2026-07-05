@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated, cast
+
+import typer
+
+from meetily_memory.cli.common import (
+    console,
+    make_typer,
+    print_json,
+    print_text_block,
+    sqlite_has_fts5,
+)
+from meetily_memory.config.paths import discover_meetily_db
+from meetily_memory.config.settings import load_app_settings, update_app_settings
+from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
+from meetily_memory.db.repository import IndexRepository
+from meetily_memory.db.schema import index_connection
+from meetily_memory.integrations import sync_obsidian_vault
+from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
+from meetily_memory.semantic_search import (
+    index_semantic_embeddings,
+    load_semantic_config,
+    resolve_embedding_provider,
+)
+from meetily_memory.structure_analyzer import StructureAnalyzer
+
+app = make_typer("Local Meetily history lifecycle commands.")
+db_app = make_typer("Inspect the local index database.")
+mcp_app = make_typer("Run the MCP server.")
+
+
+def utc_now_iso() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def configured_source_path(explicit_source: Path | None = None) -> Path | None:
+    if explicit_source is not None:
+        return explicit_source
+    settings = load_app_settings()
+    if settings.source_path:
+        configured = Path(settings.source_path).expanduser()
+        if configured.exists():
+            return configured
+    return discover_meetily_db()
+
+
+def scan_update(
+    index_path: Path,
+    source_path: Path,
+    *,
+    semantic: bool = False,
+) -> tuple[dict[str, object], int]:
+    result = MeetilySQLiteScanner(index_path).scan(source_path, analyze=True)
+    embeddings_indexed = 0
+
+    if semantic:
+        try:
+            provider = resolve_embedding_provider()
+            embeddings_indexed = index_semantic_embeddings(
+                index_path,
+                embedding_provider=provider,
+            )
+        except RuntimeError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
+    payload: dict[str, object] = {
+        "source_id": result.source_id,
+        "meetings_seen": result.meetings_seen,
+        "meetings_inserted": result.meetings_inserted,
+        "meetings_updated": result.meetings_updated,
+        "meetings_analyzed": result.meetings_analyzed,
+        "chunks_seen": result.chunks_seen,
+        "chunks_inserted": result.chunks_inserted,
+        "chunks_updated": result.chunks_updated,
+        "embeddings_indexed": embeddings_indexed,
+    }
+
+    return payload, embeddings_indexed
+
+
+def print_update_payload(payload: dict[str, object], *, semantic: bool) -> None:
+    console.print(f"meetings seen: {payload['meetings_seen']}")
+    console.print(f"meetings inserted: {payload['meetings_inserted']}")
+    console.print(f"meetings updated: {payload['meetings_updated']}")
+    console.print(f"meetings analyzed: {payload['meetings_analyzed']}")
+    console.print(f"chunks seen: {payload['chunks_seen']}")
+    if semantic:
+        console.print(f"embeddings indexed: {payload['embeddings_indexed']}")
+
+
+@app.command()
+def init(
+    ctx: typer.Context,
+    source: Annotated[
+        Path | None,
+        typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
+    ] = None,
+    autosync: Annotated[
+        bool | None,
+        typer.Option("--autosync/--no-autosync", help="Enable automatic updates."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    source_path = configured_source_path(source)
+    if source_path is None:
+        message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
+        raise typer.BadParameter(message)
+    enable_autosync = autosync
+    if enable_autosync is None:
+        enable_autosync = typer.confirm("Enable automatic updates?", default=False)
+    payload, _ = scan_update(ctx.obj["index_path"], source_path)
+    settings = update_app_settings(
+        source_path=str(source_path),
+        autosync_enabled=enable_autosync,
+        last_update_at=utc_now_iso(),
+    )
+    response = {
+        "initialized": True,
+        "index_path": str(ctx.obj["index_path"]),
+        "source_path": str(source_path),
+        "autosync_enabled": settings.autosync_enabled,
+        **payload,
+    }
+    if json_output:
+        print_json(response)
+        return
+    print_text_block("initialized: yes")
+    print_text_block(f"index path: {ctx.obj['index_path']}")
+    print_text_block(f"source path: {source_path}")
+    print_text_block(f"autosync: {'enabled' if settings.autosync_enabled else 'disabled'}")
+    print_update_payload(payload, semantic=False)
+
+
+@app.command()
+def status(
+    ctx: typer.Context,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    settings = load_app_settings()
+    index_path = ctx.obj["index_path"]
+    repo = IndexRepository(index_path)
+    stats = repo.stats()
+    semantic_config = load_semantic_config()
+    obsidian_configured = bool(settings.obsidian.vault_path)
+    llm_provider = settings.llm.provider or "not configured"
+    payload = {
+        "index_path": str(index_path),
+        "source_path": settings.source_path,
+        "last_update_at": settings.last_update_at,
+        "autosync_enabled": settings.autosync_enabled,
+        "semantic_provider": semantic_config.provider,
+        "obsidian_configured": obsidian_configured,
+        "llm_provider": settings.llm.provider,
+        **stats,
+    }
+    if json_output:
+        print_json(payload)
+        return
+    print_text_block(f"index path: {index_path}")
+    print_text_block(f"source path: {settings.source_path or 'not configured'}")
+    print_text_block(f"last update: {settings.last_update_at or 'never'}")
+    print_text_block(f"autosync: {'enabled' if settings.autosync_enabled else 'disabled'}")
+    print_text_block(f"semantic: {semantic_config.provider or 'not configured'}")
+    print_text_block(f"obsidian: {'configured' if obsidian_configured else 'not configured'}")
+    print_text_block(f"llm: {llm_provider}")
+    print_text_block(f"meetings: {stats['meetings']}")
+    print_text_block(f"chunks: {stats['chunks']}")
+
+
+@app.command()
+def scan(
+    ctx: typer.Context,
+    source: Annotated[
+        Path | None,
+        typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Reindex unchanged meetings and rebuild FTS rows."),
+    ] = False,
+    analyze_output: Annotated[
+        bool,
+        typer.Option("--analyze/--no-analyze", help="Analyze new or changed meetings."),
+    ] = True,
+) -> None:
+    source_path = configured_source_path(source)
+    if source_path is None:
+        message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
+        raise typer.BadParameter(message)
+    result = MeetilySQLiteScanner(ctx.obj["index_path"]).scan(
+        source_path,
+        force=force,
+        analyze=analyze_output,
+    )
+    payload = {
+        "source_id": result.source_id,
+        "meetings_seen": result.meetings_seen,
+        "meetings_inserted": result.meetings_inserted,
+        "meetings_updated": result.meetings_updated,
+        "meetings_analyzed": result.meetings_analyzed,
+        "chunks_seen": result.chunks_seen,
+        "chunks_inserted": result.chunks_inserted,
+        "chunks_updated": result.chunks_updated,
+    }
+    if json_output:
+        print_json(payload)
+        return
+    console.print(f"meetings seen: {result.meetings_seen}")
+    console.print(f"meetings inserted: {result.meetings_inserted}")
+    console.print(f"meetings updated: {result.meetings_updated}")
+    console.print(f"meetings analyzed: {result.meetings_analyzed}")
+    console.print(f"chunks seen: {result.chunks_seen}")
+
+
+@app.command()
+def update(
+    ctx: typer.Context,
+    source: Annotated[
+        Path | None,
+        typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
+    ] = None,
+    semantic: Annotated[
+        bool,
+        typer.Option("--semantic", help="Also update configured semantic embeddings."),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    source_path = configured_source_path(source)
+    if source_path is None:
+        message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
+        raise typer.BadParameter(message)
+    settings = load_app_settings()
+    run_semantic = semantic or bool(load_semantic_config().provider and settings.autosync_enabled)
+    payload, _ = scan_update(ctx.obj["index_path"], source_path, semantic=run_semantic)
+    settings = update_app_settings(source_path=str(source_path), last_update_at=utc_now_iso())
+    obsidian_synced = False
+    if settings.obsidian.vault_path and settings.obsidian.sync_after_update:
+        sync_obsidian_vault(
+            ctx.obj["index_path"],
+            Path(settings.obsidian.vault_path),
+            settings.obsidian.folder,
+        )
+        obsidian_synced = True
+    if json_output:
+        payload["obsidian_synced"] = obsidian_synced
+        print_json(payload)
+        return
+    print_update_payload(payload, semantic=run_semantic)
+    if obsidian_synced:
+        console.print("obsidian sync: yes")
+
+
+@db_app.command("status")
+def db_status(
+    ctx: typer.Context,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    index_path = ctx.obj["index_path"]
+    with index_connection(index_path) as conn:
+        schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    payload = {
+        "index_path": str(index_path),
+        "schema_version": schema_version,
+        "current_schema_version": CURRENT_SCHEMA_VERSION,
+    }
+    if json_output:
+        print_json(payload)
+        return
+    print_text_block(f"index path: {index_path}")
+    print_text_block(f"schema version: {schema_version}")
+    print_text_block(f"current schema version: {CURRENT_SCHEMA_VERSION}")
+
+
+@mcp_app.command("serve")
+def mcp_serve(
+    ctx: typer.Context,
+    transport: Annotated[
+        str,
+        typer.Option("--transport", help="MCP transport: stdio, sse, or streamable-http."),
+    ] = "stdio",
+) -> None:
+    if transport not in {"stdio", "sse", "streamable-http"}:
+        message = "MCP transport must be one of: stdio, sse, streamable-http."
+        raise typer.BadParameter(message)
+    try:
+        from meetily_memory.mcp_server import MCPTransport, run_mcp_server  # noqa: PLC0415
+    except ImportError as exc:
+        message = "MCP support is optional. Install with `meetily-memory[mcp]`."
+        raise typer.BadParameter(message) from exc
+    run_mcp_server(ctx.obj["index_path"], transport=cast("MCPTransport", transport))
+
+
+@app.command()
+def analyze(
+    ctx: typer.Context,
+    meeting_id: Annotated[
+        str | None,
+        typer.Argument(help="Meeting external id or internal id. Omit to analyze all meetings."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    repo = IndexRepository(ctx.obj["index_path"])
+    analyzer = StructureAnalyzer(repo)
+    if meeting_id:
+        meeting = repo.get_meeting(meeting_id)
+        if not meeting:
+            message = f"Meeting not found: {meeting_id}"
+            raise typer.BadParameter(message)
+        result = analyzer.analyze_meeting(int(meeting["id"]))
+    else:
+        result = analyzer.analyze_all()
+
+    payload = result.as_payload()
+    if json_output:
+        print_json(payload)
+        return
+    console.print(f"meetings analyzed: {payload['meetings_analyzed']}")
+    console.print(f"decisions: {payload['decisions']}")
+    console.print(f"action items: {payload['action_items']}")
+    console.print(f"risks: {payload['risks']}")
+    console.print(f"open questions: {payload['open_questions']}")
+
+
+@app.command()
+def doctor(
+    ctx: typer.Context,
+    source: Annotated[Path | None, typer.Option("--source")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    index_path = ctx.obj["index_path"]
+    repo = IndexRepository(index_path)
+    source_path = source or discover_meetily_db()
+    source_readable = can_open_readonly_sqlite(source_path) if source_path else False
+    fts5 = sqlite_has_fts5()
+    stats = repo.stats()
+    payload = {
+        "index_path": str(index_path),
+        "source_path": str(source_path) if source_path else None,
+        "source_readable": source_readable,
+        "fts5": fts5,
+        **stats,
+    }
+    if json_output:
+        print_json(payload)
+        return
+    console.print(f"index path: {index_path}")
+    console.print(f"source path: {source_path or 'not found'}")
+    console.print(f"source readable: {'yes' if source_readable else 'no'}")
+    console.print(f"fts5: {'yes' if fts5 else 'no'}")
+    console.print(f"meetings: {stats['meetings']}")
+    console.print(f"chunks: {stats['chunks']}")
+    console.print(f"decisions: {stats['decisions']}")
+    console.print(f"action items: {stats['action_items']}")
+    console.print(f"risks: {stats['risks']}")
+    console.print(f"open questions: {stats['open_questions']}")

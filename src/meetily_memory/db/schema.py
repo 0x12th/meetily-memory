@@ -1,5 +1,5 @@
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
@@ -7,9 +7,10 @@ from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION, MIGRATIONS
 
 
 @contextmanager
-def index_connection(index_path: Path) -> Iterator[sqlite3.Connection]:
+def index_connection(index_path: Path) -> Generator[sqlite3.Connection, None, None]:
     index_path = Path(index_path)
     index_path.parent.mkdir(parents=True, exist_ok=True)
+
     with closing(sqlite3.connect(index_path)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")

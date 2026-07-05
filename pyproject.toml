@@ -7,12 +7,16 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
-  "mcp[cli]>=1.27,<2",
   "orjson>=3.10.0",
   "platformdirs>=4.3.0",
   "rich>=13.9.0",
   "sqlite-vec>=0.1.9,<0.2.0",
   "typer>=0.12.0",
+]
+
+[project.optional-dependencies]
+mcp = [
+  "mcp[cli]>=1.27,<2",
 ]
 
 [project.scripts]
@@ -21,6 +25,7 @@ mm = "meetily_memory.cli.app:main"
 
 [dependency-groups]
 dev = [
+  "mcp[cli]>=1.27,<2",
   "pre-commit>=4.0.0",
   "pyinstaller>=6.11.0",
   "pytest>=8.3.0",
@@ -60,12 +65,32 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "src/meetily_memory/cli/app.py" = [
   "FBT002",
-  "PLR0913",
-  "S603",
-  "S607",
 ]
-"src/meetily_memory/db/repository.py" = [
+"src/meetily_memory/cli/*_commands.py" = [
+  "FBT002",
+  "PLR0913",
+]
+"src/meetily_memory/cli/common.py" = [
+  "S603",
+]
+"src/meetily_memory/repositories/index.py" = [
   "ANN401",
+  "SLF001",
+]
+"src/meetily_memory/memory/entities.py" = [
+  "ANN401",
+  "SLF001",
+]
+"src/meetily_memory/memory/knowledge.py" = [
+  "PLR0913",
+  "S608",
+]
+"src/meetily_memory/memory/task_status.py" = [
+  "ANN401",
+]
+"src/meetily_memory/repositories/meetings.py" = [
+  "ANN401",
+  "SLF001",
 ]
 "src/meetily_memory/semantic_search.py" = [
   "S608",

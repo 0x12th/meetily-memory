@@ -5,8 +5,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from meetily_memory.db.repository import ChunkRecord, IndexRepository, MeetingRecord
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
+from meetily_memory.repositories.index import IndexRepository
+from meetily_memory.repositories.records import ChunkRecord, MeetingRecord
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
 from meetily_memory.structure_analyzer import StructureAnalyzer
 

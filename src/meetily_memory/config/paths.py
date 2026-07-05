@@ -20,6 +20,10 @@ def semantic_config_path() -> Path:
     return default_data_dir() / "config.json"
 
 
+def app_config_path() -> Path:
+    return default_data_dir() / "settings.json"
+
+
 def candidate_meetily_db_paths(
     env: Mapping[str, str] | None = None,
     home: Path | None = None,

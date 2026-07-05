@@ -1,46 +1,59 @@
 # Meetily Memory
 
-Private local memory for your Meetily meetings.
+Search.
+Context.
+Ask.
 
-Meetily Memory indexes your local Meetily database into a separate SQLite
-knowledge layer, then helps you find decisions, tasks, risks, questions, people,
-projects, and paste-ready context across many meetings.
+Meetily Memory turns local Meetily meetings into a private, source-backed memory
+you can search, understand, and ask.
 
-It does not replace Meetily, record meetings, upload data, call an LLM, or
-modify the Meetily database.
+It is for the moment when:
 
-## What It Helps With
+> "I remember we discussed this."
 
-- **Search past meetings** with fast local FTS: `mm s "pricing decision"`.
-- **Build LLM context** you can paste into ChatGPT or Claude: `mm c "what did we decide about pricing?"`.
-- **Recover source-backed memory** for topics, projects, people, decisions, tasks, risks, and questions.
-- **Track unresolved work locally** with task status overrides that keep source evidence.
-- **Export knowledge** to Obsidian, Markdown, Gbrain-style JSONL, Spotlight, or a task-tracker draft.
-- **Expose local memory to agents** through a thin MCP server over the same Core API.
+...is not enough.
 
-## Why
+You need the original decision, the remaining risks, the people involved, and
+the meeting that proved it.
 
-Recording meetings is easy. Remembering what happened months later is not.
+Meetily Memory never modifies the Meetily database and never requires a cloud
+service.
 
-After enough meetings, you need answers like:
+---
 
-- What did we decide about the migration?
-- What did Vladimir promise last week?
-- Which risks keep coming up?
-- What context should I give an AI agent before asking it to help?
-- Where did this claim come from?
+## What You Can Do
 
-Meetily Memory keeps the workflow local and evidence-first:
+Find an old discussion:
 
-```text
-Meetily history
-        |
-        v
-Local SQLite index
-        |
-        v
-Search / knowledge / exports / agents
+```bash
+mm s "migration risk"
 ```
+
+Build clean context for ChatGPT, Claude, or Codex:
+
+```bash
+mm c "what did we decide about the migration?"
+```
+
+See everything known about a topic:
+
+```bash
+mm topic "migration"
+```
+
+Ask your meeting history directly:
+
+```bash
+mm ask "what is still open?"
+```
+
+Sync a managed Obsidian knowledge vault:
+
+```bash
+mm obsidian init
+```
+
+---
 
 ## Install
 
@@ -51,104 +64,214 @@ brew tap 0x12th/meetily-memory
 brew install meetily-memory
 ```
 
-The CLI is available as both:
+The CLI is available as:
 
 ```bash
-meetily-memory --help
-mm --help
+mm
+meetily-memory
 ```
+
+---
 
 ## First Run
 
-Meetily Memory discovers common Meetily database locations automatically.
+```bash
+mm init
+```
+
+`mm init` automatically:
+
+- discovers the local Meetily database;
+- creates the private search index;
+- performs the first update;
+- offers to enable automatic updates.
+
+Nothing optional is enabled without asking.
+
+If automatic updates are enabled, your local index stays up to date
+automatically.
+
+If discovery fails:
 
 ```bash
 mm doctor
-mm update
 ```
 
-If your Meetily database is elsewhere:
+---
 
-```bash
-mm update --source /path/to/meeting_minutes.sqlite
-```
+## Everyday Usage
 
-Then try:
+Most users only need a few commands.
+
+Search:
 
 ```bash
 mm s "migration risk"
-mm c "what risks did we discuss for the migration?"
+```
+
+Build LLM context:
+
+```bash
+mm c "what context matters for the migration plan?"
+```
+
+Explore a topic:
+
+```bash
 mm topic "migration"
-mm tasks
 ```
 
-## Core Workflows
-
-### Search And Context
+Ask meeting memory:
 
 ```bash
-mm s "pricing decision"
-mm c "what did we decide about pricing?"
+mm ask "what remains unresolved?"
 ```
 
-`mm s` is for fast lookup. `mm c` builds Markdown context with citations, ready
-to paste into ChatGPT, Claude, or another LLM.
-
-### Local Knowledge
+Open the original meeting:
 
 ```bash
-mm decisions
-mm tasks
-mm risks
-mm questions
-mm topic "migration"
-mm person "Vladimir"
-mm project "migration"
-mm graph "migration" --json
+mm open 12
 ```
 
-Structured results are heuristic signals, not an automatic truth model. The CLI
-keeps meeting and chunk evidence visible so you can verify important claims.
-
-### Exports
+If automatic updates are disabled, refresh the index manually:
 
 ```bash
-mm export obsidian "migration" --output ~/Obsidian/Meetily
-mm export markdown "migration" --output ./migration.md
-mm export gbrain "migration" --output ./migration.gbrain.jsonl
-mm export task-draft "migration risks" --output ./task.md
-mm spotlight export
+mm update
 ```
 
-Exports are file adapters over the Core API. They do not sync in the background
-or write back to Meetily, Jira, GitHub, or other external systems.
+---
 
-### Agent Access
+## Obsidian
+
+Meetily Memory can maintain a managed Obsidian knowledge vault.
+
+Configure it once:
 
 ```bash
-mm mcp serve
+mm obsidian init
 ```
 
-The MCP server is a thin adapter over the same source-backed Core API used by
-the CLI and exports.
+After setup, notes can be synchronized automatically after index updates.
+
+Manual synchronization is also available:
+
+```bash
+mm obsidian sync
+```
+
+The vault contains managed notes such as:
+
+```text
+Topics/
+Meetings/
+People/
+Tasks/
+Decisions/
+Risks/
+Questions/
+```
+
+Managed notes include:
+
+```html
+<!-- meetily-memory:managed -->
+```
+
+Only managed files are updated.
+Your own notes are never overwritten.
+
+---
+
+## LLM Integration
+
+Configure an LLM once:
+
+```bash
+mm llm init
+```
+
+Supported providers:
+
+- Manual (prepare context for ChatGPT or Claude)
+- Ollama (local models)
+
+Then simply ask:
+
+```bash
+mm ask "what is still open?"
+```
+
+Meetily Memory retrieves the relevant evidence first, then sends only the
+selected context to the configured provider.
+
+---
 
 ## Principles
 
-- **Local-first**: no required cloud services.
-- **Private by default**: no uploads and no required LLM calls.
-- **Read-only upstream**: the Meetily database is never modified.
-- **Evidence-first**: useful output should point back to meeting and chunk sources.
-- **Minimal infrastructure**: SQLite, FTS5, optional sqlite-vec, no external graph database.
+- Local-first.
+- Private by default.
+- Read-only Meetily database.
+- Evidence before summaries.
+- Small public CLI.
+- Search → Context → Ask.
 
-## Documentation
+---
 
-- [Getting started](docs/getting-started.md)
-- [Command reference](docs/commands.md)
-- [Knowledge layer and Core API](docs/knowledge-layer.md)
-- [Exports and integrations](docs/integrations.md)
-- [Semantic search](docs/semantic-search.md)
-- [Development](docs/development.md)
+## Architecture
+
+```text
+                Meetily SQLite
+                      │
+                      ▼
+          Meetily Memory index.sqlite
+                      │
+      ┌───────────────┼────────────────┐
+      │               │                │
+      ▼               ▼                ▼
+   FTS Search   Structured Memory   Semantic Search
+                      │
+                      ▼
+              Topic Knowledge Layer
+                      │
+        ┌─────────────┼──────────────┐
+        ▼             ▼              ▼
+      CLI          Obsidian      LLM / Ask
+                                     │
+                                     ▼
+                            Experimental MCP
+```
+
+Meetily Memory stores only derived local state:
+
+- normalized meetings and chunks;
+- SQLite FTS index;
+- decisions, action items, risks, and questions;
+- topic relationships;
+- optional semantic embeddings;
+- local application settings.
+
+The internal knowledge layer powers `mm topic`, `mm ask`, Obsidian
+synchronization, and the experimental MCP adapter.
+
+## Development
+
+```bash
+uv sync
+
+uv run ruff check .
+uv run ruff format --check .
+
+uv run ty check --error all
+
+uv run pytest -q
+
+uv build
+```
+
+---
 
 ## License
 
-Licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+Licensed under the Apache License 2.0.
+
+See [LICENSE](LICENSE).

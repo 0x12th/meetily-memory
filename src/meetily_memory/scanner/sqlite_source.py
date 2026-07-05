@@ -1,12 +1,12 @@
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import closing, contextmanager, suppress
 from pathlib import Path
 from urllib.parse import quote
 
 
 @contextmanager
-def readonly_sqlite_connection(path: Path) -> Iterator[sqlite3.Connection]:
+def readonly_sqlite_connection(path: Path) -> Generator[sqlite3.Connection, None, None]:
     path = Path(path)
     if not path.is_file():
         message = f"Meetily DB not found: {path}"

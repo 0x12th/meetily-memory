@@ -72,6 +72,40 @@ def test_index_schema_runs_explicit_migrations_from_v1(tmp_path: Path) -> None:
             assert conn.execute(sql).fetchone()[0] == 0
 
 
+def test_index_repository_upgrades_v1_database_to_v3_tables(tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    with sqlite3.connect(index_path) as conn:
+        migrate_to_v1(conn)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+
+    IndexRepository(index_path)
+
+    expected_tables = {
+        "decisions",
+        "action_items",
+        "risks",
+        "open_questions",
+        "knowledge_nodes",
+        "knowledge_edges",
+        "topic_aliases",
+        "task_status_overrides",
+    }
+    with sqlite3.connect(index_path) as conn:
+        actual_tables = {
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                """
+            )
+        }
+        assert expected_tables <= actual_tables
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
 def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
 
