@@ -85,15 +85,19 @@ def topic_memory(
 def open_command(
     ctx: typer.Context,
     meeting_id: str,
-    folder: Annotated[bool, typer.Option("--folder")] = False,
-    print_path: Annotated[bool, typer.Option("--print-path")] = False,
+    source: Annotated[bool, typer.Option("--source", help="Open the indexed source path.")] = False,
+    print_path: Annotated[
+        bool,
+        typer.Option("--print-path", help="Print the selected path without opening it."),
+    ] = False,
 ) -> None:
+    """Open the original meeting folder."""
     repo = IndexRepository(ctx.obj["index_path"])
     meeting = repo.get_meeting(meeting_id)
     if not meeting:
         message = f"Meeting not found: {meeting_id}"
         raise typer.BadParameter(message)
-    path = meeting.get("folder_path") if folder else meeting.get("source_path")
+    path = meeting.get("source_path") if source else meeting.get("folder_path")
     path = path or meeting.get("folder_path") or meeting.get("source_path")
     if not path:
         message = f"Meeting has no path: {meeting_id}"

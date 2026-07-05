@@ -22,7 +22,7 @@ mm obsidian status
 
 - vault path, defaulting to `~/Documents/Obsidian`;
 - folder, defaulting to `Meetily Memory`;
-- whether to run sync after every `mm update`.
+- whether to run sync after every `mm refresh`.
 
 `mm obsidian sync` creates and updates a managed note network:
 
@@ -48,16 +48,16 @@ Managed files must include:
 The sync command may update managed files, but it must not overwrite unrelated
 user notes in the vault.
 
-## Automatic Post-Update Sync
+## Automatic Post-Refresh Sync
 
-If enabled during `mm obsidian init`, Obsidian sync runs after `mm update`.
+If enabled during `mm obsidian init`, Obsidian sync runs after `mm refresh`.
 
-The post-update flow is:
+The post-refresh flow is:
 
 ```text
-mm update
+mm refresh
 semantic index, if semantic search is configured
-obsidian sync, if Obsidian post-update sync is enabled
+obsidian sync, if Obsidian post-refresh sync is enabled
 ```
 
 ## Not In The Public Integration Layer

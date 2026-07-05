@@ -23,6 +23,8 @@ service.
 
 ## What You Can Do
 
+Everyday flow:
+
 Find an old discussion:
 
 ```bash
@@ -35,16 +37,30 @@ Build clean context for ChatGPT, Claude, or Codex:
 mm c "what did we decide about the migration?"
 ```
 
-See everything known about a topic:
-
-```bash
-mm topic "migration"
-```
-
 Ask your meeting history directly:
 
 ```bash
 mm ask "what is still open?"
+```
+
+Open the original meeting folder:
+
+```bash
+mm open 12
+```
+
+Refresh the local index from Meetily:
+
+```bash
+mm refresh
+```
+
+Advanced views and integrations:
+
+See everything known about a topic:
+
+```bash
+mm topic "migration"
 ```
 
 Sync a managed Obsidian knowledge vault:
@@ -83,12 +99,12 @@ mm init
 
 - discovers the local Meetily database;
 - creates the private search index;
-- performs the first update;
-- offers to enable automatic updates.
+- performs the first refresh;
+- offers to enable automatic index refreshes.
 
 Nothing optional is enabled without asking.
 
-If automatic updates are enabled, your local index stays up to date
+If automatic refreshes are enabled, your local index stays up to date
 automatically.
 
 If discovery fails:
@@ -109,17 +125,15 @@ Search:
 mm s "migration risk"
 ```
 
+Use this when you want source snippets and meeting ids.
+
 Build LLM context:
 
 ```bash
 mm c "what context matters for the migration plan?"
 ```
 
-Explore a topic:
-
-```bash
-mm topic "migration"
-```
+Use this when you want Markdown you can paste into ChatGPT, Claude, or Codex.
 
 Ask meeting memory:
 
@@ -127,13 +141,31 @@ Ask meeting memory:
 mm ask "what remains unresolved?"
 ```
 
+Use this when you want Meetily Memory to prepare the context and answer through
+the configured provider. In manual mode it prints the prompt instead.
+
+Explore a topic:
+
+```bash
+mm topic "migration"
+```
+
+Use this when you want an advanced dossier: related meetings, decisions, tasks,
+risks, questions, people, and sources.
+
 Open the original meeting:
 
 ```bash
 mm open 12
 ```
 
-If automatic updates are disabled, refresh the index manually:
+If automatic refreshes are disabled, refresh the index manually:
+
+```bash
+mm refresh
+```
+
+Update the installed utility itself:
 
 ```bash
 mm update
@@ -151,7 +183,7 @@ Configure it once:
 mm obsidian init
 ```
 
-After setup, notes can be synchronized automatically after index updates.
+After setup, notes can be synchronized automatically after index refreshes.
 
 Manual synchronization is also available:
 

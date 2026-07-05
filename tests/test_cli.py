@@ -16,6 +16,8 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert "Options:" in help_result.stdout
     assert "Commands:" in help_result.stdout
     assert "--version" in help_result.stdout
+    assert "Everyday:" in help_result.stdout
+    assert "Advanced:" in help_result.stdout
     assert "--install-completion" not in help_result.stdout
     assert "--show-completion" not in help_result.stdout
     assert "╭" not in help_result.stdout
@@ -30,6 +32,16 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert "graph" not in help_result.stdout
     assert "project" not in help_result.stdout
     assert "person" not in help_result.stdout
+
+    open_help = runner.invoke(app, ["open", "--help"])
+    assert open_help.exit_code == 0
+    assert "--source" in open_help.stdout
+    assert "--folder" not in open_help.stdout
+
+    obsidian_init_help = runner.invoke(app, ["obsidian", "init", "--help"])
+    assert obsidian_init_help.exit_code == 0
+    assert "--sync-after-refresh" in obsidian_init_help.stdout
+    assert "--sync-after-update" not in obsidian_init_help.stdout
 
 
 def test_cli_version_outputs_package_version() -> None:
@@ -99,7 +111,7 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
 
     opened = runner.invoke(app, ["--index", str(index_path), "open", "meeting-2", "--print-path"])
     assert opened.exit_code == 0
-    assert opened.stdout.strip() == str(meetily_db)
+    assert opened.stdout.strip() == str(tmp_path / "Vladimir Follow-up")
 
 
 def test_cli_topic_shows_structured_memory_with_source_evidence(
@@ -201,7 +213,7 @@ def test_cli_semantic_search_requires_explicit_index(meetily_db: Path, tmp_path:
     assert isinstance(payload[0]["distance"], float)
 
 
-def test_cli_open_folder_selects_meeting_folder(meetily_db: Path, tmp_path: Path) -> None:
+def test_cli_open_selects_meeting_folder_by_default(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
 
@@ -216,14 +228,14 @@ def test_cli_open_folder_selects_meeting_folder(meetily_db: Path, tmp_path: Path
         ["--index", str(index_path), "open", "1", "--print-path"],
     )
     assert default_path.exit_code == 0
-    assert default_path.stdout.strip() == str(meetily_db)
+    assert default_path.stdout.strip() == str(tmp_path / "Launch Planning")
 
-    folder_path = runner.invoke(
+    source_path = runner.invoke(
         app,
-        ["--index", str(index_path), "open", "1", "--folder", "--print-path"],
+        ["--index", str(index_path), "open", "1", "--source", "--print-path"],
     )
-    assert folder_path.exit_code == 0
-    assert folder_path.stdout.strip() == str(tmp_path / "Launch Planning")
+    assert source_path.exit_code == 0
+    assert source_path.stdout.strip() == str(meetily_db)
 
 
 def test_cli_scan_can_skip_structured_analysis(meetily_db: Path, tmp_path: Path) -> None:
@@ -240,13 +252,36 @@ def test_cli_scan_can_skip_structured_analysis(meetily_db: Path, tmp_path: Path)
     assert topic.exit_code == 0
     assert "No structured signals." in topic.stdout
 
-    update = runner.invoke(
+    refresh = runner.invoke(
         app,
-        ["--index", str(index_path), "update", "--source", str(meetily_db)],
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
     )
+    assert refresh.exit_code == 0
+    assert "meetings seen: 2" in refresh.stdout
+    assert "meetings analyzed:" in refresh.stdout
+
+
+def test_cli_update_upgrades_homebrew_package(tmp_path: Path) -> None:
+    runner = CliRunner()
+    brew = tmp_path / "brew"
+    calls = tmp_path / "brew-calls.txt"
+    brew.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\n", encoding="utf-8")
+    brew.chmod(0o755)
+
+    update = runner.invoke(app, ["update"], env={"PATH": str(tmp_path)})
+
     assert update.exit_code == 0
-    assert "meetings seen: 2" in update.stdout
-    assert "meetings analyzed:" in update.stdout
+    assert calls.read_text(encoding="utf-8") == "upgrade meetily-memory\n"
+    assert "updated: meetily-memory" in update.stdout
+
+
+def test_cli_update_reports_homebrew_failure(tmp_path: Path) -> None:
+    runner = CliRunner()
+
+    update = runner.invoke(app, ["update"], env={"PATH": str(tmp_path)})
+
+    assert update.exit_code != 0
+    assert "Homebrew was not found" in update.output
 
 
 def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
@@ -464,7 +499,7 @@ def test_cli_init_status_ask_and_obsidian_sync(meetily_db: Path, tmp_path: Path)
             str(vault_dir),
             "--folder",
             "Meetily Memory",
-            "--sync-after-update",
+            "--sync-after-refresh",
         ],
         env=env,
     )

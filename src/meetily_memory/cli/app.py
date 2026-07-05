@@ -14,7 +14,14 @@ from meetily_memory.cli.search_commands import app as search_app
 from meetily_memory.cli.semantic_commands import app as semantic_root_app
 from meetily_memory.cli.semantic_commands import semantic_app
 
-app = make_typer("Local Meetily history index.")
+app = make_typer(
+    "Local Meetily history index.\n\n"
+    "Everyday: s finds evidence, open verifies the source folder, c builds paste-ready "
+    "LLM context, ask answers from configured context.\n"
+    "Advanced: topic shows a topic dossier, refresh rebuilds the local index, update "
+    "upgrades the installed utility, integrations live under semantic, obsidian, "
+    "autosync, db, and mcp."
+)
 app.add_typer(lifecycle_app)
 app.add_typer(semantic_root_app)
 app.add_typer(llm_root_app)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, cast
@@ -101,7 +103,7 @@ def init(
     ] = None,
     autosync: Annotated[
         bool | None,
-        typer.Option("--autosync/--no-autosync", help="Enable automatic updates."),
+        typer.Option("--autosync/--no-autosync", help="Enable automatic index refreshes."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
@@ -111,7 +113,7 @@ def init(
         raise typer.BadParameter(message)
     enable_autosync = autosync
     if enable_autosync is None:
-        enable_autosync = typer.confirm("Enable automatic updates?", default=False)
+        enable_autosync = typer.confirm("Enable automatic index refreshes?", default=False)
     payload, _ = scan_update(ctx.obj["index_path"], source_path)
     settings = update_app_settings(
         source_path=str(source_path),
@@ -162,7 +164,7 @@ def status(
         return
     print_text_block(f"index path: {index_path}")
     print_text_block(f"source path: {settings.source_path or 'not configured'}")
-    print_text_block(f"last update: {settings.last_update_at or 'never'}")
+    print_text_block(f"last refresh: {settings.last_update_at or 'never'}")
     print_text_block(f"autosync: {'enabled' if settings.autosync_enabled else 'disabled'}")
     print_text_block(f"semantic: {semantic_config.provider or 'not configured'}")
     print_text_block(f"obsidian: {'configured' if obsidian_configured else 'not configured'}")
@@ -217,8 +219,8 @@ def scan(
     console.print(f"chunks seen: {result.chunks_seen}")
 
 
-@app.command()
-def update(
+@app.command("refresh")
+def refresh(
     ctx: typer.Context,
     source: Annotated[
         Path | None,
@@ -226,7 +228,7 @@ def update(
     ] = None,
     semantic: Annotated[
         bool,
-        typer.Option("--semantic", help="Also update configured semantic embeddings."),
+        typer.Option("--semantic", help="Also refresh configured semantic embeddings."),
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
@@ -253,6 +255,23 @@ def update(
     print_update_payload(payload, semantic=run_semantic)
     if obsidian_synced:
         console.print("obsidian sync: yes")
+
+
+@app.command("update")
+def update() -> None:
+    """Update the installed meetily-memory utility through Homebrew."""
+    brew = shutil.which("brew")
+    if brew is None:
+        message = (
+            "Homebrew was not found. If Meetily Memory was installed another way, "
+            "update it with that package manager."
+        )
+        raise typer.BadParameter(message)
+    result = subprocess.run([brew, "upgrade", "meetily-memory"], check=False)  # noqa: S603
+    if result.returncode != 0:
+        message = "Homebrew upgrade failed: brew upgrade meetily-memory"
+        raise typer.BadParameter(message)
+    print_text_block("updated: meetily-memory")
 
 
 @db_app.command("status")

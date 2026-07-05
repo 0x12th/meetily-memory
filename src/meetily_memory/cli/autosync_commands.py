@@ -7,14 +7,15 @@ import typer
 from meetily_memory.cli.common import make_typer, print_json, print_text_block
 from meetily_memory.config.settings import load_app_settings, update_app_settings
 
-autosync_app = make_typer("Manage automatic updates.")
+autosync_app = make_typer("Manage automatic index refreshes.")
+AUTOSYNC_COMMAND = "refresh"
 
 
 @autosync_app.command("start")
 def autosync_start(
     interval_minutes: Annotated[
         int,
-        typer.Option("--interval-minutes", help="Background update interval."),
+        typer.Option("--interval-minutes", help="Background refresh interval."),
     ] = 30,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
@@ -70,7 +71,7 @@ def autosync_status(
         print_json(payload)
         return
     print_text_block(f"autosync: {'enabled' if settings.autosync_enabled else 'disabled'}")
-    print_text_block(f"last update: {settings.last_update_at or 'never'}")
+    print_text_block(f"last refresh: {settings.last_update_at or 'never'}")
 
 
 def install_launchd_plist(interval_minutes: int) -> Path:
@@ -89,7 +90,7 @@ def install_launchd_plist(interval_minutes: int) -> Path:
   <key>ProgramArguments</key>
   <array>
     <string>{executable}</string>
-    <string>update</string>
+    <string>{AUTOSYNC_COMMAND}</string>
   </array>
   <key>StartInterval</key>
   <integer>{seconds}</integer>
@@ -110,14 +111,14 @@ def install_systemd_user_units(interval_minutes: int) -> list[Path]:
     executable = Path(sys.argv[0]).resolve()
     minutes = max(interval_minutes, 1)
     service = f"""[Unit]
-Description=Meetily Memory automatic update
+Description=Meetily Memory automatic refresh
 
 [Service]
 Type=oneshot
-ExecStart={executable} update
+ExecStart={executable} {AUTOSYNC_COMMAND}
 """
     timer = f"""[Unit]
-Description=Run Meetily Memory automatic update
+Description=Run Meetily Memory automatic refresh
 
 [Timer]
 OnBootSec=1min

@@ -28,8 +28,8 @@ def obsidian_init(
     sync_after_update: Annotated[
         bool,
         typer.Option(
-            "--sync-after-update/--no-sync-after-update",
-            help="Run Obsidian sync after mm update.",
+            "--sync-after-refresh/--no-sync-after-refresh",
+            help="Run Obsidian sync after mm refresh.",
         ),
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
@@ -47,7 +47,8 @@ def obsidian_init(
         return
     print_text_block(f"obsidian vault: {settings.obsidian.vault_path}")
     print_text_block(f"obsidian folder: {settings.obsidian.folder}")
-    print_text_block(f"sync after update: {'yes' if settings.obsidian.sync_after_update else 'no'}")
+    sync_after_refresh = "yes" if settings.obsidian.sync_after_update else "no"
+    print_text_block(f"sync after refresh: {sync_after_refresh}")
 
 
 @obsidian_app.command("sync")
@@ -94,5 +95,6 @@ def obsidian_status(
     print_text_block("obsidian: configured")
     print_text_block(f"vault: {settings.obsidian.vault_path}")
     print_text_block(f"folder: {settings.obsidian.folder}")
-    print_text_block(f"sync after update: {'yes' if settings.obsidian.sync_after_update else 'no'}")
+    sync_after_refresh = "yes" if settings.obsidian.sync_after_update else "no"
+    print_text_block(f"sync after refresh: {sync_after_refresh}")
     print_text_block(f"last sync: {settings.obsidian.last_sync_at or 'never'}")
