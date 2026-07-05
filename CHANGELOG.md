@@ -1,14 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-07-05
 
-- Split the root README into a concise product overview and detailed docs under `docs/`.
-- Add export-only integration adapters for Obsidian notes, Gbrain JSONL, Markdown bundles, and generic task tracker drafts.
-- Add a local MCP server that exposes Core API tools over FastMCP.
-- Add a versioned Core API for retrieval, context, memory, topic, graph, and task-status operations.
-- Add SQLite knowledge nodes/edges, topic memory, topic graph projection, and local task status overrides.
-- License the project under Apache License 2.0.
-- Up perfomance.
+- Narrow the public CLI around init, update, status, search, context, topic memory, semantic search, ask, Obsidian sync, autosync, doctor, and advanced diagnostics.
+- Split the 1500+ line CLI and overloaded index repository into focused command, repository, memory, and database modules.
+- Keep the graph as an internal knowledge layer for topic memory, ask, Obsidian, and MCP instead of a public command surface.
+- Replace export-style Obsidian behavior with managed sync notes for meetings, topics, people, tasks, decisions, risks, and questions.
+- Add `mm semantic init` and `mm llm init` as the consistent setup entry points.
+- Move MCP dependencies behind the `mcp` optional extra for pip installs.
+- Remove Spotlight and broad export leftovers from the focused core API.
 
 ## 0.2.0 - 2026-07-04
 
