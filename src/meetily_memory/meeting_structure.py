@@ -9,7 +9,7 @@ SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 ENTITY_PATTERNS = {
     "decisions": re.compile(
         r"\b(decision|decided|agreed|approved|confirmed|resolved)\b|"
-        r"(решили|решение|согласовали|утвердили)",
+        r"(решили|решение|согласовали|утвердили|подтвердил|подтвердили|подтвержден)",
         re.IGNORECASE,
     ),
     "risks": re.compile(

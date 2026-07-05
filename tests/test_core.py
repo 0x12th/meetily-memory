@@ -55,7 +55,7 @@ def test_cli_topic_json_uses_core_data_contract(meetily_db: Path, tmp_path: Path
     scan = runner.invoke(app, ["--index", str(index_path), "scan", "--source", str(meetily_db)])
     assert scan.exit_code == 0
 
-    cli_topic = runner.invoke(app, ["--index", str(index_path), "topic", "migration", "--json"])
+    cli_topic = runner.invoke(app, ["--index", str(index_path), "t", "migration", "--json"])
     assert cli_topic.exit_code == 0
 
     core_topic = MeetilyMemoryCore(index_path).topic("migration").data

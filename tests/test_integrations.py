@@ -14,13 +14,13 @@ def test_obsidian_sync_creates_managed_note_network(meetily_db: Path, tmp_path: 
     root = vault_path / "Meetily Memory"
     assert result.root_dir == root
     assert result.files_written >= 6
-    assert (root / "Meetings" / "Vladimir Follow-up.md").exists()
+    assert (root / "Meetings" / "Dobrynya Follow-up.md").exists()
     assert (root / "Tasks").is_dir()
     task_notes = list((root / "Tasks").glob("*.md"))
     assert task_notes
     task_text = task_notes[0].read_text(encoding="utf-8")
     assert MANAGED_MARKER in task_text
-    assert "[[Vladimir Follow-up]]" in task_text
+    assert "[[Dobrynya Follow-up]]" in task_text
     assert "Source: meeting-2 /" in task_text
 
 
@@ -28,7 +28,7 @@ def test_obsidian_sync_does_not_overwrite_unmanaged_notes(meetily_db: Path, tmp_
     index_path = tmp_path / "index.sqlite"
     vault_path = tmp_path / "vault"
     root = vault_path / "Meetily Memory"
-    unmanaged = root / "Meetings" / "Vladimir Follow-up.md"
+    unmanaged = root / "Meetings" / "Dobrynya Follow-up.md"
     unmanaged.parent.mkdir(parents=True)
     unmanaged.write_text("personal note", encoding="utf-8")
     MeetilySQLiteScanner(index_path).scan(meetily_db)

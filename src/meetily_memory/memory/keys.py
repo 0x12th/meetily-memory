@@ -1,6 +1,8 @@
 from collections.abc import Iterable
 from typing import Any
 
+from meetily_memory.db.fts import cyrillic_case_variants, fts_query_tokens
+
 
 def normalize_key(value: str) -> str:
     return " ".join(value.casefold().split())
@@ -27,7 +29,17 @@ def row_matches_terms(row: dict[str, Any], terms: Iterable[str]) -> bool:
             )
         )
     )
-    return any(normalize_key(term) in haystack for term in terms if normalize_key(term))
+    return any(term_matches_haystack(term, haystack) for term in terms if normalize_key(term))
+
+
+def term_matches_haystack(term: str, haystack: str) -> bool:
+    normalized = normalize_key(term)
+    if normalized in haystack:
+        return True
+    variants: list[str] = []
+    for token in fts_query_tokens(normalized):
+        variants.extend(cyrillic_case_variants(token))
+    return any(variant in haystack for variant in variants)
 
 
 def without_added_aliases(topic: dict[str, Any]) -> dict[str, Any]:

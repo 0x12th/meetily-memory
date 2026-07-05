@@ -348,8 +348,15 @@ class KnowledgeRepository:
         with index_connection(self.context.index_path) as conn:
             rows = self.list_topic_entity_details(conn, int(topic["id"]), limit)
             related_people = self.list_topic_people(conn, int(topic["id"]), limit)
+        language = dominant_language(
+            [
+                *(meeting.get("language") for meeting in meetings),
+                *(row.get("meeting_language") for row in rows),
+            ]
+        )
         return {
             "topic": without_added_aliases(topic),
+            "language": language,
             "query_terms": topic_terms,
             "meetings": meetings,
             "structured_signals": rows,
@@ -600,3 +607,15 @@ def optional_int(value: object) -> int | None:
         return int(value)
     message = f"Expected integer-compatible value, got {type(value).__name__}."
     raise TypeError(message)
+
+
+def dominant_language(values: Iterable[object]) -> str | None:
+    counts: dict[str, int] = {}
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        normalized = value.casefold().split("-", maxsplit=1)[0]
+        counts[normalized] = counts.get(normalized, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda item: item[1])[0]

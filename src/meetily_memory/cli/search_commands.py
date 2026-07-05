@@ -55,7 +55,7 @@ def context(
     print_text_block(str(data["markdown"]))
 
 
-@app.command("topic")
+@app.command("t")
 def topic_memory(
     ctx: typer.Context,
     query: str,
@@ -79,6 +79,9 @@ def topic_memory(
         print_json(memory)
         return
     print_topic_memory(memory)
+
+
+app.command("topic", hidden=True)(topic_memory)
 
 
 @app.command("open")

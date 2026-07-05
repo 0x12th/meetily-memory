@@ -10,8 +10,8 @@ from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT
 from meetily_memory.json_codec import dumps_json, loads_json
 from meetily_memory.semantic_search import DEFAULT_OLLAMA_URL
 
-app = make_typer("LLM ask root commands.")
-llm_app = make_typer("Configure local LLM asking.")
+app = make_typer("Optional LLM answer commands.")
+llm_app = make_typer("Configure optional local LLM providers.")
 
 
 @llm_app.command("init")
@@ -49,7 +49,7 @@ def llm_init(
         print_text_block(f"ollama url: {settings.llm.ollama_url}")
 
 
-@app.command("ask")
+@app.command("ask", hidden=True)
 def ask(
     ctx: typer.Context,
     question: str,

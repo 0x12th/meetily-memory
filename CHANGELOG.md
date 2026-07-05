@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 - 2026-07-05
+
+- Replace the public topic command with the shorter `mm t` while keeping the
+  old `mm topic` path hidden for compatibility.
+- Demote experimental LLM answering from the everyday README/help path and keep
+  `mm c` as the recommended LLM context handoff.
+- Make topic output clearer as a source-backed "what we know" dossier with
+  heuristic signal labels and meeting-language-aware headings.
+- Improve Cyrillic topic matching for simple inflected forms such as
+  `миграция` / `миграции`.
+- Refresh test fixtures and examples to use Dobrynya consistently.
+
 ## 0.3.0 - 2026-07-05
 
 - Narrow the public CLI around init, update, status, search, context, topic memory, semantic search, ask, Obsidian sync, autosync, doctor, and advanced diagnostics.

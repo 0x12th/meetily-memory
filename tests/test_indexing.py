@@ -238,7 +238,7 @@ def test_scan_is_incremental_and_replaces_changed_meeting_chunks(
     conn = sqlite3.connect(meetily_db)
     conn.execute(
         "UPDATE transcripts SET transcript = ? WHERE id = ?",
-        ("Vladimir agreed to send migration risks and budget notes by Friday.", "transcript-2"),
+        ("Dobrynya agreed to send migration risks and budget notes by Friday.", "transcript-2"),
     )
     conn.execute(
         "UPDATE meetings SET updated_at = ? WHERE id = ?",

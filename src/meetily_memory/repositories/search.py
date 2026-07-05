@@ -80,6 +80,7 @@ class SearchRepository:
               m.created_at AS created_at,
               m.updated_at AS updated_at,
               m.folder_path AS folder_path,
+              m.language AS language,
               c.id AS chunk_id,
               c.external_id AS chunk_external_id,
               c.kind AS kind,

@@ -21,7 +21,7 @@ This page describes the public command model after scope narrowing.
 | `mm open 12 --source` | Opens the indexed source file/path. |
 | `mm open 12 --print-path` | Prints the default meeting folder path without opening it. |
 | `mm c "what did we decide about migration?"` | Builds paste-ready Markdown context with sources for ChatGPT, Claude, Codex, or another LLM. Use when you want to copy context elsewhere. |
-| `mm topic "migration"` | Advanced topic dossier: related meetings, decisions, tasks, risks, questions, people, and sources. Internally uses the knowledge layer and graph projection. |
+| `mm t "migration"` | Shows what is known about a topic: related meetings, heuristic decisions/tasks/risks/questions, people, and source links. It is a source-backed dossier, not an LLM answer. Headings follow indexed meeting language metadata when available. |
 
 ## Optional: Semantic Search
 
@@ -31,17 +31,16 @@ This page describes the public command model after scope narrowing.
 | `mm semantic index` | Explicitly builds or refreshes embeddings for chunks. `mm refresh` also updates embeddings once semantic search is configured. |
 | `mm sem "migration blockers"` | Semantic search. If embeddings are missing, it asks the user to run `mm semantic index`. |
 
-## Optional: LLM / Ask
+## Optional: LLM Setup
 
 | Command | Public role |
 |---|---|
-| `mm llm init` | Configures the provider used by `mm ask`. Initial modes are `manual` and `ollama`; `agent` is reserved for later. |
-| `mm ask "what did we decide about migration?"` | Retrieves relevant context and asks through the configured provider. In manual mode, it prints the prompt/context instead of answering directly. |
-| `mm ask --meeting 12 "what are the action items?"` | Asks within one meeting. |
-| `mm ask --topic "migration" "what is still open?"` | Asks against topic memory. |
+| `mm llm init` | Configures optional local LLM settings. Initial modes are `manual` and `ollama`; `agent` is reserved for later. |
 
-In `manual` mode, `mm ask` outputs the prompt/context for manual use instead of
-calling a model.
+The answer path is not part of the everyday CLI yet. Prefer `mm c` for
+source-backed prompt/context handoff until local answering has a reliable
+provider setup, source-grounding checks, and a clear difference from context
+export.
 
 ## Optional: Obsidian
 
@@ -92,4 +91,5 @@ There should be no separate public watch command.
 | `mm scan` | Low-level Meetily DB indexing for debugging and tests. Ordinary users use `mm refresh`. |
 | `mm analyze` | Rebuilds structured memory manually for debug or repair. |
 | `mm db status` | Shows schema version and local index internals. |
+| `mm ask ...` | Hidden experimental compatibility command. In manual mode it prints a prompt, which overlaps with `mm c`; do not treat it as a core user workflow yet. |
 | `mm mcp serve` | Experimental MCP adapter for external agents. It is optional for pip/uv installs via `meetily-memory[mcp]`. |

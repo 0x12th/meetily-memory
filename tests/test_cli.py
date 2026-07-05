@@ -22,6 +22,8 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert "--version" in help_result.stdout
     assert "Everyday:" in help_result.stdout
     assert "Advanced:" in help_result.stdout
+    assert "\n  ask" not in help_result.stdout
+    assert "ask answers" not in help_result.stdout
     assert "--install-completion" not in help_result.stdout
     assert "--show-completion" not in help_result.stdout
     assert "╭" not in help_result.stdout
@@ -31,6 +33,8 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert "llm" in help_result.stdout
     assert "obsidian" in help_result.stdout
     assert "autosync" in help_result.stdout
+    assert "\n  t\n" in help_result.stdout
+    assert "\n  topic" not in help_result.stdout
     assert "export" not in help_result.stdout
     assert "spotlight" not in help_result.stdout
     assert "graph" not in help_result.stdout
@@ -90,11 +94,11 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert context.exit_code == 0
     assert "# Question" in context.stdout
     assert "# Relevant meetings" in context.stdout
-    assert "## Meeting: Vladimir Follow-up" in context.stdout
+    assert "## Meeting: Dobrynya Follow-up" in context.stdout
     assert "Date: 2026-07-02T09:30:00Z" in context.stdout
     assert "Source: meeting-2 / transcript-2" in context.stdout
     assert "### Relevant excerpt" in context.stdout
-    assert "Vladimir agreed to send migration risks by Friday." in context.stdout
+    assert "Dobrynya agreed to send migration risks by Friday." in context.stdout
     assert context.stdout.count("Who owns migration risks?") == 2
 
     analyze = runner.invoke(app, ["--index", str(index_path), "analyze", "meeting-2"])
@@ -115,7 +119,7 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
 
     opened = runner.invoke(app, ["--index", str(index_path), "open", "meeting-2", "--print-path"])
     assert opened.exit_code == 0
-    assert opened.stdout.strip() == str(tmp_path / "Vladimir Follow-up")
+    assert opened.stdout.strip() == str(tmp_path / "Dobrynya Follow-up")
 
 
 def test_cli_topic_shows_structured_memory_with_source_evidence(
@@ -130,12 +134,51 @@ def test_cli_topic_shows_structured_memory_with_source_evidence(
     )
     assert scan.exit_code == 0
 
-    topic = runner.invoke(app, ["--index", str(index_path), "topic", "migration"])
+    topic = runner.invoke(app, ["--index", str(index_path), "t", "migration"])
     assert topic.exit_code == 0
-    assert "Topic memory: migration" in topic.stdout
-    assert "Vladimir Follow-up" in topic.stdout
+    assert "What we know: migration" in topic.stdout
+    assert "Dobrynya Follow-up" in topic.stdout
     assert "Source: meeting-2 / transcript-2" in topic.stdout
-    assert "Vladimir agreed to send migration risks by Friday." in topic.stdout
+    assert "Dobrynya agreed to send migration risks by Friday." in topic.stdout
+
+
+def test_cli_topic_uses_meeting_language_for_russian_topic(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    with sqlite3.connect(meetily_db) as conn:
+        conn.execute(
+            """
+            INSERT INTO summary_processes (
+                meeting_id, status, created_at, updated_at, result, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "meeting-2",
+                "completed",
+                "2026-07-02T09:33:00Z",
+                "2026-07-02T09:34:00Z",
+                '{"markdown":"Добрыня подтвердил план миграции."}',
+                '{"language":"ru"}',
+            ),
+        )
+        conn.commit()
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    scan = runner.invoke(
+        app,
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+    )
+    assert scan.exit_code == 0
+
+    topic = runner.invoke(app, ["--index", str(index_path), "t", "миграция"])
+
+    assert topic.exit_code == 0
+    assert "Что известно: миграция" in topic.stdout
+    assert "Связанные встречи" in topic.stdout
+    assert "Dobrynya Follow-up" in topic.stdout
+    assert "Добрыня подтвердил план миграции." in topic.stdout
 
 
 def test_cli_semantic_search_requires_explicit_index(meetily_db: Path, tmp_path: Path) -> None:
@@ -190,7 +233,7 @@ def test_cli_semantic_search_requires_explicit_index(meetily_db: Path, tmp_path:
         ],
     )
     assert semantic.exit_code == 0
-    assert "Vladimir Follow-up" in semantic.stdout
+    assert "Dobrynya Follow-up" in semantic.stdout
     assert "semantic distance:" in semantic.stdout
     assert "embedding: hash/local-hash-v1/128d" in semantic.stdout
     assert "open: mm open 2" in semantic.stdout
@@ -252,7 +295,7 @@ def test_cli_scan_can_skip_structured_analysis(meetily_db: Path, tmp_path: Path)
     )
     assert scan.exit_code == 0
 
-    topic = runner.invoke(app, ["--index", str(index_path), "topic", "migration"])
+    topic = runner.invoke(app, ["--index", str(index_path), "t", "migration"])
     assert topic.exit_code == 0
     assert "No structured signals." in topic.stdout
 
@@ -419,7 +462,7 @@ def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path:
         env=semantic_env,
     )
     assert semantic_alias.exit_code == 0
-    assert "Vladimir Follow-up" in semantic_alias.stdout
+    assert "Dobrynya Follow-up" in semantic_alias.stdout
     assert "embedding: hash/local-hash-v1/128d" in semantic_alias.stdout
 
     switch = runner.invoke(
@@ -584,7 +627,7 @@ def test_cli_init_status_ask_and_obsidian_sync(meetily_db: Path, tmp_path: Path)
     assert obsidian_sync.exit_code == 0
     assert "obsidian files synced:" in obsidian_sync.stdout
     assert (vault_dir / "Meetily Memory" / "Topics" / "migration.md").exists()
-    assert (vault_dir / "Meetily Memory" / "Meetings" / "Vladimir Follow-up.md").exists()
+    assert (vault_dir / "Meetily Memory" / "Meetings" / "Dobrynya Follow-up.md").exists()
     assert "<!-- meetily-memory:managed -->" in (
         vault_dir / "Meetily Memory" / "Topics" / "migration.md"
     ).read_text(encoding="utf-8")
@@ -600,21 +643,21 @@ def test_cli_v5_topic_graph_alias_and_task_status_memory(meetily_db: Path, tmp_p
     )
     assert scan.exit_code == 0
 
-    topic = runner.invoke(app, ["--index", str(index_path), "topic", "migration"])
+    topic = runner.invoke(app, ["--index", str(index_path), "t", "migration"])
     assert topic.exit_code == 0
-    assert "Topic memory: migration" in topic.stdout
-    assert "Unresolved tasks" in topic.stdout
-    assert "Vladimir agreed to send migration risks by Friday." in topic.stdout
+    assert "What we know: migration" in topic.stdout
+    assert "Open tasks (heuristic)" in topic.stdout
+    assert "Dobrynya agreed to send migration risks by Friday." in topic.stdout
     assert "Source: meeting-2 / transcript-2" in topic.stdout
 
     alias = runner.invoke(
         app,
-        ["--index", str(index_path), "topic", "migration", "--alias", "миграция"],
+        ["--index", str(index_path), "t", "migration", "--alias", "миграция"],
     )
     assert alias.exit_code == 0
     assert "alias added: миграция -> migration" in alias.stdout
 
-    alias_lookup = runner.invoke(app, ["--index", str(index_path), "topic", "миграция"])
+    alias_lookup = runner.invoke(app, ["--index", str(index_path), "t", "миграция"])
     assert alias_lookup.exit_code == 0
-    assert "Topic memory: migration" in alias_lookup.stdout
+    assert "What we know: migration" in alias_lookup.stdout
     assert "alias: миграция" in alias_lookup.stdout

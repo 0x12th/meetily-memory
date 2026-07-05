@@ -5,28 +5,29 @@ from meetily_memory.cli.common import compact_date, print_text_block
 
 def print_topic_memory(memory: dict[str, object]) -> None:
     topic = cast("dict[str, object]", memory["topic"])
-    print_text_block(f"Topic memory: {topic['title']}")
+    labels = topic_labels(str(memory.get("language") or ""))
+    print_text_block(f"{labels['title']}: {topic['title']}")
     aliases = cast("list[str]", topic.get("aliases", []))
     for alias in aliases:
         print_text_block(f"alias: {alias}")
-    print_text_block("\nRelated meetings")
+    print_text_block(f"\n{labels['meetings']}")
     print_search_meeting_summaries(cast("list[dict[str, object]]", memory["meetings"]))
-    print_text_block("Latest decisions")
+    print_text_block(labels["decisions"])
     print_entity_bullets(entity_rows_for_kind(memory, "decisions"))
-    print_text_block("Unresolved tasks")
+    print_text_block(labels["tasks"])
     open_tasks = [
         row
         for row in entity_rows_for_kind(memory, "action_items")
         if row.get("status", "open") in {"open", "unknown"}
     ]
     print_entity_bullets(open_tasks)
-    print_text_block("Active risks")
+    print_text_block(labels["risks"])
     print_entity_bullets(entity_rows_for_kind(memory, "risks"))
-    print_text_block("Open questions")
+    print_text_block(labels["questions"])
     print_entity_bullets(entity_rows_for_kind(memory, "open_questions"))
     people = cast("list[dict[str, object]]", memory.get("related_people", []))
     if people:
-        print_text_block("Related people")
+        print_text_block(labels["people"])
         for person in people:
             print_text_block(f"- {person['display_name']}")
 
@@ -34,6 +35,28 @@ def print_topic_memory(memory: dict[str, object]) -> None:
 def entity_rows_for_kind(memory: dict[str, object], kind: str) -> list[dict[str, object]]:
     rows = cast("list[dict[str, object]]", memory.get("structured_signals", []))
     return [row for row in rows if row["kind"] == kind]
+
+
+def topic_labels(language: str) -> dict[str, str]:
+    if language.casefold().split("-", maxsplit=1)[0] == "ru":
+        return {
+            "title": "Что известно",
+            "meetings": "Связанные встречи",
+            "decisions": "Решения (эвристика)",
+            "tasks": "Открытые задачи (эвристика)",
+            "risks": "Риски (эвристика)",
+            "questions": "Открытые вопросы (эвристика)",
+            "people": "Связанные люди",
+        }
+    return {
+        "title": "What we know",
+        "meetings": "Related meetings",
+        "decisions": "Decisions (heuristic)",
+        "tasks": "Open tasks (heuristic)",
+        "risks": "Risks (heuristic)",
+        "questions": "Open questions (heuristic)",
+        "people": "Related people",
+    }
 
 
 def graph_node_title(nodes: list[dict[str, object]], node_id: int) -> str:
