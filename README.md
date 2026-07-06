@@ -5,7 +5,7 @@ Context.
 Verify.
 
 Meetily Memory turns local Meetily meetings into a private, source-backed memory
-you can search, explore, and turn into LLM-ready context.
+for search, context, and verification.
 
 It is for the moment when:
 
@@ -49,10 +49,10 @@ mm init
 
 `mm init` automatically:
 
-- discovers the local Meetily database;
-- creates a private search index;
-- performs the initial refresh;
-- offers to enable automatic refreshes.
+* discovers the local Meetily database;
+* creates a private search index;
+* performs the initial refresh;
+* offers to enable automatic refreshes.
 
 Nothing optional is enabled without asking.
 
@@ -68,6 +68,24 @@ Search meetings:
 
 ```bash
 mm s "migration risk"
+```
+
+Example output:
+
+```text
+#10 Meeting 2026-07-06
+
+12:56:36 | chunk #3863 | open: mm open 10
+If I write to the database, I must also publish to Kafka...
+
+12:56:42
+Pattern outbox.
+```
+
+Show neighboring context around each hit:
+
+```bash
+mm s "migration risk" --context 2
 ```
 
 Build LLM-ready context:
@@ -112,6 +130,12 @@ mm s "migration risk"
 
 Search indexed meetings and return matching source snippets.
 
+Use `--context N` when the matching snippet is too short:
+
+```bash
+mm s "migration risk" --context 2
+```
+
 ### Context
 
 ```bash
@@ -126,11 +150,24 @@ Build clean Markdown context ready to paste into ChatGPT, Claude, or Codex.
 mm t "migration"
 ```
 
-Explore everything known about a topic, including related meetings,
-heuristically extracted decisions, risks, tasks, questions, people, and
-supporting evidence.
+Experimental. Explore a topic as search results grouped into an evidence-backed
+dossier: summary, related meetings, possible decisions, possible risks,
+possible tasks, possible questions, and supporting excerpts.
 
-This is an evidence view rather than an LLM-generated answer.
+Topic output is not a knowledge-graph oracle or an LLM-generated answer. If
+structured memory has no matches, it still shows relevant evidence from search.
+Topic expansion uses stored aliases, not built-in term dictionaries:
+
+```bash
+mm t "kafka" --alias "кафка" --alias "broker"
+```
+
+The CLI language is stable across commands. Configure it explicitly when needed:
+
+```bash
+mm config language ru
+mm config language auto
+```
 
 ### Open
 
@@ -152,7 +189,7 @@ Refresh the local index when automatic refreshes are disabled.
 
 ## Optional Features
 
-### Obsidian
+### Obsidian (Experimental)
 
 Meetily Memory can maintain a managed Obsidian knowledge vault.
 
@@ -170,13 +207,13 @@ mm obsidian sync
 
 Managed notes include:
 
-- Topics
-- Meetings
-- People
-- Tasks
-- Decisions
-- Risks
-- Questions
+* Topics
+* Meetings
+* People
+* Tasks
+* Decisions
+* Risks
+* Questions
 
 Managed files contain:
 
@@ -185,6 +222,7 @@ Managed files contain:
 ```
 
 Only managed notes are updated.
+
 Your own notes are never overwritten.
 
 ---
@@ -199,10 +237,11 @@ mm llm init
 
 Supported providers:
 
-- Manual (prepare context for ChatGPT or Claude)
-- Ollama (local models)
+* Manual (prepare context for ChatGPT or Claude)
+* Ollama (local models)
 
 The `mm ask` command is intentionally hidden while this workflow matures.
+
 For now, `mm c` is the recommended interface.
 
 Compatibility command:
@@ -218,24 +257,28 @@ context to an LLM.
 
 ### MCP (Experimental)
 
-`mm mcp serve` exposes Meetily Memory to external agents.
+```bash
+mm mcp serve
+```
+
+Expose Meetily Memory to external agents.
 
 MCP support is optional for `pip` and `uv` installs via
 `meetily-memory[mcp]`.
 
-If the extra is not installed, the command prints installation
-instructions instead of starting a server.
+If the extra is not installed, the command prints installation instructions
+instead of starting a server.
 
 ---
 
 ## Principles
 
-- Local-first.
-- Private by default.
-- Read-only Meetily database.
-- Evidence before summaries.
-- Small public CLI.
-- Search → Context → Verify.
+* Search-first public CLI.
+* Evidence before summaries.
+* Search → Context → Verify.
+* Local-first.
+* Private by default.
+* Read-only Meetily database.
 
 ---
 
@@ -247,33 +290,35 @@ instructions instead of starting a server.
                       ▼
           Meetily Memory index.sqlite
                       │
-      ┌───────────────┼────────────────┐
-      │               │                │
-      ▼               ▼                ▼
-   FTS Search   Structured Memory   Semantic Search
-                      │
-                      ▼
-              Topic Knowledge Layer
+      ┌───────────────┼────────────────────┐
+      │               │                    │
+      ▼               ▼                    ▼
+   FTS Search   Source Context      Structured Signals
+    stable         stable              experimental
+      │                                   │
+      ├───────────────┬───────────────────┤
+      ▼               ▼                   ▼
+     CLI       Topic Summary       Semantic Search
+    stable      experimental        experimental
                       │
         ┌─────────────┼──────────────┐
         ▼             ▼              ▼
-     CLI       Optional Obsidian   LLM Answering
-                                     │
-                                     ▼
-                              Experimental MCP
+  Obsidian       LLM Answering      MCP
+ experimental    experimental   experimental
 ```
 
 Meetily Memory stores only derived local state:
 
-- normalized meetings and chunks;
-- SQLite FTS index;
-- decisions, action items, risks, and questions;
-- topic relationships;
-- optional semantic embeddings;
-- local application settings.
+* normalized meetings and chunks;
+* SQLite FTS index;
+* experimental decisions, action items, risks, and questions;
+* experimental topic relationships;
+* optional semantic embeddings;
+* local application settings.
 
-The knowledge layer powers `mm t`, Obsidian synchronization, LLM workflows,
-and the MCP adapter.
+The stable path is search, context, and source verification. The experimental
+knowledge layers power `mm t`, Obsidian synchronization, LLM workflows, and the
+MCP adapter.
 
 ---
 

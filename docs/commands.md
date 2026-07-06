@@ -9,21 +9,34 @@ This page describes the public command model after scope narrowing.
 | `mm init` | First-run setup. Discovers the Meetily DB, creates `index.sqlite`, runs the first refresh, and asks before enabling automatic index refreshes. |
 | `mm refresh` | Main manual index refresh. Reads the Meetily DB, updates the local index, and rebuilds structured memory. If semantic search or Obsidian are configured, it also refreshes those derived layers. |
 | `mm update` | Updates the installed `meetily-memory` utility through Homebrew. |
-| `mm status` | Short system state: Meetily DB path, index path, last refresh, autosync, Obsidian, LLM, and semantic status. |
+| `mm status` | Short system state: Meetily DB path, index path, UI language, last refresh, autosync, Obsidian, LLM, and semantic status. |
 | `mm doctor` | Diagnostics only. Checks Meetily DB access/schema, SQLite/FTS5/sqlite-vec support, index permissions, and config. It does not change state. |
+| `mm config language ru` | Stores the stable CLI UI language. Supported values are `en`, `ru`, and `auto`. |
 
 ## Search And Context
 
 | Command | Public role |
 |---|---|
 | `mm s "migration risk"` | Fast FTS search over indexed meetings. Returns meeting id, title, chunk id, timestamp/source, and enough evidence to open the source. |
+| `mm s "migration risk" --context 2` | Expands each hit with neighboring chunks before and after the match. Use this when the matching snippet is too short. |
 | `mm open 12` | Opens the meeting folder so the original Meetily record can be inspected. |
 | `mm open 12 --source` | Opens the indexed source file/path. |
 | `mm open 12 --print-path` | Prints the default meeting folder path without opening it. |
 | `mm c "what did we decide about migration?"` | Builds paste-ready Markdown context with sources for ChatGPT, Claude, Codex, or another LLM. Use when you want to copy context elsewhere. |
-| `mm t "migration"` | Shows what is known about a topic: related meetings, heuristic decisions/tasks/risks/questions, people, and source links. It is a source-backed dossier, not an LLM answer. Headings follow indexed meeting language metadata when available. |
+| `mm t "migration"` | Experimental source-backed topic dossier. It starts from search evidence, labels heuristic matches as possible decisions/tasks/risks/questions, and still shows evidence when structured memory is empty. It is not an LLM answer. |
 
-## Optional: Semantic Search
+`mm t` expands stored topic aliases. Add aliases explicitly with repeated
+`--alias` options, for example:
+
+```bash
+mm t "kafka" --alias "кафка" --alias "broker"
+```
+
+There is no built-in domain dictionary for specific terms. Future expansion
+should come from user aliases, indexed aliases, extracted aliases, or semantic
+retrieval.
+
+## Optional Experimental: Semantic Search
 
 | Command | Public role |
 |---|---|
@@ -31,7 +44,7 @@ This page describes the public command model after scope narrowing.
 | `mm semantic index` | Explicitly builds or refreshes embeddings for chunks. `mm refresh` also updates embeddings once semantic search is configured. |
 | `mm sem "migration blockers"` | Semantic search. If embeddings are missing, it asks the user to run `mm semantic index`. |
 
-## Optional: LLM Setup
+## Optional Experimental: LLM Setup
 
 | Command | Public role |
 |---|---|
@@ -42,7 +55,10 @@ source-backed prompt/context handoff until local answering has a reliable
 provider setup, source-grounding checks, and a clear difference from context
 export.
 
-## Optional: Obsidian
+## Optional Experimental: Obsidian
+
+Obsidian is experimental but intentionally visible and usable because it is a
+requested workflow.
 
 | Command | Public role |
 |---|---|

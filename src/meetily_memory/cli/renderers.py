@@ -5,26 +5,34 @@ from meetily_memory.cli.common import compact_date, print_text_block
 
 def print_topic_memory(memory: dict[str, object]) -> None:
     topic = cast("dict[str, object]", memory["topic"])
-    labels = topic_labels(str(memory.get("language") or ""))
+    labels = topic_labels(str(memory.get("ui_language") or "en"))
     print_text_block(f"{labels['title']}: {topic['title']}")
     aliases = cast("list[str]", topic.get("aliases", []))
     for alias in aliases:
         print_text_block(f"alias: {alias}")
+    evidence = cast(
+        "list[dict[str, object]]",
+        memory.get("evidence", memory.get("meetings", [])),
+    )
+    print_text_block(f"\n{labels['summary']}")
+    print_topic_summary(memory, evidence)
     print_text_block(f"\n{labels['meetings']}")
     print_search_meeting_summaries(cast("list[dict[str, object]]", memory["meetings"]))
     print_text_block(labels["decisions"])
-    print_entity_bullets(entity_rows_for_kind(memory, "decisions"))
+    print_topic_section(memory, evidence, "decisions", labels)
     print_text_block(labels["tasks"])
     open_tasks = [
         row
         for row in entity_rows_for_kind(memory, "action_items")
         if row.get("status", "open") in {"open", "unknown"}
     ]
-    print_entity_bullets(open_tasks)
+    print_topic_section(memory, evidence, "action_items", labels, structured_rows=open_tasks)
     print_text_block(labels["risks"])
-    print_entity_bullets(entity_rows_for_kind(memory, "risks"))
+    print_topic_section(memory, evidence, "risks", labels)
     print_text_block(labels["questions"])
-    print_entity_bullets(entity_rows_for_kind(memory, "open_questions"))
+    print_topic_section(memory, evidence, "open_questions", labels)
+    print_text_block(labels["evidence"])
+    print_evidence_bullets(evidence)
     people = cast("list[dict[str, object]]", memory.get("related_people", []))
     if people:
         print_text_block(labels["people"])
@@ -41,21 +49,42 @@ def topic_labels(language: str) -> dict[str, str]:
     if language.casefold().split("-", maxsplit=1)[0] == "ru":
         return {
             "title": "Что известно",
+            "summary": "Кратко",
             "meetings": "Связанные встречи",
-            "decisions": "Решения (эвристика)",
-            "tasks": "Открытые задачи (эвристика)",
-            "risks": "Риски (эвристика)",
-            "questions": "Открытые вопросы (эвристика)",
+            "decisions": "Возможные решения",
+            "tasks": "Возможные задачи",
+            "risks": "Возможные риски",
+            "questions": "Возможные вопросы",
+            "evidence": "Подтверждающие фрагменты",
             "people": "Связанные люди",
+            "no_decisions": "Подтвержденные решения не найдены.",
+            "no_tasks": "Возможные задачи не найдены.",
+            "no_risks": "Возможные риски не найдены.",
+            "no_questions": "Возможные вопросы не найдены.",
+            "no_evidence": "Подтверждающие фрагменты не найдены.",
+            "no_topic": "Подтверждающие фрагменты по теме не найдены.",
+            "summary_found": (
+                "Найдено фрагментов: {excerpts}; встреч: {meetings}; запросы: {terms}."
+            ),
         }
     return {
         "title": "What we know",
+        "summary": "Summary",
         "meetings": "Related meetings",
-        "decisions": "Decisions (heuristic)",
-        "tasks": "Open tasks (heuristic)",
-        "risks": "Risks (heuristic)",
-        "questions": "Open questions (heuristic)",
+        "decisions": "Possible decisions",
+        "tasks": "Possible tasks",
+        "risks": "Possible risks",
+        "questions": "Possible questions",
+        "evidence": "Supporting excerpts",
         "people": "Related people",
+        "no_decisions": "No confirmed decisions found.",
+        "no_tasks": "No possible tasks found.",
+        "no_risks": "No possible risks found.",
+        "no_questions": "No possible questions found.",
+        "no_evidence": "No supporting excerpts found.",
+        "no_topic": "No source-backed evidence found for this topic.",
+        "summary_found": "Found {excerpts} source-backed excerpt(s) across "
+        "{meetings} meeting(s) for: {terms}.",
     }
 
 
@@ -121,6 +150,148 @@ def print_entity_bullets(rows: list[dict[str, object]]) -> None:
         return
     for row in rows:
         print_text_block(f"- {row['text']} | Source: {entity_source(row)}")
+
+
+def print_topic_summary(
+    memory: dict[str, object],
+    evidence: list[dict[str, object]],
+) -> None:
+    labels = topic_labels(str(memory.get("ui_language") or "en"))
+    query_terms = cast("list[str]", memory.get("query_terms", []))
+    meeting_ids = {row.get("meeting_id") for row in evidence}
+    if not evidence:
+        print_text_block(labels["no_topic"])
+        return
+    term_text = ", ".join(query_terms) if query_terms else str(memory["topic"])
+    print_text_block(
+        labels["summary_found"].format(
+            excerpts=len(evidence),
+            meetings=len(meeting_ids),
+            terms=term_text,
+        )
+    )
+
+
+def print_topic_section(
+    memory: dict[str, object],
+    evidence: list[dict[str, object]],
+    kind: str,
+    labels: dict[str, str],
+    *,
+    structured_rows: list[dict[str, object]] | None = None,
+) -> None:
+    rows = structured_rows if structured_rows is not None else entity_rows_for_kind(memory, kind)
+    if rows:
+        print_entity_bullets(rows)
+        return
+    if kind == "decisions":
+        print_text_block(labels["no_decisions"])
+        return
+    print_evidence_bullets(classify_evidence(evidence, kind), empty=empty_label(labels, kind))
+
+
+def empty_label(labels: dict[str, str], kind: str) -> str:
+    empty_labels = {
+        "action_items": "no_tasks",
+        "risks": "no_risks",
+        "open_questions": "no_questions",
+    }
+    return labels[empty_labels[kind]]
+
+
+def classify_evidence(
+    evidence: list[dict[str, object]],
+    kind: str,
+) -> list[dict[str, object]]:
+    keywords = TOPIC_KEYWORDS[kind]
+    return [
+        row
+        for row in evidence
+        if any(keyword in str(row.get("text", "")).casefold() for keyword in keywords)
+    ]
+
+
+TOPIC_KEYWORDS = {
+    "decisions": (
+        "decided",
+        "decision",
+        "agreed",
+        "approved",
+        "use ",
+        "using",
+        "chosen",
+        "selected",
+        "решили",
+        "договорились",
+        "используем",
+        "выбрали",
+        "надо делать",
+    ),
+    "action_items": (
+        "action",
+        "todo",
+        "send",
+        "prepare",
+        "owner",
+        "owns",
+        "by friday",
+        "надо",
+        "нужно",
+        "сделать",
+        "отправить",
+    ),
+    "risks": (
+        "risk",
+        "problem",
+        "cannot",
+        "can't",
+        "blocked",
+        "blocker",
+        "race",
+        "consistency",
+        "inconsistent",
+        "риск",
+        "проблем",
+        "не можем",
+        "ломается",
+        "рассинхрон",
+        "гонка",
+        "нет гарант",
+    ),
+    "open_questions": (
+        "question",
+        "unclear",
+        "unknown",
+        "how ",
+        "what ",
+        "who ",
+        "вопрос",
+        "непонятно",
+        "как будем",
+        "нужно решить",
+    ),
+}
+
+
+def print_evidence_bullets(
+    rows: list[dict[str, object]],
+    *,
+    empty: str = "No relevant evidence.",
+) -> None:
+    if not rows:
+        print_text_block(empty)
+        return
+    for row in rows:
+        prefix_parts = []
+        if row.get("timestamp_label"):
+            prefix_parts.append(str(row["timestamp_label"]))
+        if row.get("speaker"):
+            prefix_parts.append(str(row["speaker"]))
+        prefix = f"{' | '.join(prefix_parts)}: " if prefix_parts else ""
+        print_text_block(
+            f"- {prefix}{row['text']} | Source: {entity_source(row)} "
+            f"| open: mm open {row['meeting_id']}"
+        )
 
 
 def print_grouped_entity_bullets(rows: list[dict[str, object]]) -> None:

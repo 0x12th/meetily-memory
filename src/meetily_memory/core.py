@@ -32,12 +32,13 @@ class MeetilyMemoryCore:
     def __init__(self, index_path: Path) -> None:
         self.repo = IndexRepository(Path(index_path))
 
-    def search(self, query: str, limit: int = 10) -> CoreResponse:
+    def search(self, query: str, limit: int = 10, context: int = 0) -> CoreResponse:
         return CoreResponse(
             "search",
             {
                 "query": query,
-                "results": self.repo.search(query, limit),
+                "context": context,
+                "results": self.repo.search(query, limit, context=context),
             },
         )
 

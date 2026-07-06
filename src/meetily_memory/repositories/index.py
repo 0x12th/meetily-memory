@@ -219,14 +219,18 @@ class IndexRepository:
         limit: int = 10,
         *,
         meeting_id: int | None = None,
+        context: int = 0,
     ) -> list[dict[str, Any]]:
-        return self.search_repo.search(query, limit, meeting_id=meeting_id)
+        return self.search_repo.search(query, limit, meeting_id=meeting_id, context=context)
 
     def list_meetings(self, limit: int = 20, person: str | None = None) -> list[dict[str, Any]]:
         return self.meetings.list_meetings(limit, person)
 
     def get_meeting(self, external_or_internal_id: str) -> dict[str, Any] | None:
         return self.meetings.get_meeting(external_or_internal_id)
+
+    def dominant_meeting_language(self) -> str | None:
+        return self.meetings.dominant_meeting_language()
 
     def record_scan_run(
         self,

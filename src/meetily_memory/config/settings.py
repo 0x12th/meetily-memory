@@ -31,6 +31,7 @@ class SemanticSettings:
 @dataclass(frozen=True)
 class AppSettings:
     source_path: str | None = None
+    ui_language: str | None = None
     autosync_enabled: bool = False
     last_update_at: str | None = None
     obsidian: ObsidianSettings = ObsidianSettings()
@@ -40,6 +41,7 @@ class AppSettings:
     def as_payload(self) -> dict[str, Any]:
         return {
             "source_path": self.source_path,
+            "ui_language": self.ui_language,
             "autosync_enabled": self.autosync_enabled,
             "last_update_at": self.last_update_at,
             "obsidian": {
@@ -76,6 +78,7 @@ def load_app_settings() -> AppSettings:
     semantic = semantic_from_payload(semantic_payload if isinstance(semantic_payload, dict) else {})
     return AppSettings(
         source_path=optional_str(payload.get("source_path")),
+        ui_language=normalize_ui_language(optional_str(payload.get("ui_language"))),
         autosync_enabled=bool(payload.get("autosync_enabled", False)),
         last_update_at=optional_str(payload.get("last_update_at")),
         obsidian=obsidian,
@@ -95,6 +98,9 @@ def update_app_settings(**changes: object) -> AppSettings:
     settings = load_app_settings()
     updated = AppSettings(
         source_path=string_change(changes, "source_path", settings.source_path),
+        ui_language=normalize_ui_language(
+            string_change(changes, "ui_language", settings.ui_language)
+        ),
         autosync_enabled=bool_change(
             changes,
             "autosync_enabled",
@@ -166,3 +172,10 @@ def bool_change(changes: dict[str, object], key: str, *, current: bool) -> bool:
 
 def optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def normalize_ui_language(value: str | None) -> str | None:
+    if value is None:
+        return None
+    language = value.casefold().replace("_", "-").split("-", maxsplit=1)[0]
+    return language if language in {"en", "ru"} else None

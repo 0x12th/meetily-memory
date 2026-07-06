@@ -328,6 +328,20 @@ class MeetingsRepository:
                 ).fetchone()
             return row_to_dict(row)
 
+    def dominant_meeting_language(self) -> str | None:
+        with index_connection(self.index_path) as conn:
+            row = conn.execute(
+                """
+                SELECT language
+                FROM meetings
+                WHERE language IS NOT NULL AND language != ''
+                GROUP BY language
+                ORDER BY COUNT(*) DESC, language ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            return str(row["language"]) if row else None
+
     def record_scan_run(
         self,
         source_id: int,

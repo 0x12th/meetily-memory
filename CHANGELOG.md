@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2 - 2026-07-06
+
+- Add `mm s --context/-C` to expand search hits with neighboring chunks.
+- Rework `mm t` as a source-backed topic dossier with supporting excerpts even
+  when structured signals are empty.
+- Make topic sections use cautious "possible" labels for heuristic decisions,
+  tasks, risks, and questions.
+- Add stable CLI UI language configuration via `mm config language en|ru|auto`.
+- Keep topic alias expansion data-driven through stored aliases instead of
+  built-in term dictionaries.
+- Update README and command docs around the search-first stable contract and
+  experimental topic/Obsidian/LLM/MCP surfaces.
+
 ## 0.3.1 - 2026-07-05
 
 - Replace the public topic command with the shorter `mm t` while keeping the

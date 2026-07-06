@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import typer
 
@@ -11,6 +11,7 @@ from meetily_memory.cli.common import (
     open_path,
     print_json,
     print_text_block,
+    ui_language_from_context,
 )
 from meetily_memory.cli.renderers import print_topic_memory
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT
@@ -24,25 +25,54 @@ def search(
     ctx: typer.Context,
     query: str,
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
+    context: Annotated[
+        int,
+        typer.Option("--context", "-C", min=0, help="Include N chunks before and after each hit."),
+    ] = 0,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    results = core_from_context(ctx).search(query, limit).data["results"]
+    results = core_from_context(ctx).search(query, limit, context).data["results"]
     if json_output:
         print_json(results)
         return
+    print_search_results(cast("list[dict[str, object]]", results))
+
+
+def print_search_results(results: list[dict[str, object]]) -> None:
+    grouped: dict[int, list[dict[str, object]]] = {}
     for result in results:
-        date = compact_date(result.get("updated_at") or result.get("created_at"))
-        suffix = f" ({date})" if date else ""
-        console.print(f"#{result['meeting_id']} {result['title']}{suffix}")
-        source_parts = [
-            f"chunk #{result['chunk_id']}",
-            f"open: mm open {result['meeting_id']}",
-        ]
-        if result.get("timestamp_label"):
-            source_parts.insert(0, str(result["timestamp_label"]))
-        console.print(" | ".join(source_parts))
-        console.print(result["text"])
-        console.print()
+        meeting_id = int(cast("int | str", result["meeting_id"]))
+        grouped.setdefault(meeting_id, []).append(result)
+    for index, rows in enumerate(grouped.values()):
+        if index:
+            console.print()
+        print_search_meeting_header(rows[0])
+        for result in rows:
+            print_search_excerpt(result)
+
+
+def print_search_meeting_header(result: dict[str, object]) -> None:
+    meeting_id = result["meeting_id"]
+    date = compact_date(result.get("updated_at") or result.get("created_at"))
+    suffix = f" ({date})" if date else ""
+    console.print(f"#{meeting_id} {result['title']}{suffix}")
+    console.print(f"open: mm open {meeting_id}")
+
+
+def print_search_excerpt(result: dict[str, object]) -> None:
+    source_parts = [
+        f"chunk #{result['chunk_id']}",
+    ]
+    if result.get("timestamp_label"):
+        source_parts.insert(0, str(result["timestamp_label"]))
+    if result.get("is_context"):
+        source_parts.append("context")
+    console.print(" | ".join(source_parts))
+    text = str(result["text"])
+    if result.get("speaker"):
+        text = f"{result['speaker']}: {text}"
+    console.print(text)
+    console.print()
 
 
 @app.command("c")
@@ -78,6 +108,7 @@ def topic_memory(
     if json_output:
         print_json(memory)
         return
+    memory["ui_language"] = ui_language_from_context(ctx)
     print_topic_memory(memory)
 
 

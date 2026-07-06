@@ -344,13 +344,13 @@ class KnowledgeRepository:
     def topic_memory(self, title: str, limit: int = 10) -> dict[str, Any]:
         topic = self.ensure_topic(title)
         topic_terms = [str(topic["title"]), *(str(alias) for alias in topic["aliases"])]
-        meetings = self.context.search_meetings(str(topic["title"]), limit)
+        evidence = search_topic_evidence(self.context.search_meetings, topic_terms, limit)
         with index_connection(self.context.index_path) as conn:
             rows = self.list_topic_entity_details(conn, int(topic["id"]), limit)
             related_people = self.list_topic_people(conn, int(topic["id"]), limit)
         language = dominant_language(
             [
-                *(meeting.get("language") for meeting in meetings),
+                *(meeting.get("language") for meeting in evidence),
                 *(row.get("meeting_language") for row in rows),
             ]
         )
@@ -358,7 +358,8 @@ class KnowledgeRepository:
             "topic": without_added_aliases(topic),
             "language": language,
             "query_terms": topic_terms,
-            "meetings": meetings,
+            "meetings": evidence,
+            "evidence": evidence,
             "structured_signals": rows,
             "related_people": related_people,
         }
@@ -615,7 +616,28 @@ def dominant_language(values: Iterable[object]) -> str | None:
         if not isinstance(value, str) or not value:
             continue
         normalized = value.casefold().split("-", maxsplit=1)[0]
+        if normalized not in {"en", "ru"}:
+            continue
         counts[normalized] = counts.get(normalized, 0) + 1
     if not counts:
         return None
     return max(counts.items(), key=lambda item: item[1])[0]
+
+
+def search_topic_evidence(
+    search_meetings: SearchMeetings,
+    topic_terms: Iterable[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_chunk_ids: set[int] = set()
+    for term in topic_terms:
+        for row in search_meetings(term, limit):
+            chunk_id = int(row["chunk_id"])
+            if chunk_id in seen_chunk_ids:
+                continue
+            rows.append(row)
+            seen_chunk_ids.add(chunk_id)
+            if len(rows) >= limit:
+                return rows
+    return rows

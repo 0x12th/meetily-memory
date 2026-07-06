@@ -3,6 +3,7 @@ import subprocess
 import sys
 from contextlib import closing
 from importlib.metadata import PackageNotFoundError, version
+from locale import getlocale
 from pathlib import Path
 from shutil import which
 
@@ -12,7 +13,9 @@ from rich.table import Table
 
 from meetily_memory import __version__ as fallback_version
 from meetily_memory.config.paths import default_index_path
+from meetily_memory.config.settings import load_app_settings, normalize_ui_language
 from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import dumps_json
 
 PACKAGE_NAME = "meetily-memory"
@@ -73,6 +76,23 @@ def print_text_block(text: str) -> None:
 
 def core_from_context(ctx: typer.Context) -> MeetilyMemoryCore:
     return MeetilyMemoryCore(ctx.obj["index_path"])
+
+
+def ui_language_from_context(ctx: typer.Context) -> str:
+    return resolve_ui_language(ctx.obj["index_path"])
+
+
+def resolve_ui_language(index_path: Path) -> str:
+    settings = load_app_settings()
+    if settings.ui_language:
+        return settings.ui_language
+    indexed_language = normalize_ui_language(
+        IndexRepository(index_path).dominant_meeting_language()
+    )
+    if indexed_language:
+        return indexed_language
+    system_language = normalize_ui_language(getlocale()[0])
+    return system_language or "en"
 
 
 def meeting_label(row: dict[str, object]) -> str:

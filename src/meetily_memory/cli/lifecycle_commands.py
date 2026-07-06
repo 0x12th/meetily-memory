@@ -13,6 +13,7 @@ from meetily_memory.cli.common import (
     make_typer,
     print_json,
     print_text_block,
+    resolve_ui_language,
     sqlite_has_fts5,
 )
 from meetily_memory.config.paths import discover_meetily_db
@@ -31,6 +32,7 @@ from meetily_memory.semantic_search import (
 from meetily_memory.structure_analyzer import StructureAnalyzer
 
 app = make_typer("Local Meetily history lifecycle commands.")
+config_app = make_typer("Manage CLI settings.")
 db_app = make_typer("Inspect the local index database.")
 mcp_app = make_typer("Run the MCP server.")
 
@@ -149,9 +151,12 @@ def status(
     semantic_config = load_semantic_config()
     obsidian_configured = bool(settings.obsidian.vault_path)
     llm_provider = settings.llm.provider or "not configured"
+    resolved_ui_language = resolve_ui_language(index_path)
     payload = {
         "index_path": str(index_path),
         "source_path": settings.source_path,
+        "ui_language": settings.ui_language,
+        "resolved_ui_language": resolved_ui_language,
         "last_update_at": settings.last_update_at,
         "autosync_enabled": settings.autosync_enabled,
         "semantic_provider": semantic_config.provider,
@@ -164,6 +169,8 @@ def status(
         return
     print_text_block(f"index path: {index_path}")
     print_text_block(f"source path: {settings.source_path or 'not configured'}")
+    configured_label = "configured" if settings.ui_language else "auto"
+    print_text_block(f"language: {resolved_ui_language} ({configured_label})")
     print_text_block(f"last refresh: {settings.last_update_at or 'never'}")
     print_text_block(f"autosync: {'enabled' if settings.autosync_enabled else 'disabled'}")
     print_text_block(f"semantic: {semantic_config.provider or 'not configured'}")
@@ -171,6 +178,30 @@ def status(
     print_text_block(f"llm: {llm_provider}")
     print_text_block(f"meetings: {stats['meetings']}")
     print_text_block(f"chunks: {stats['chunks']}")
+
+
+@config_app.command("language")
+def config_language(
+    language: Annotated[
+        str,
+        typer.Argument(help="UI language: en, ru, or auto."),
+    ],
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    normalized = language.casefold().replace("_", "-").split("-", maxsplit=1)[0]
+    if normalized == "auto":
+        settings = update_app_settings(ui_language=None)
+    elif normalized in {"en", "ru"}:
+        settings = update_app_settings(ui_language=normalized)
+    else:
+        message = "UI language must be one of: en, ru, auto."
+        raise typer.BadParameter(message)
+
+    payload = {"ui_language": settings.ui_language}
+    if json_output:
+        print_json(payload)
+        return
+    print_text_block(f"ui language: {settings.ui_language or 'auto'}")
 
 
 @app.command()
