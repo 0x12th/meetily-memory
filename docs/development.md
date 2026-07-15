@@ -1,5 +1,8 @@
 # Development
 
+See [Retrieval evaluation](evaluation.md) for the reproducible FTS5 quality baseline and paired
+comparison workflow.
+
 Development setup:
 
 ```bash

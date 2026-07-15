@@ -1,0 +1,29 @@
+{
+  "schema_version": "meetily-memory.eval.v1",
+  "dataset_version": "1",
+  "name": "synthetic-format-and-metrics-only",
+  "tasks": [
+    {
+      "id": "exact-pricing",
+      "query": "pricing decision",
+      "class": "exact_match",
+      "critical": true,
+      "critical_reason": "Known exact evidence used to protect lexical retrieval.",
+      "expected": [
+        {"evidence_id": "meeting-1/transcript-1", "relevance": 2},
+        {"evidence_id": "meeting-1/summary:meeting-1", "relevance": 1}
+      ]
+    },
+    {
+      "id": "task-migration-owner",
+      "query": "Who owns migration risks?",
+      "class": "task",
+      "critical": false,
+      "critical_reason": null,
+      "expected": [
+        {"evidence_id": "meeting-2/transcript-2", "relevance": 2},
+        {"evidence_id": "meeting-2/note:meeting-2", "relevance": 1}
+      ]
+    }
+  ]
+}
