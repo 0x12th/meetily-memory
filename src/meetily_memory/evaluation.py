@@ -248,6 +248,7 @@ class EvaluationComparison:
     transitions: list[str]
     by_class: dict[str, ComparisonCount]
     critical_regressions: list[str]
+    allowed_manifest_drift: list[str]
 
     def as_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -397,11 +398,20 @@ def aggregate_metrics(tasks: tuple[ObservedTask, ...]) -> EvaluationMetrics:
 
 
 def compare_reports(
-    baseline: EvaluationReport, candidate: EvaluationReport
+    baseline: EvaluationReport,
+    candidate: EvaluationReport,
+    *,
+    allow_manifest_drift: set[str] | None = None,
 ) -> EvaluationComparison:
+    allowed = allow_manifest_drift or set()
+    unknown_fields = allowed - set(EvaluationManifest.COMPATIBILITY_FIELDS)
+    if unknown_fields:
+        message = f"unknown manifest drift fields: {', '.join(sorted(unknown_fields))}"
+        raise ValueError(message)
     mismatches = baseline.manifest.compatibility_mismatches(candidate.manifest)
-    if mismatches:
-        message = f"incompatible evaluation manifests: {', '.join(mismatches)}"
+    incompatible = [field for field in mismatches if field not in allowed]
+    if incompatible:
+        message = f"incompatible evaluation manifests: {', '.join(incompatible)}"
         raise ValueError(message)
     baseline_tasks = {task.id: task for task in baseline.tasks}
     candidate_tasks = {task.id: task for task in candidate.tasks}
@@ -436,6 +446,7 @@ def compare_reports(
         transitions=transitions,
         by_class={key: count_outcomes(value) for key, value in by_class_outcomes.items()},
         critical_regressions=critical_regressions,
+        allowed_manifest_drift=sorted(field for field in mismatches if field in allowed),
     )
 
 

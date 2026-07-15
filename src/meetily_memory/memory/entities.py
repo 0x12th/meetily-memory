@@ -86,7 +86,7 @@ ENTITY_DETAIL_SQL = {
           c.timestamp_label AS chunk_timestamp_label
         FROM decisions e
         JOIN meetings m ON m.id = e.meeting_id
-        LEFT JOIN chunks c ON c.id = e.source_chunk_id
+        JOIN chunks c ON c.id = e.source_chunk_id
         ORDER BY meeting_date DESC, e.ordinal ASC
         LIMIT ?
     """,
@@ -94,10 +94,10 @@ ENTITY_DETAIL_SQL = {
         SELECT
           'action_items' AS kind,
           e.*,
-          COALESCE(o.status, 'open') AS status,
-          o.note AS status_note,
-          o.source AS status_source,
-          o.updated_at AS status_updated_at,
+          'open' AS status,
+          NULL AS status_note,
+          NULL AS status_source,
+          NULL AS status_updated_at,
           m.external_id AS meeting_external_id,
           m.title AS meeting_title,
           m.language AS meeting_language,
@@ -108,8 +108,7 @@ ENTITY_DETAIL_SQL = {
           c.timestamp_label AS chunk_timestamp_label
         FROM action_items e
         JOIN meetings m ON m.id = e.meeting_id
-        LEFT JOIN chunks c ON c.id = e.source_chunk_id
-        LEFT JOIN task_status_overrides o ON o.action_item_id = e.id
+        JOIN chunks c ON c.id = e.source_chunk_id
         ORDER BY meeting_date DESC, e.ordinal ASC
         LIMIT ?
     """,
@@ -127,7 +126,7 @@ ENTITY_DETAIL_SQL = {
           c.timestamp_label AS chunk_timestamp_label
         FROM risks e
         JOIN meetings m ON m.id = e.meeting_id
-        LEFT JOIN chunks c ON c.id = e.source_chunk_id
+        JOIN chunks c ON c.id = e.source_chunk_id
         ORDER BY meeting_date DESC, e.ordinal ASC
         LIMIT ?
     """,
@@ -145,7 +144,7 @@ ENTITY_DETAIL_SQL = {
           c.timestamp_label AS chunk_timestamp_label
         FROM open_questions e
         JOIN meetings m ON m.id = e.meeting_id
-        LEFT JOIN chunks c ON c.id = e.source_chunk_id
+        JOIN chunks c ON c.id = e.source_chunk_id
         ORDER BY meeting_date DESC, e.ordinal ASC
         LIMIT ?
     """,

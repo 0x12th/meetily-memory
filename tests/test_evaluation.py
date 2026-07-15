@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,25 @@ def test_report_comparison_rejects_incompatible_manifests() -> None:
 
     with pytest.raises(ValueError, match="incompatible evaluation manifests"):
         compare_reports(baseline, candidate)
+
+
+def test_report_comparison_allows_explicit_index_schema_drift() -> None:
+    baseline_manifest = EvaluationManifest.compatible_for_tests()
+    candidate_manifest = replace(
+        baseline_manifest,
+        run_id="candidate",
+        index_schema_version=4,
+    )
+    baseline = EvaluationReport.for_tests(baseline_manifest, [])
+    candidate = EvaluationReport.for_tests(candidate_manifest, [])
+
+    comparison = compare_reports(
+        baseline,
+        candidate,
+        allow_manifest_drift={"index_schema_version"},
+    )
+
+    assert comparison.allowed_manifest_drift == ["index_schema_version"]
 
 
 def test_dataset_rejects_critical_task_without_predeclared_reason() -> None:

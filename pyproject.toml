@@ -95,6 +95,9 @@ ignore = [
 "src/meetily_memory/semantic_search.py" = [
   "S608",
 ]
+"src/meetily_memory/db/migrations.py" = [
+  "S608",
+]
 "src/meetily_memory/scanner/meetily_sqlite.py" = [
   "ANN401",
 ]

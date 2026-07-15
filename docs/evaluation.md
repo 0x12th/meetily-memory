@@ -33,6 +33,10 @@ comparison is rejected when the dataset, corpus, index schema, retrieval mode or
 or semantic provider/model/dimension differ. Code commits and dirty-tree state remain recorded
 for traceability but do not by themselves make two retrieval runs incompatible.
 
+An intentional migration can be analyzed with an explicit drift field, for example
+`--allow-drift index_schema_version`. The comparison records the allowed mismatch; this mode is
+for migration analysis and must not be presented as an ordinary compatible comparison.
+
 The report includes hit@1/3/5, MRR, nDCG, source accuracy, source openings, empty-result rate,
 median and p95 latency, per-task observations, paired improvements/ties/regressions, success
 transitions, class-level counts, and critical regressions. Failed real tasks still require a

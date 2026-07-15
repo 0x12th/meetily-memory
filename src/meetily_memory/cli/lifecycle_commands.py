@@ -311,19 +311,30 @@ def db_status(
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
     index_path = ctx.obj["index_path"]
+    repo = IndexRepository(index_path)
     with index_connection(index_path) as conn:
         schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    migration_report = repo.user_state.latest_migration_report()
     payload = {
         "index_path": str(index_path),
+        "state_path": str(repo.state_path),
         "schema_version": schema_version,
         "current_schema_version": CURRENT_SCHEMA_VERSION,
+        "user_state_migration": migration_report,
     }
     if json_output:
         print_json(payload)
         return
     print_text_block(f"index path: {index_path}")
+    print_text_block(f"state path: {repo.state_path}")
     print_text_block(f"schema version: {schema_version}")
     print_text_block(f"current schema version: {CURRENT_SCHEMA_VERSION}")
+    if migration_report:
+        print_text_block(
+            "user state migration: "
+            f"{migration_report['migrated']} migrated, "
+            f"{migration_report['orphaned']} orphaned"
+        )
 
 
 @mcp_app.command("serve")

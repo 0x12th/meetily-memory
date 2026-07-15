@@ -19,7 +19,6 @@ EMPTY_KNOWLEDGE_COUNT_SQL = (
     "SELECT COUNT(*) FROM knowledge_nodes",
     "SELECT COUNT(*) FROM knowledge_edges",
     "SELECT COUNT(*) FROM topic_aliases",
-    "SELECT COUNT(*) FROM task_status_overrides",
 )
 
 
@@ -72,7 +71,7 @@ def test_index_schema_runs_explicit_migrations_from_v1(tmp_path: Path) -> None:
             assert conn.execute(sql).fetchone()[0] == 0
 
 
-def test_index_repository_upgrades_v1_database_to_v3_tables(tmp_path: Path) -> None:
+def test_index_repository_upgrades_v1_database_to_current_tables(tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     with sqlite3.connect(index_path) as conn:
         migrate_to_v1(conn)
@@ -89,7 +88,6 @@ def test_index_repository_upgrades_v1_database_to_v3_tables(tmp_path: Path) -> N
         "knowledge_nodes",
         "knowledge_edges",
         "topic_aliases",
-        "task_status_overrides",
     }
     with sqlite3.connect(index_path) as conn:
         actual_tables = {
@@ -103,7 +101,7 @@ def test_index_repository_upgrades_v1_database_to_v3_tables(tmp_path: Path) -> N
             )
         }
         assert expected_tables <= actual_tables
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
 
 
 def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path: Path) -> None:

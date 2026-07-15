@@ -28,8 +28,8 @@ class ScanResult:
 class MeetilySQLiteScanner:
     source_kind = "meetily_sqlite"
 
-    def __init__(self, index_path: Path) -> None:
-        self.repo = IndexRepository(Path(index_path))
+    def __init__(self, index_path: Path, *, state_path: Path | None = None) -> None:
+        self.repo = IndexRepository(Path(index_path), state_path=state_path)
         self.structure_analyzer = StructureAnalyzer(self.repo)
 
     def scan(self, source_path: Path, *, force: bool = False, analyze: bool = True) -> ScanResult:

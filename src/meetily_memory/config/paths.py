@@ -16,6 +16,10 @@ def default_index_path() -> Path:
     return default_data_dir() / "index.sqlite"
 
 
+def default_state_path() -> Path:
+    return default_data_dir() / "state.sqlite"
+
+
 def semantic_config_path() -> Path:
     return default_data_dir() / "config.json"
 

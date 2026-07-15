@@ -629,8 +629,8 @@ def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
 
     assert status.exit_code == 0
     assert f"index path: {index_path}" in status.stdout
-    assert "schema version: 3" in status.stdout
-    assert "current schema version: 3" in status.stdout
+    assert "schema version: 4" in status.stdout
+    assert "current schema version: 4" in status.stdout
 
 
 @requires_sqlite_vec

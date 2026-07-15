@@ -7,6 +7,14 @@ from typing import Any
 from meetily_memory.db.fts import build_fts_query
 from meetily_memory.db.rows import rows_to_dicts
 from meetily_memory.db.schema import index_connection
+from meetily_memory.domain import (
+    MeetingRef,
+    MemoryEntity,
+    SearchHit,
+    SourceExcerpt,
+    canonical_entity_kind,
+    stable_evidence_id,
+)
 from meetily_memory.meeting_structure import ENTITY_KINDS, StructuredEntity
 from meetily_memory.memory.entities import (
     ENTITY_DETAIL_SQL,
@@ -25,6 +33,11 @@ from meetily_memory.memory.task_status import TaskStatusContext, TaskStatusRepos
 from meetily_memory.repositories.meetings import MeetingsContext, MeetingsRepository
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, ScanRunStats
 from meetily_memory.repositories.search import SearchRepository
+from meetily_memory.user_state import (
+    UserStateRepository,
+    prepare_user_state_migration,
+    task_identity,
+)
 
 __all__ = [
     "ChunkRecord",
@@ -40,8 +53,17 @@ class IndexRepository:
     entity_select_sql = ENTITY_SELECT_SQL
     entity_node_types = ENTITY_NODE_TYPES
 
-    def __init__(self, index_path: Path) -> None:
+    def __init__(self, index_path: Path, *, state_path: Path | None = None) -> None:
         self.index_path = Path(index_path)
+        self.state_path = (
+            Path(state_path) if state_path else self.index_path.with_name("state.sqlite")
+        )
+        self.user_state = UserStateRepository(self.state_path)
+        prepare_user_state_migration(
+            self.index_path,
+            self.user_state,
+            now=utc_now(),
+        )
         with index_connection(self.index_path):
             pass
         self.meetings = MeetingsRepository(
@@ -76,6 +98,7 @@ class IndexRepository:
         self.task_status = TaskStatusRepository(
             TaskStatusContext(
                 index_path=self.index_path,
+                user_state=self.user_state,
                 validate_status=assert_known_task_status,
                 now=utc_now,
             )
@@ -100,6 +123,7 @@ class IndexRepository:
         return rows_to_dicts(rows)
 
     def upsert_source(self, kind: str, path: str, now: str, label: str | None = None) -> int:
+        self.user_state.get_or_create_source(kind, path, now=now)
         return self.meetings.upsert_source(kind, path, now, label)
 
     def get_source(self, kind: str, path: str) -> dict[str, Any] | None:
@@ -201,7 +225,11 @@ class IndexRepository:
         limit: int,
     ) -> list[dict[str, Any]]:
         rows = conn.execute(ENTITY_DETAIL_SQL[kind], (limit,)).fetchall()
-        return rows_to_dicts(rows)
+        details = rows_to_dicts(rows)
+        if kind == "action_items":
+            for row in details:
+                self._hydrate_task_status(row)
+        return details
 
     def _list_all_structured_entity_details_conn(
         self,
@@ -222,6 +250,78 @@ class IndexRepository:
         context: int = 0,
     ) -> list[dict[str, Any]]:
         return self.search_repo.search(query, limit, meeting_id=meeting_id, context=context)
+
+    def search_hits(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        meeting_id: int | None = None,
+        context: int = 0,
+    ) -> tuple[SearchHit, ...]:
+        rows = self.search(query, limit, meeting_id=meeting_id, context=context)
+        return tuple(self.search_hit_from_row(row) for row in rows)
+
+    def search_hit_from_row(self, row: dict[str, Any]) -> SearchHit:
+        source = self._source_details(int(row["meeting_id"]))
+        source_uuid = self.user_state.source_uuid(
+            str(source["kind"]),
+            str(source["path"]),
+            now=utc_now(),
+        )
+        excerpt = source_excerpt_from_search_row(row)
+        domain_row = {**row, "source_path": source["path"]}
+        return SearchHit(
+            id=stable_evidence_id(
+                source_uuid,
+                excerpt.meeting_external_id,
+                excerpt.chunk_external_id,
+                kind=excerpt.kind,
+                ordinal=excerpt.ordinal,
+                text=excerpt.text,
+            ),
+            meeting=meeting_ref_from_row(domain_row, source_uuid),
+            excerpt=excerpt,
+        )
+
+    def get_search_hit(self, evidence_id: str) -> SearchHit | None:
+        for row in self.search_repo.all_evidence_rows():
+            hit = self.search_hit_from_row(row)
+            if hit.id == evidence_id:
+                return hit
+        return None
+
+    def memory_entities_for_hits(self, hits: tuple[SearchHit, ...]) -> tuple[MemoryEntity, ...]:
+        evidence_ids = {hit.id for hit in hits}
+        entities: list[MemoryEntity] = []
+        for row in self.list_all_structured_entity_details(limit=10_000):
+            evidence_row = self._entity_evidence_details(int(row["source_chunk_id"]))
+            source_uuid = self.user_state.source_uuid(
+                str(evidence_row["source_kind"]),
+                str(evidence_row["source_path"]),
+                now=utc_now(),
+            )
+            excerpt = source_excerpt_from_entity_row(evidence_row)
+            evidence_id = stable_evidence_id(
+                source_uuid,
+                excerpt.meeting_external_id,
+                excerpt.chunk_external_id,
+                kind=excerpt.kind,
+                ordinal=excerpt.ordinal,
+                text=excerpt.text,
+            )
+            if evidence_id not in evidence_ids:
+                continue
+            entities.append(
+                MemoryEntity(
+                    kind=canonical_entity_kind(str(row["kind"])),
+                    content=str(row["text"]),
+                    source=excerpt,
+                    evidence_id=evidence_id,
+                    extraction_method=str(row["source"]),
+                )
+            )
+        return tuple(entities)
 
     def list_meetings(self, limit: int = 20, person: str | None = None) -> list[dict[str, Any]]:
         return self.meetings.list_meetings(limit, person)
@@ -244,6 +344,124 @@ class IndexRepository:
     def stats(self) -> dict[str, int]:
         return self.meetings.stats()
 
+    def _hydrate_task_status(self, row: dict[str, Any]) -> None:
+        chunk_external_id = row.get("chunk_external_id")
+        if not chunk_external_id:
+            return
+        source = self._source_details(int(row["meeting_id"]))
+        source_uuid = self.user_state.source_uuid(
+            str(source["kind"]),
+            str(source["path"]),
+            now=utc_now(),
+        )
+        state = self.user_state.get_task_state(
+            task_identity(
+                source_uuid,
+                str(row["meeting_external_id"]),
+                str(chunk_external_id),
+                str(row["text"]),
+            )
+        )
+        if state is None:
+            return
+        row["status"] = state["status"]
+        row["status_note"] = state["note"]
+        row["status_source"] = state["source"]
+        row["status_updated_at"] = state["updated_at"]
+
+    def _source_details(self, meeting_id: int) -> dict[str, Any]:
+        with index_connection(self.index_path) as conn:
+            row = conn.execute(
+                """
+                SELECT s.kind, s.path
+                FROM meetings m
+                JOIN sources s ON s.id = m.source_id
+                WHERE m.id = ?
+                """,
+                (meeting_id,),
+            ).fetchone()
+            if row is None:
+                message = f"Source not found for meeting: {meeting_id}"
+                raise ValueError(message)
+            return dict(row)
+
+    def _entity_evidence_details(self, source_chunk_id: int) -> dict[str, Any]:
+        with index_connection(self.index_path) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  m.external_id AS meeting_external_id,
+                  c.external_id AS chunk_external_id,
+                  c.kind AS chunk_kind,
+                  c.ordinal AS chunk_ordinal,
+                  c.text AS chunk_text,
+                  c.speaker AS chunk_speaker,
+                  c.starts_at_seconds AS chunk_starts_at_seconds,
+                  c.ends_at_seconds AS chunk_ends_at_seconds,
+                  c.timestamp_label AS chunk_timestamp_label,
+                  s.kind AS source_kind,
+                  s.path AS source_path
+                FROM chunks c
+                JOIN meetings m ON m.id = c.meeting_id
+                JOIN sources s ON s.id = m.source_id
+                WHERE c.id = ?
+                """,
+                (source_chunk_id,),
+            ).fetchone()
+            if row is None:
+                message = f"Source chunk not found: {source_chunk_id}"
+                raise ValueError(message)
+            return dict(row)
+
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def meeting_ref_from_row(row: dict[str, Any], source_uuid: str) -> MeetingRef:
+    return MeetingRef(
+        source_uuid=source_uuid,
+        external_id=str(row["meeting_external_id"]),
+        title=str(row["title"]),
+        source_path=str(row["source_path"]),
+        created_at=optional_str(row.get("created_at")),
+        updated_at=optional_str(row.get("updated_at")),
+        folder_path=optional_str(row.get("folder_path")),
+        language=optional_str(row.get("language")),
+    )
+
+
+def source_excerpt_from_search_row(row: dict[str, Any]) -> SourceExcerpt:
+    return SourceExcerpt(
+        meeting_external_id=str(row["meeting_external_id"]),
+        chunk_external_id=optional_str(row.get("chunk_external_id")),
+        kind=str(row["kind"]),
+        ordinal=int(row["ordinal"]),
+        text=str(row["text"]),
+        speaker=optional_str(row.get("speaker")),
+        starts_at_seconds=optional_float(row.get("starts_at_seconds")),
+        ends_at_seconds=optional_float(row.get("ends_at_seconds")),
+        timestamp_label=optional_str(row.get("timestamp_label")),
+    )
+
+
+def source_excerpt_from_entity_row(row: dict[str, Any]) -> SourceExcerpt:
+    return SourceExcerpt(
+        meeting_external_id=str(row["meeting_external_id"]),
+        chunk_external_id=optional_str(row.get("chunk_external_id")),
+        kind=str(row["chunk_kind"]),
+        ordinal=int(row["chunk_ordinal"]),
+        text=str(row["chunk_text"]),
+        speaker=optional_str(row.get("chunk_speaker")),
+        starts_at_seconds=optional_float(row.get("chunk_starts_at_seconds")),
+        ends_at_seconds=optional_float(row.get("chunk_ends_at_seconds")),
+        timestamp_label=optional_str(row.get("chunk_timestamp_label")),
+    )
+
+
+def optional_str(value: object) -> str | None:
+    return str(value) if value is not None else None
+
+
+def optional_float(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None

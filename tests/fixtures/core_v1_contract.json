@@ -1,0 +1,24 @@
+{
+  "contract_version": "meetily-memory.core.v1",
+  "search_data_fields": ["query", "context", "results"],
+  "search_result_fields": [
+    "meeting_id",
+    "meeting_external_id",
+    "title",
+    "created_at",
+    "updated_at",
+    "folder_path",
+    "language",
+    "chunk_id",
+    "chunk_external_id",
+    "kind",
+    "ordinal",
+    "text",
+    "speaker",
+    "starts_at_seconds",
+    "ends_at_seconds",
+    "timestamp_label",
+    "rank"
+  ],
+  "context_data_fields": ["question", "markdown", "evidence"]
+}

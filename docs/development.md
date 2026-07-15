@@ -3,6 +3,9 @@
 See [Retrieval evaluation](evaluation.md) for the reproducible FTS5 quality baseline and paired
 comparison workflow.
 
+See [Core contracts and persistent user state](contracts.md) for v1/v2 compatibility and the
+schema-v4 user-state migration boundary.
+
 Development setup:
 
 ```bash

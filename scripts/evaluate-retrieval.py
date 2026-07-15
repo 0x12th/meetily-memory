@@ -19,6 +19,22 @@ def main() -> None:
     parser.add_argument("--index", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", type=Path)
+    parser.add_argument(
+        "--allow-drift",
+        action="append",
+        choices=(
+            "dataset_fingerprint",
+            "corpus_fingerprint",
+            "index_schema_version",
+            "retrieval_mode",
+            "retrieval_parameters",
+            "semantic_provider",
+            "semantic_model",
+            "semantic_dimension",
+        ),
+        default=[],
+        help="Explicitly allow one incompatible manifest field for drift analysis.",
+    )
     parser.add_argument("--limit", type=int, default=5)
     args = parser.parse_args()
 
@@ -26,7 +42,11 @@ def main() -> None:
     save_report(report, args.output)
     payload: dict[str, object] = {"report": report.as_payload()}
     if args.baseline:
-        payload["comparison"] = compare_reports(load_report(args.baseline), report).as_payload()
+        payload["comparison"] = compare_reports(
+            load_report(args.baseline),
+            report,
+            allow_manifest_drift=set(args.allow_drift),
+        ).as_payload()
     sys.stdout.write(dumps_json(payload))
     sys.stdout.write("\n")
 

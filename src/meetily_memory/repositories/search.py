@@ -166,3 +166,32 @@ class SearchRepository:
             """,
             (meeting_id, ordinal - context, ordinal + context),
         ).fetchall()
+
+    def all_evidence_rows(self) -> list[dict[str, Any]]:
+        with index_connection(self.index_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  m.id AS meeting_id,
+                  m.external_id AS meeting_external_id,
+                  m.title AS title,
+                  m.created_at AS created_at,
+                  m.updated_at AS updated_at,
+                  m.folder_path AS folder_path,
+                  m.language AS language,
+                  c.id AS chunk_id,
+                  c.external_id AS chunk_external_id,
+                  c.kind AS kind,
+                  c.ordinal AS ordinal,
+                  c.text AS text,
+                  c.speaker AS speaker,
+                  c.starts_at_seconds AS starts_at_seconds,
+                  c.ends_at_seconds AS ends_at_seconds,
+                  c.timestamp_label AS timestamp_label,
+                  NULL AS rank
+                FROM chunks c
+                JOIN meetings m ON m.id = c.meeting_id
+                ORDER BY m.source_id, m.external_id, c.kind, c.ordinal
+                """
+            ).fetchall()
+            return rows_to_dicts(rows)

@@ -1,7 +1,7 @@
 import sqlite3
 from collections.abc import Callable
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 STRUCTURED_ENTITIES_SQL = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -271,8 +271,66 @@ def migrate_to_v3(conn: sqlite3.Connection) -> None:
     conn.executescript(KNOWLEDGE_SCHEMA_SQL)
 
 
+def migrate_to_v4(conn: sqlite3.Connection) -> None:
+    legacy_status_count = conn.execute("SELECT COUNT(*) FROM task_status_overrides").fetchone()[0]
+    migration_ready = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'user_state_migration_ready'
+        """
+    ).fetchone()
+    if legacy_status_count and migration_ready is None:
+        message = "User state must be migrated before upgrading the disposable index to v4."
+        raise RuntimeError(message)
+
+    conn.execute("DROP TABLE task_status_overrides")
+    for table in ("decisions", "action_items", "risks", "open_questions"):
+        migrate_entity_table_to_required_chunk(conn, table)
+    conn.execute("DROP TABLE IF EXISTS user_state_migration_ready")
+
+
+def migrate_entity_table_to_required_chunk(conn: sqlite3.Connection, table: str) -> None:
+    legacy_table = f"{table}_v3"
+    conn.execute(f"ALTER TABLE {table} RENAME TO {legacy_table}")
+    conn.execute(
+        f"""
+        CREATE TABLE {table} (
+          id INTEGER PRIMARY KEY,
+          meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+          source_chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+          ordinal INTEGER NOT NULL,
+          text TEXT NOT NULL,
+          source TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          fingerprint TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          raw_metadata_json TEXT,
+          UNIQUE(meeting_id, fingerprint)
+        )
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT INTO {table} (
+          id, meeting_id, source_chunk_id, ordinal, text, source, confidence,
+          fingerprint, created_at, updated_at, raw_metadata_json
+        )
+        SELECT
+          id, meeting_id, source_chunk_id, ordinal, text, source, confidence,
+          fingerprint, created_at, updated_at, raw_metadata_json
+        FROM {legacy_table}
+        WHERE source_chunk_id IS NOT NULL
+        """
+    )
+    conn.execute(f"DROP TABLE {legacy_table}")
+    conn.execute(f"CREATE INDEX idx_{table}_meeting ON {table}(meeting_id, ordinal)")
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: migrate_to_v1,
     2: migrate_to_v2,
     3: migrate_to_v3,
+    4: migrate_to_v4,
 }

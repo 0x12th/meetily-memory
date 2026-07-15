@@ -47,7 +47,7 @@ OPEN_QUESTION_PATTERNS = (
 @dataclass(frozen=True)
 class StructuredEntity:
     kind: str
-    source_chunk_id: int | None
+    source_chunk_id: int
     ordinal: int
     text: str
     source: str
@@ -125,11 +125,14 @@ def split_sentences(text: str) -> list[str]:
     return [sentence.strip() for sentence in SENTENCE_SPLIT_RE.split(text) if sentence.strip()]
 
 
-def chunk_id(chunk: Mapping[str, object]) -> int | None:
+def chunk_id(chunk: Mapping[str, object]) -> int:
     value = chunk.get("id")
-    return value if isinstance(value, int) else None
+    if not isinstance(value, int):
+        message = "Structured entity extraction requires a persisted source chunk id."
+        raise TypeError(message)
+    return value
 
 
-def entity_fingerprint(kind: str, source_chunk_id: int | None, text: str) -> str:
-    payload = f"{kind}\0{source_chunk_id or ''}\0{text.casefold()}".encode()
+def entity_fingerprint(kind: str, source_chunk_id: int, text: str) -> str:
+    payload = f"{kind}\0{source_chunk_id}\0{text.casefold()}".encode()
     return hashlib.sha256(payload).hexdigest()
