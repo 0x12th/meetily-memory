@@ -18,6 +18,11 @@ uv run scripts/evaluate-retrieval.py \
   --output .docs/eval/baseline.json
 ```
 
+To evaluate the explicit neighboring-context mode without changing default retrieval, add
+`--context 1` and compare with `--allow-drift retrieval_parameters`. Lexical matches keep their
+original order; adjacent chunks are appended afterward, so the experiment cannot silently
+replace or reorder the standard top results.
+
 Compare a candidate with a compatible baseline:
 
 ```bash

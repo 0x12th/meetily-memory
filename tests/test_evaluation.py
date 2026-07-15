@@ -45,6 +45,18 @@ def test_evaluation_calculates_ranked_and_product_metrics(meetily_db: Path, tmp_
     assert all(task.success for task in report.tasks)
 
 
+def test_evaluation_records_explicit_neighbor_context_parameter(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    dataset = load_dataset(Path("eval/synthetic_dataset.json"))
+
+    report = evaluate_retrieval(dataset, index_path, limit=5, context=1)
+
+    assert report.manifest.retrieval_parameters == {"limit": 5, "context": 1}
+
+
 def test_report_comparison_is_paired_by_task_and_class() -> None:
     manifest = EvaluationManifest.compatible_for_tests()
     baseline = EvaluationReport.for_tests(

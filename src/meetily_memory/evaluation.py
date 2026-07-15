@@ -311,6 +311,7 @@ def evaluate_retrieval(
     index_path: Path,
     *,
     limit: int = 5,
+    context: int = 0,
     repository_root: Path | None = None,
 ) -> EvaluationReport:
     if limit < EVALUATION_CUTOFF:
@@ -321,13 +322,14 @@ def evaluate_retrieval(
     observed: list[ObservedTask] = []
     for task in dataset.tasks:
         started = perf_counter()
-        rows = repo.search(task.query, limit)
+        rows = repo.search(task.query, limit, context=context)
         latency_ms = (perf_counter() - started) * 1000
         observed.append(observe_task(task, rows, latency_ms))
     manifest = build_manifest(
         dataset,
         index_path,
         limit=limit,
+        context=context,
         repository_root=repository_root,
     )
     tasks = tuple(observed)
@@ -511,6 +513,7 @@ def build_manifest(
     index_path: Path,
     *,
     limit: int,
+    context: int,
     repository_root: Path | None,
 ) -> EvaluationManifest:
     root = repository_root or Path.cwd()
@@ -527,7 +530,7 @@ def build_manifest(
         corpus_fingerprint=corpus_fingerprint(index_path),
         index_schema_version=schema_version,
         retrieval_mode="fts5",
-        retrieval_parameters={"limit": limit},
+        retrieval_parameters={"limit": limit, "context": context},
     )
 
 

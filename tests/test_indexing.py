@@ -210,6 +210,20 @@ def test_search_prefers_strict_token_matches_before_or_fallback(
     assert "migration risks" in str(results[0]["text"])
 
 
+def test_neighbor_context_keeps_lexical_match_before_adjacent_chunks(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+
+    results = IndexRepository(index_path).search("partner review", limit=1, context=1)
+
+    assert results[0]["chunk_external_id"] == "transcript-3"
+    assert results[0]["is_context"] is False
+    assert results[1]["chunk_external_id"] == "transcript-1"
+    assert results[1]["is_context"] is True
+
+
 def test_scan_reports_unsupported_meetily_schema(tmp_path: Path) -> None:
     source_path = tmp_path / "meeting_minutes.sqlite"
     with sqlite3.connect(source_path) as conn:

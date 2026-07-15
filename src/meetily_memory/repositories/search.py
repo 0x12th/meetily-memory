@@ -115,17 +115,31 @@ class SearchRepository:
         context: int,
     ) -> list[dict[str, Any]]:
         expanded: list[dict[str, Any]] = []
-        seen_chunk_ids: set[int] = set()
+        matched_chunk_ids = {int(row["chunk_id"]) for row in rows}
+        for row in rows:
+            matched = dict(row)
+            matched["matched_chunk_id"] = int(row["chunk_id"])
+            matched["is_context"] = False
+            expanded.append(matched)
+
+        seen_chunk_ids = set(matched_chunk_ids)
         for row in rows:
             context_rows = rows_to_dicts(self._execute_context_window(conn, row, context))
             matched_chunk_id = int(row["chunk_id"])
+            matched_ordinal = int(row["ordinal"])
+            context_rows.sort(
+                key=lambda context_row: (
+                    abs(int(context_row["ordinal"]) - matched_ordinal),
+                    int(context_row["ordinal"]),
+                )
+            )
             for context_row in context_rows:
                 chunk_id = int(context_row["chunk_id"])
                 if chunk_id in seen_chunk_ids:
                     continue
                 context_row["rank"] = row.get("rank")
                 context_row["matched_chunk_id"] = matched_chunk_id
-                context_row["is_context"] = chunk_id != matched_chunk_id
+                context_row["is_context"] = True
                 expanded.append(context_row)
                 seen_chunk_ids.add(chunk_id)
         return expanded

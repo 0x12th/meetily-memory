@@ -36,9 +36,20 @@ def main() -> None:
         help="Explicitly allow one incompatible manifest field for drift analysis.",
     )
     parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument(
+        "--context",
+        type=int,
+        default=0,
+        help="Include this many adjacent chunks around each lexical match.",
+    )
     args = parser.parse_args()
 
-    report = evaluate_retrieval(load_dataset(args.dataset), args.index, limit=args.limit)
+    report = evaluate_retrieval(
+        load_dataset(args.dataset),
+        args.index,
+        limit=args.limit,
+        context=args.context,
+    )
     save_report(report, args.output)
     payload: dict[str, object] = {"report": report.as_payload()}
     if args.baseline:

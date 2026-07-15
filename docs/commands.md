@@ -15,6 +15,9 @@ This page describes the public command model after scope narrowing.
 
 ## Search And Context
 
+`mm s QUERY --context 1` keeps ranked lexical matches first and appends adjacent source chunks
+afterward. Neighbor expansion is explicit; the default remains `--context 0`.
+
 | Command | Public role |
 |---|---|
 | `mm s "migration risk"` | Fast FTS search over indexed meetings. Returns meeting id, title, chunk id, timestamp/source, and enough evidence to open the source. |
