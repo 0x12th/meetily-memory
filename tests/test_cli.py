@@ -134,7 +134,15 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert "Source: meeting-2 / transcript-2" in context.stdout
     assert "### Relevant excerpt" in context.stdout
     assert "Dobrynya agreed to send migration risks by Friday." in context.stdout
+    assert "Evidence role: neighboring context" in context.stdout
     assert context.stdout.count("Who owns migration risks?") == 2
+
+    exact_context = runner.invoke(
+        app,
+        ["--index", str(index_path), "c", "Who owns migration risks?", "--context", "0"],
+    )
+    assert exact_context.exit_code == 0
+    assert "Evidence role: neighboring context" not in exact_context.stdout
 
     analyze = runner.invoke(app, ["--index", str(index_path), "analyze", "meeting-2"])
     assert analyze.exit_code == 0

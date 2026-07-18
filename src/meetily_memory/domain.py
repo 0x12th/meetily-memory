@@ -5,6 +5,7 @@ from typing import Literal
 from meetily_memory.json_codec import dumps_json_bytes
 
 MemoryEntityKind = Literal["decision", "task", "risk", "question"]
+COMPACT_SEARCH_HIT_PROJECTION_VERSION = "compact.v1"
 ENTITY_KIND_MAP: dict[str, MemoryEntityKind] = {
     "decisions": "decision",
     "action_items": "task",
@@ -49,12 +50,14 @@ class SearchHit:
     id: str
     meeting: MeetingRef
     excerpt: SourceExcerpt
+    is_context: bool = False
 
     def as_payload(self) -> dict[str, object]:
         return {
             "id": self.id,
             "meeting": self.meeting.as_payload(),
             "excerpt": self.excerpt.as_payload(),
+            "is_context": self.is_context,
         }
 
     def compact(self, preview_length: int) -> "CompactSearchHit":
@@ -70,6 +73,9 @@ class SearchHit:
             meeting=self.meeting,
             preview=preview,
             truncated=truncated,
+            is_context=self.is_context,
+            preview_length=preview_length,
+            projection_version=COMPACT_SEARCH_HIT_PROJECTION_VERSION,
         )
 
 
@@ -79,6 +85,9 @@ class CompactSearchHit:
     meeting: MeetingRef
     preview: str
     truncated: bool
+    is_context: bool
+    preview_length: int
+    projection_version: str
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -86,6 +95,9 @@ class CompactSearchHit:
             "meeting": self.meeting.as_payload(),
             "preview": self.preview,
             "truncated": self.truncated,
+            "is_context": self.is_context,
+            "preview_length": self.preview_length,
+            "projection_version": self.projection_version,
         }
 
 

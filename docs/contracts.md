@@ -7,14 +7,18 @@ types are serialized back through the dedicated v1 adapter, and
 
 Python consumers can explicitly request `meetily-memory.core.v2` from `search()` and
 `build_context()`. The v2 search result is a `SearchHit` with a stable public evidence ID,
-`MeetingRef`, and an untruncated `SourceExcerpt`. The v2 context payload is a data-only
+`MeetingRef`, an untruncated `SourceExcerpt`, and an explicit `is_context` role. The v2 context
+payload is a data-only
 `ContextBundle`; it does not contain Markdown. `MemoryEntity` values use the canonical kinds
 `decision`, `task`, `risk`, and `question`, point directly to their source excerpt, and are
 marked non-authoritative. Extractor confidence remains internal diagnostics and is not part of
 the domain contract.
 
-`CompactSearchHit` is an explicit preview projection. Its `truncated` field is always present,
-and the full `SearchHit` can be resolved with the same evidence ID.
+`CompactSearchHit` is an explicit preview projection. Its `truncated`, `preview_length`,
+`projection_version`, and `is_context` fields are always present. Changing the preview length
+does not change retrieval or the evidence ID. The full `SearchHit` resolves through
+`MeetilyMemoryCore.resolve_search_hit()` with the same ID; a missing ID is an integrity error,
+not an empty successful result.
 
 ## User state migration
 

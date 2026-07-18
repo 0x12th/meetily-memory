@@ -59,10 +59,10 @@ def test_context_renderer_uses_context_bundle_without_storage_rows(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    hit = MeetilyMemoryCore(index_path).search_hits("migration risks")[0]
+    hits = MeetilyMemoryCore(index_path).search_hits("migration risks", limit=1, context=1)
     bundle = ContextBundle(
         question="Who owns migration risks?",
-        evidence=(hit,),
+        evidence=hits,
         entities=(),
     )
 
@@ -72,6 +72,7 @@ def test_context_renderer_uses_context_bundle_without_storage_rows(
     assert "## Meeting: Dobrynya Follow-up" in markdown
     assert "Source: meeting-2 / transcript-2" in markdown
     assert "Dobrynya agreed to send migration risks by Friday." in markdown
+    assert "Evidence role: neighboring context" in markdown
     assert markdown.endswith("# Question\n\nWho owns migration risks?\n")
 
 

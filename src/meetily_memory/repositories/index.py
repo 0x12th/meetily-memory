@@ -282,6 +282,7 @@ class IndexRepository:
             ),
             meeting=meeting_ref_from_row(domain_row, source_uuid),
             excerpt=excerpt,
+            is_context=bool(row.get("is_context", False)),
         )
 
     def get_search_hit(self, evidence_id: str) -> SearchHit | None:

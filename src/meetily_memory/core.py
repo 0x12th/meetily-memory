@@ -2,7 +2,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from meetily_memory.context_builder import ContextRenderer
+from meetily_memory.context_builder import (
+    DEFAULT_CONTEXT_NEIGHBORS,
+    MAX_CONTEXT_EVIDENCE,
+    ContextRenderer,
+)
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.domain import CompactSearchHit, ContextBundle, SearchHit
 from meetily_memory.local_memory import (
@@ -30,6 +34,21 @@ class CoreResponse:
             "kind": self.kind,
             "data": self.data,
         }
+
+
+@dataclass(frozen=True)
+class ContextRetrievalOptions:
+    meeting_id: int | None = None
+    neighbor_count: int = DEFAULT_CONTEXT_NEIGHBORS
+    max_evidence: int = MAX_CONTEXT_EVIDENCE
+
+    def __post_init__(self) -> None:
+        if self.neighbor_count < 0:
+            message = "neighbor_count must not be negative"
+            raise ValueError(message)
+        if self.max_evidence < 1:
+            message = "max_evidence must be positive"
+            raise ValueError(message)
 
 
 class MeetilyMemoryCore:
@@ -84,14 +103,27 @@ class MeetilyMemoryCore:
     def get_search_hit(self, evidence_id: str) -> SearchHit | None:
         return self.repo.get_search_hit(evidence_id)
 
+    def resolve_search_hit(self, evidence_id: str) -> SearchHit:
+        hit = self.get_search_hit(evidence_id)
+        if hit is None:
+            message = f"Evidence not found: {evidence_id}"
+            raise LookupError(message)
+        return hit
+
     def context_bundle(
         self,
         question: str,
         limit: int = 8,
         *,
-        meeting_id: int | None = None,
+        options: ContextRetrievalOptions | None = None,
     ) -> ContextBundle:
-        evidence = self.retrieval_strategy.search(question, limit, meeting_id=meeting_id)
+        retrieval_options = options or ContextRetrievalOptions()
+        evidence = self.retrieval_strategy.search(
+            question,
+            limit,
+            meeting_id=retrieval_options.meeting_id,
+            context=retrieval_options.neighbor_count,
+        )[: retrieval_options.max_evidence]
         return ContextBundle(
             question=question,
             evidence=evidence,
@@ -104,12 +136,17 @@ class MeetilyMemoryCore:
         limit: int = 8,
         *,
         contract_version: str = CORE_V1_VERSION,
+        context: int = DEFAULT_CONTEXT_NEIGHBORS,
     ) -> CoreResponse:
         validate_contract_version(contract_version)
         if contract_version == CORE_V2_VERSION:
-            bundle = self.context_bundle(question, limit)
+            bundle = self.context_bundle(
+                question,
+                limit,
+                options=ContextRetrievalOptions(neighbor_count=context),
+            )
             return CoreResponse("context", bundle.as_payload(), contract_version)
-        rows = self.repo.search(question, limit)
+        rows = self.repo.search(question, limit, context=context)[:MAX_CONTEXT_EVIDENCE]
         evidence = tuple(self.repo.search_hit_from_row(row) for row in rows)
         bundle = ContextBundle(question=question, evidence=evidence, entities=())
         return CoreResponse(
@@ -129,6 +166,7 @@ class MeetilyMemoryCore:
         limit: int = 8,
         *,
         contract_version: str = CORE_V1_VERSION,
+        context: int = DEFAULT_CONTEXT_NEIGHBORS,
     ) -> CoreResponse:
         validate_contract_version(contract_version)
         meeting = self.repo.get_meeting(meeting_id)
@@ -136,9 +174,21 @@ class MeetilyMemoryCore:
             message = f"Meeting not found: {meeting_id}"
             raise ValueError(message)
         if contract_version == CORE_V2_VERSION:
-            bundle = self.context_bundle(question, limit, meeting_id=int(meeting["id"]))
+            bundle = self.context_bundle(
+                question,
+                limit,
+                options=ContextRetrievalOptions(
+                    meeting_id=int(meeting["id"]),
+                    neighbor_count=context,
+                ),
+            )
             return CoreResponse("meeting_context", bundle.as_payload(), contract_version)
-        rows = self.repo.search(question, limit, meeting_id=int(meeting["id"]))
+        rows = self.repo.search(
+            question,
+            limit,
+            meeting_id=int(meeting["id"]),
+            context=context,
+        )[:MAX_CONTEXT_EVIDENCE]
         evidence = tuple(self.repo.search_hit_from_row(row) for row in rows)
         bundle = ContextBundle(question=question, evidence=evidence, entities=())
         return CoreResponse(

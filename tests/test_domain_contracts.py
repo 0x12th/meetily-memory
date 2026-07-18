@@ -2,7 +2,14 @@ import json
 import sqlite3
 from pathlib import Path
 
-from meetily_memory.core import CORE_V1_VERSION, CORE_V2_VERSION, MeetilyMemoryCore
+import pytest
+
+from meetily_memory.core import (
+    CORE_V1_VERSION,
+    CORE_V2_VERSION,
+    ContextRetrievalOptions,
+    MeetilyMemoryCore,
+)
 from meetily_memory.domain import CompactSearchHit, MemoryEntity, SearchHit
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 
@@ -20,7 +27,7 @@ def test_core_v1_remains_default_and_v2_is_explicit(meetily_db: Path, tmp_path: 
     assert set(v1["data"]) == set(fixture["search_data_fields"])
     assert set(v1["data"]["results"][0]) == set(fixture["search_result_fields"])
     assert v2["contract_version"] == CORE_V2_VERSION
-    assert set(v2["data"]["results"][0]) == {"id", "meeting", "excerpt"}
+    assert set(v2["data"]["results"][0]) == {"id", "meeting", "excerpt", "is_context"}
     assert "chunk_id" not in v2["data"]["results"][0]
 
     context = core.build_context("migration risks", limit=3).as_payload()
@@ -56,14 +63,20 @@ def test_compact_hit_reports_truncation_and_resolves_to_full_evidence(
     core = MeetilyMemoryCore(index_path)
 
     compact = core.compact_search_hits("migration risks", preview_length=20)[0]
-    full = core.get_search_hit(compact.id)
+    wider = core.compact_search_hits("migration risks", preview_length=40)[0]
+    full = core.resolve_search_hit(compact.id)
 
     assert isinstance(compact, CompactSearchHit)
     assert compact.truncated is True
     assert compact.preview.endswith("…")
-    assert full is not None
+    assert compact.preview_length == 20
+    assert compact.projection_version == "compact.v1"
+    assert compact.id == wider.id
+    assert compact.preview != wider.preview
     assert full.id == compact.id
     assert full.excerpt.text.startswith("Dobrynya agreed")
+    with pytest.raises(LookupError, match="Evidence not found"):
+        core.resolve_search_hit("evidence:missing")
 
 
 def test_v2_context_is_data_only_and_uses_canonical_memory_entities(
@@ -74,6 +87,11 @@ def test_v2_context_is_data_only_and_uses_canonical_memory_entities(
     core = MeetilyMemoryCore(index_path)
 
     bundle = core.context_bundle("migration risks", limit=5)
+    bounded = core.context_bundle(
+        "migration risks",
+        limit=3,
+        options=ContextRetrievalOptions(neighbor_count=1, max_evidence=5),
+    )
     payload = core.build_context(
         "migration risks", limit=5, contract_version=CORE_V2_VERSION
     ).as_payload()
@@ -87,6 +105,25 @@ def test_v2_context_is_data_only_and_uses_canonical_memory_entities(
     assert all(entity.authoritative is False for entity in bundle.entities)
     assert all(entity.evidence_id for entity in bundle.entities)
     assert all("confidence" not in entity.as_payload() for entity in bundle.entities)
+    assert len(bounded.evidence) <= 5
+    assert bounded.evidence[0].is_context is False
+    assert any(hit.is_context for hit in bounded.evidence)
+    assert all("is_context" in hit.as_payload() for hit in bounded.evidence)
+
+
+def test_context_defaults_to_bounded_neighbors_without_changing_search_default(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    core = MeetilyMemoryCore(index_path)
+
+    search = core.search("migration risks", limit=3, contract_version=CORE_V2_VERSION)
+    context = core.build_context("migration risks", limit=3, contract_version=CORE_V2_VERSION)
+
+    assert all(result["is_context"] is False for result in search.data["results"])
+    assert any(result["is_context"] is True for result in context.data["evidence"])
+    assert len(context.data["evidence"]) <= 20
 
 
 def test_memory_entities_require_chunks_and_cascade_on_chunk_delete(

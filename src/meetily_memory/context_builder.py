@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from meetily_memory.domain import ContextBundle, SearchHit
 
 DEFAULT_CONTEXT_LIMIT = 8
+DEFAULT_CONTEXT_NEIGHBORS = 2
+MAX_CONTEXT_EVIDENCE = 20
 
 
 @dataclass
@@ -86,6 +88,7 @@ def search_hit_as_context_row(hit: SearchHit) -> dict[str, object]:
         "text": hit.excerpt.text,
         "speaker": hit.excerpt.speaker,
         "timestamp_label": hit.excerpt.timestamp_label,
+        "is_context": hit.is_context,
     }
 
 
@@ -129,7 +132,8 @@ def format_excerpt(row: Mapping[str, object]) -> str:
         prefix_parts.append(str(row["timestamp_label"]))
     prefix = f"**{' | '.join(prefix_parts)}**: " if prefix_parts else ""
     source = format_source(row)
-    return f"{source}\n> {prefix}{normalize_excerpt(str(row['text']))}"
+    role = "\nEvidence role: neighboring context" if row.get("is_context") else ""
+    return f"{source}{role}\n> {prefix}{normalize_excerpt(str(row['text']))}"
 
 
 def format_source(row: Mapping[str, object]) -> str:

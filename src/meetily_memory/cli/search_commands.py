@@ -80,8 +80,12 @@ def context(
     ctx: typer.Context,
     question: str,
     limit: Annotated[int, typer.Option("--limit", "-n")] = DEFAULT_CONTEXT_LIMIT,
+    context: Annotated[
+        int,
+        typer.Option("--context", help="Adjacent chunks around each lexical match."),
+    ] = 2,
 ) -> None:
-    data = core_from_context(ctx).build_context(question, limit).data
+    data = core_from_context(ctx).build_context(question, limit, context=context).data
     print_text_block(str(data["markdown"]))
 
 
