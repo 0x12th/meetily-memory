@@ -16,6 +16,11 @@ the domain contract or generated Obsidian notes. The heuristic task extractor re
 explicit action verb or assignment phrase; generic mentions of a task or what one "can do" are
 not treated as established action items.
 
+MCP `search` and `build_context` use `core.v1` unless the caller explicitly passes
+`contract_version="meetily-memory.core.v2"`. They delegate version selection and validation to
+`MeetilyMemoryCore`; the MCP adapter does not implement retrieval, ranking, ID resolution, or
+context assembly.
+
 `CompactSearchHit` is an explicit preview projection. Its `truncated`, `preview_length`,
 `projection_version`, and `is_context` fields are always present. Changing the preview length
 does not change retrieval or the evidence ID. The full `SearchHit` resolves through

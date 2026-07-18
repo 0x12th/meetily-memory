@@ -23,7 +23,7 @@ async def test_mcp_server_exposes_v7_toolset(meetily_db: Path, tmp_path: Path) -
     server = create_mcp_server(index_path)
     tools = await server.list_tools()
 
-    assert {tool.name for tool in tools} >= set(MCP_TOOL_NAMES)
+    assert {tool.name for tool in tools} == set(MCP_TOOL_NAMES)
 
 
 @pytest.mark.anyio
@@ -49,3 +49,42 @@ async def test_mcp_tools_are_thin_core_adapters(meetily_db: Path, tmp_path: Path
     tasks = await call_payload(server, "get_tasks", {"limit": 3, "status": "open"})
     assert tasks["kind"] == "structured_entities"
     assert tasks["data"]["entity_kind"] == "action_items"
+
+
+@pytest.mark.anyio
+async def test_mcp_search_and_context_require_explicit_v2_selection(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    server = create_mcp_server(index_path)
+
+    search = await call_payload(
+        server,
+        "search",
+        {
+            "query": "migration risks",
+            "limit": 3,
+            "contract_version": "meetily-memory.core.v2",
+        },
+    )
+    context = await call_payload(
+        server,
+        "build_context",
+        {
+            "question": "Who owns migration risks?",
+            "limit": 3,
+            "contract_version": "meetily-memory.core.v2",
+        },
+    )
+
+    assert search["contract_version"] == "meetily-memory.core.v2"
+    assert set(search["data"]["results"][0]) == {
+        "id",
+        "meeting",
+        "excerpt",
+        "is_context",
+    }
+    assert context["contract_version"] == "meetily-memory.core.v2"
+    assert "markdown" not in context["data"]
+    assert any(hit["is_context"] for hit in context["data"]["evidence"])

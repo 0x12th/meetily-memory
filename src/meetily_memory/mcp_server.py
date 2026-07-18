@@ -4,7 +4,7 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from meetily_memory.config.paths import default_index_path
-from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.core import CORE_V1_VERSION, MeetilyMemoryCore
 
 MCP_TOOL_NAMES = (
     "search",
@@ -28,9 +28,13 @@ def create_mcp_server(index_path: Path | None = None) -> FastMCP:  # noqa: C901
     server = FastMCP("Meetily Memory", json_response=True)
 
     @server.tool()
-    def search(query: str, limit: int = 10) -> dict[str, object]:
+    def search(
+        query: str,
+        limit: int = 10,
+        contract_version: str = CORE_V1_VERSION,
+    ) -> dict[str, object]:
         """Search local Meetily memory with source-backed results."""
-        return core.search(query, limit).as_payload()
+        return core.search(query, limit, contract_version=contract_version).as_payload()
 
     @server.tool()
     def get_meeting(meeting_id: str) -> dict[str, object]:
@@ -38,9 +42,17 @@ def create_mcp_server(index_path: Path | None = None) -> FastMCP:  # noqa: C901
         return core.get_meeting(meeting_id).as_payload()
 
     @server.tool()
-    def build_context(question: str, limit: int = 8) -> dict[str, object]:
+    def build_context(
+        question: str,
+        limit: int = 8,
+        contract_version: str = CORE_V1_VERSION,
+    ) -> dict[str, object]:
         """Build source-backed Markdown context for an LLM question."""
-        return core.build_context(question, limit).as_payload()
+        return core.build_context(
+            question,
+            limit,
+            contract_version=contract_version,
+        ).as_payload()
 
     @server.tool()
     def get_person(name: str, limit: int = 10) -> dict[str, object]:
