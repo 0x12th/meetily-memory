@@ -14,9 +14,6 @@ class RetrievalStrategy(Protocol):
         self,
         query: str,
         limit: int = 10,
-        *,
-        meeting_id: int | None = None,
-        context: int = 0,
     ) -> tuple[SearchHit, ...]: ...
 
 
@@ -28,16 +25,8 @@ class LexicalRetrievalStrategy:
         self,
         query: str,
         limit: int = 10,
-        *,
-        meeting_id: int | None = None,
-        context: int = 0,
     ) -> tuple[SearchHit, ...]:
-        return self.repository.search_hits(
-            query,
-            limit,
-            meeting_id=meeting_id,
-            context=context,
-        )
+        return self.repository.search_hits(query, limit)
 
 
 @dataclass(frozen=True)
@@ -49,16 +38,7 @@ class SemanticRetrievalStrategy:
         self,
         query: str,
         limit: int = 10,
-        *,
-        meeting_id: int | None = None,
-        context: int = 0,
     ) -> tuple[SearchHit, ...]:
-        if context:
-            message = "Semantic retrieval does not expand neighboring context."
-            raise ValueError(message)
-        if meeting_id is not None:
-            message = "Semantic retrieval does not support meeting-scoped search."
-            raise ValueError(message)
         rows = semantic_search(
             self.repository.index_path,
             query,
@@ -100,31 +80,17 @@ class HybridRetrievalStrategy:
         self,
         query: str,
         limit: int = 10,
-        *,
-        meeting_id: int | None = None,
-        context: int = 0,
     ) -> tuple[SearchHit, ...]:
-        return self.search_with_trace(
-            query,
-            limit,
-            meeting_id=meeting_id,
-            context=context,
-        ).hits
+        return self.search_with_trace(query, limit).hits
 
     def search_with_trace(
         self,
         query: str,
         limit: int = 10,
-        *,
-        meeting_id: int | None = None,
-        context: int = 0,
     ) -> RetrievalResult:
-        if context:
-            message = "Hybrid retrieval does not expand neighboring context."
-            raise ValueError(message)
         candidate_limit = max(limit, limit * self.candidate_multiplier)
-        lexical_hits = self.lexical.search(query, candidate_limit, meeting_id=meeting_id)
-        semantic_hits = self.semantic.search(query, candidate_limit, meeting_id=meeting_id)
+        lexical_hits = self.lexical.search(query, candidate_limit)
+        semantic_hits = self.semantic.search(query, candidate_limit)
         lexical_ranks = {hit.id: rank for rank, hit in enumerate(lexical_hits, start=1)}
         semantic_ranks = {hit.id: rank for rank, hit in enumerate(semantic_hits, start=1)}
         hits_by_id = {hit.id: hit for hit in (*lexical_hits, *semantic_hits)}

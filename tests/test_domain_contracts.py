@@ -111,7 +111,7 @@ def test_v2_context_is_data_only_and_uses_canonical_memory_entities(
     assert all("is_context" in hit.as_payload() for hit in bounded.evidence)
 
 
-def test_context_defaults_to_bounded_neighbors_without_changing_search_default(
+def test_context_neighbors_are_explicit_without_changing_search_default(
     meetily_db: Path, tmp_path: Path
 ) -> None:
     index_path = tmp_path / "index.sqlite"
@@ -120,10 +120,14 @@ def test_context_defaults_to_bounded_neighbors_without_changing_search_default(
 
     search = core.search("migration risks", limit=3, contract_version=CORE_V2_VERSION)
     context = core.build_context("migration risks", limit=3, contract_version=CORE_V2_VERSION)
+    expanded = core.build_context(
+        "migration risks", limit=3, context=2, contract_version=CORE_V2_VERSION
+    )
 
     assert all(result["is_context"] is False for result in search.data["results"])
-    assert any(result["is_context"] is True for result in context.data["evidence"])
-    assert len(context.data["evidence"]) <= 20
+    assert all(result["is_context"] is False for result in context.data["evidence"])
+    assert any(result["is_context"] is True for result in expanded.data["evidence"])
+    assert len(expanded.data["evidence"]) <= 20
 
 
 def test_memory_entities_require_chunks_and_cascade_on_chunk_delete(

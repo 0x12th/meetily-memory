@@ -1,8 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-import pytest
-
 from meetily_memory import retrieval
 from meetily_memory.context_builder import ContextRenderer
 from meetily_memory.core import CORE_V2_VERSION, MeetilyMemoryCore
@@ -21,15 +19,12 @@ class FixedRetrievalStrategy:
         self,
         query: str,
         limit: int = 10,
-        *,
-        meeting_id: int | None = None,
-        context: int = 0,
     ) -> tuple[SearchHit, ...]:
-        del query, meeting_id, context
+        del query
         return self.hits[:limit]
 
 
-def test_selected_strategy_drives_v2_search_and_context_bundle(
+def test_selected_strategy_drives_only_explicit_v2_search(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
@@ -42,14 +37,15 @@ def test_selected_strategy_drives_v2_search_and_context_bundle(
     )
 
     search = core.search("query ignored by strategy", contract_version=CORE_V2_VERSION)
-    bundle = core.context_bundle("question ignored by strategy")
+    bundle = core.context_bundle("migration risks")
     context = core.build_context(
-        "question ignored by strategy",
+        "migration risks",
         contract_version=CORE_V2_VERSION,
     )
 
     assert search.data["results"] == [lexical_hit.as_payload()]
-    assert bundle.evidence == (lexical_hit,)
+    assert bundle.evidence[0].excerpt.chunk_external_id == "transcript-2"
+    assert bundle.evidence != (lexical_hit,)
     assert context.data == bundle.as_payload()
 
 
@@ -117,5 +113,3 @@ def test_semantic_strategy_returns_domain_search_hits(
 
     assert hits
     assert all(isinstance(hit, SearchHit) for hit in hits)
-    with pytest.raises(ValueError, match="meeting-scoped"):
-        strategy.search("migration risks", 3, meeting_id=2)

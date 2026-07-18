@@ -87,4 +87,4 @@ async def test_mcp_search_and_context_require_explicit_v2_selection(
     }
     assert context["contract_version"] == "meetily-memory.core.v2"
     assert "markdown" not in context["data"]
-    assert any(hit["is_context"] for hit in context["data"]["evidence"])
+    assert all(hit["is_context"] is False for hit in context["data"]["evidence"])

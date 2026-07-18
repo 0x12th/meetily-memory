@@ -94,6 +94,12 @@ Build LLM-ready context:
 mm c "what did we decide about the migration?"
 ```
 
+Add neighboring excerpts only when the direct matches are insufficient:
+
+```bash
+mm c "what did we decide about the migration?" --context 2
+```
+
 Explore a topic:
 
 ```bash
@@ -143,6 +149,7 @@ mm c "what did we decide about the migration?"
 ```
 
 Build clean Markdown context ready to paste into ChatGPT, Claude, or Codex.
+Neighbor expansion is explicit through `--context N`; direct lexical matches are the default.
 
 ### Topics
 

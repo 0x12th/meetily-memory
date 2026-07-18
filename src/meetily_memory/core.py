@@ -5,6 +5,7 @@ from typing import Any
 from meetily_memory.context_builder import (
     DEFAULT_CONTEXT_NEIGHBORS,
     MAX_CONTEXT_EVIDENCE,
+    ContextBundleBuilder,
     ContextRenderer,
 )
 from meetily_memory.db.repository import IndexRepository
@@ -61,6 +62,7 @@ class MeetilyMemoryCore:
     ) -> None:
         self.repo = IndexRepository(Path(index_path), state_path=state_path)
         self.retrieval_strategy = retrieval_strategy or LexicalRetrievalStrategy(self.repo)
+        self.context_builder = ContextBundleBuilder(self.repo)
         self.context_renderer = ContextRenderer()
 
     def search(
@@ -89,7 +91,8 @@ class MeetilyMemoryCore:
         )
 
     def search_hits(self, query: str, limit: int = 10, context: int = 0) -> tuple[SearchHit, ...]:
-        return self.retrieval_strategy.search(query, limit, context=context)
+        hits = self.retrieval_strategy.search(query, limit)
+        return self.repo.expand_search_hits(hits, context) if context else hits
 
     def compact_search_hits(
         self,
@@ -118,16 +121,12 @@ class MeetilyMemoryCore:
         options: ContextRetrievalOptions | None = None,
     ) -> ContextBundle:
         retrieval_options = options or ContextRetrievalOptions()
-        evidence = self.retrieval_strategy.search(
+        return self.context_builder.build(
             question,
             limit,
             meeting_id=retrieval_options.meeting_id,
-            context=retrieval_options.neighbor_count,
-        )[: retrieval_options.max_evidence]
-        return ContextBundle(
-            question=question,
-            evidence=evidence,
-            entities=self.repo.memory_entities_for_hits(evidence),
+            neighbor_count=retrieval_options.neighbor_count,
+            max_evidence=retrieval_options.max_evidence,
         )
 
     def build_context(

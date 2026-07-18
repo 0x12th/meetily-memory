@@ -28,7 +28,7 @@ afterward. Neighbor expansion is explicit; the default remains `--context 0`.
 | `mm open 12 --source` | Opens the indexed source file/path. |
 | `mm open 12 --print-path` | Prints the default meeting folder path without opening it. |
 | `mm c "what did we decide about migration?"` | Builds paste-ready Markdown context with sources for ChatGPT, Claude, Codex, or another LLM. Use when you want to copy context elsewhere. |
-| `mm c "what did we decide?" --context 0` | Disables the default neighboring context when only direct lexical matches are needed. |
+| `mm c "what did we decide?" --context 2` | Explicitly adds two neighboring chunks around each lexical match. |
 | `mm t "migration"` | Experimental source-backed topic dossier. It starts from search evidence, labels heuristic matches as possible decisions/tasks/risks/questions, and still shows evidence when structured memory is empty. It is not an LLM answer. |
 
 `mm t` expands stored topic aliases. Add aliases explicitly with repeated
@@ -42,9 +42,8 @@ There is no built-in domain dictionary for specific terms. Future expansion
 should come from user aliases, indexed aliases, extracted aliases, or semantic
 retrieval.
 
-`mm c` uses two adjacent chunks around each lexical match by default, marks them as neighboring
-context, and caps the resulting evidence bundle at 20 excerpts. This does not change the
-`mm s` default: ordinary search remains lexical with `--context 0`.
+`mm c` uses direct lexical matches by default. `--context N` explicitly appends neighboring
+chunks, marks their evidence role, and caps the resulting evidence bundle at 20 excerpts.
 
 ## Optional Experimental: Semantic Search
 

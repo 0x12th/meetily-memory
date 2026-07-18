@@ -314,6 +314,27 @@ class IndexRepository:
             is_context=bool(row.get("is_context", False)),
         )
 
+    def expand_search_hits(
+        self, hits: tuple[SearchHit, ...], context: int
+    ) -> tuple[SearchHit, ...]:
+        rows = [
+            row
+            for hit in hits
+            if (
+                row := self.search_repo.evidence_row(
+                    hit.meeting.source_path,
+                    hit.meeting.external_id,
+                    hit.excerpt.chunk_external_id,
+                    hit.excerpt.kind,
+                    hit.excerpt.ordinal,
+                )
+            )
+            is not None
+        ]
+        return tuple(
+            self.search_hit_from_row(row) for row in self.search_repo.expand_hits(rows, context)
+        )
+
     def get_search_hit(self, evidence_id: str) -> SearchHit | None:
         for row in self.search_repo.all_evidence_rows():
             hit = self.search_hit_from_row(row)

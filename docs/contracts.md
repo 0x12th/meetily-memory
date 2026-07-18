@@ -21,6 +21,11 @@ MCP `search` and `build_context` use `core.v1` unless the caller explicitly pass
 `MeetilyMemoryCore`; the MCP adapter does not implement retrieval, ranking, ID resolution, or
 context assembly.
 
+`RetrievalStrategy` accepts only a query and candidate limit and returns ranked `SearchHit`
+values. Meeting scope, neighboring excerpts, bundle limits, and `MemoryEntity` attachment are
+owned by the lexical `ContextBundleBuilder`. Selecting semantic or hybrid retrieval therefore
+changes only explicit v2 Search; it does not claim support for Context.
+
 `CompactSearchHit` is an explicit preview projection. Its `truncated`, `preview_length`,
 `projection_version`, and `is_context` fields are always present. Changing the preview length
 does not change retrieval or the evidence ID. The full `SearchHit` resolves through

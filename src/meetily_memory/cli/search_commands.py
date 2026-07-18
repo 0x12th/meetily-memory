@@ -83,7 +83,7 @@ def context(
     context: Annotated[
         int,
         typer.Option("--context", help="Adjacent chunks around each lexical match."),
-    ] = 2,
+    ] = 0,
 ) -> None:
     data = core_from_context(ctx).build_context(question, limit, context=context).data
     print_text_block(str(data["markdown"]))

@@ -338,7 +338,9 @@ def evaluate_retrieval(
     observed: list[ObservedTask] = []
     for task in dataset.tasks:
         started = perf_counter()
-        hits = strategy.search(task.query, limit, context=context)
+        hits = strategy.search(task.query, limit)
+        if context:
+            hits = repo.expand_search_hits(hits, context)
         latency_ms = (perf_counter() - started) * 1000
         observed.append(observe_task(task, hits, latency_ms))
     manifest_parameters: dict[str, Any] = {"limit": limit, "context": context}

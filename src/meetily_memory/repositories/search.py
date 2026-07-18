@@ -144,6 +144,68 @@ class SearchRepository:
                 seen_chunk_ids.add(chunk_id)
         return expanded
 
+    def expand_hits(
+        self,
+        rows: list[dict[str, Any]],
+        context: int,
+    ) -> list[dict[str, Any]]:
+        if context <= 0 or not rows:
+            return rows
+        with index_connection(self.index_path) as conn:
+            return self._expand_context(conn, rows, context)
+
+    def evidence_row(
+        self,
+        source_path: str,
+        meeting_external_id: str,
+        chunk_external_id: str | None,
+        kind: str,
+        ordinal: int,
+    ) -> dict[str, Any] | None:
+        with index_connection(self.index_path) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  m.id AS meeting_id,
+                  m.external_id AS meeting_external_id,
+                  m.title AS title,
+                  m.created_at AS created_at,
+                  m.updated_at AS updated_at,
+                  m.folder_path AS folder_path,
+                  m.language AS language,
+                  c.id AS chunk_id,
+                  c.external_id AS chunk_external_id,
+                  c.kind AS kind,
+                  c.ordinal AS ordinal,
+                  c.text AS text,
+                  c.speaker AS speaker,
+                  c.starts_at_seconds AS starts_at_seconds,
+                  c.ends_at_seconds AS ends_at_seconds,
+                  c.timestamp_label AS timestamp_label,
+                  NULL AS rank
+                FROM chunks c
+                JOIN meetings m ON m.id = c.meeting_id
+                JOIN sources s ON s.id = m.source_id
+                WHERE s.path = ?
+                  AND m.external_id = ?
+                  AND (
+                    (? IS NOT NULL AND c.external_id = ?)
+                    OR (? IS NULL AND c.kind = ? AND c.ordinal = ?)
+                  )
+                LIMIT 1
+                """,
+                (
+                    source_path,
+                    meeting_external_id,
+                    chunk_external_id,
+                    chunk_external_id,
+                    chunk_external_id,
+                    kind,
+                    ordinal,
+                ),
+            ).fetchone()
+        return dict(row) if row else None
+
     def _execute_context_window(
         self,
         conn: sqlite3.Connection,

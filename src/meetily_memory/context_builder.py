@@ -2,9 +2,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from meetily_memory.domain import ContextBundle, SearchHit
+from meetily_memory.repositories.index import IndexRepository
 
 DEFAULT_CONTEXT_LIMIT = 8
-DEFAULT_CONTEXT_NEIGHBORS = 2
+DEFAULT_CONTEXT_NEIGHBORS = 0
 MAX_CONTEXT_EVIDENCE = 20
 
 
@@ -23,6 +24,32 @@ class ContextRenderer:
         return render_context_markdown(
             bundle.question,
             group_hits_by_meeting(bundle.evidence),
+        )
+
+
+@dataclass(frozen=True)
+class ContextBundleBuilder:
+    repository: IndexRepository
+
+    def build(
+        self,
+        question: str,
+        limit: int,
+        *,
+        meeting_id: int | None,
+        neighbor_count: int,
+        max_evidence: int,
+    ) -> ContextBundle:
+        evidence = self.repository.search_hits(
+            question,
+            limit,
+            meeting_id=meeting_id,
+            context=neighbor_count,
+        )[:max_evidence]
+        return ContextBundle(
+            question=question,
+            evidence=evidence,
+            entities=self.repository.memory_entities_for_hits(evidence),
         )
 
 
