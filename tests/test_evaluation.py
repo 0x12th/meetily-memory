@@ -1,12 +1,17 @@
-from dataclasses import replace
+import subprocess
+import sys
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
+from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.domain import SearchHit
 from meetily_memory.evaluation import (
     EvaluationDataset,
     EvaluationManifest,
     EvaluationReport,
+    EvaluationRetrievalConfig,
     EvaluationTask,
     ExpectedEvidence,
     ObservedTask,
@@ -14,7 +19,26 @@ from meetily_memory.evaluation import (
     evaluate_retrieval,
     load_dataset,
 )
+from meetily_memory.json_codec import loads_json
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.semantic_search import LocalHashEmbeddingProvider, index_semantic_embeddings
+from tests.semantic_helpers import requires_sqlite_vec
+
+
+@dataclass(frozen=True)
+class FixedEvaluationStrategy:
+    hits: tuple[SearchHit, ...]
+
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        meeting_id: int | None = None,
+        context: int = 0,
+    ) -> tuple[SearchHit, ...]:
+        del query, meeting_id, context
+        return self.hits[:limit]
 
 
 def test_synthetic_evaluation_dataset_is_valid() -> None:
@@ -55,6 +79,69 @@ def test_evaluation_records_explicit_neighbor_context_parameter(
     report = evaluate_retrieval(dataset, index_path, limit=5, context=1)
 
     assert report.manifest.retrieval_parameters == {"limit": 5, "context": 1}
+
+
+def test_evaluation_records_explicit_hybrid_strategy(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
+    hit = MeetilyMemoryCore(index_path).search_hits("pricing decision", 1)[0]
+
+    report = evaluate_retrieval(
+        dataset,
+        index_path,
+        limit=5,
+        config=EvaluationRetrievalConfig(
+            strategy=FixedEvaluationStrategy((hit,)),
+            mode="hybrid_rrf",
+            parameters={"rrf_k": 60},
+            semantic_provider="ollama",
+            semantic_model="nomic-embed-text",
+            semantic_dimension=768,
+        ),
+    )
+
+    assert report.manifest.retrieval_mode == "hybrid_rrf"
+    assert report.manifest.retrieval_parameters == {"limit": 5, "context": 0, "rrf_k": 60}
+    assert report.manifest.semantic_provider == "ollama"
+    assert report.manifest.semantic_model == "nomic-embed-text"
+    assert report.manifest.semantic_dimension == 768
+
+
+@requires_sqlite_vec
+def test_evaluation_script_runs_explicit_hybrid_mode(meetily_db: Path, tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    output_path = tmp_path / "hybrid.json"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    index_semantic_embeddings(
+        index_path,
+        embedding_provider=LocalHashEmbeddingProvider(),
+    )
+
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/evaluate-retrieval.py",
+            "tests/fixtures/evaluation/synthetic_dataset.json",
+            "--index",
+            str(index_path),
+            "--output",
+            str(output_path),
+            "--retrieval",
+            "hybrid",
+            "--embedding-provider",
+            "hash",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = loads_json(output_path.read_text())
+    assert report["manifest"]["retrieval_mode"] == "hybrid_rrf"
+    assert report["manifest"]["semantic_provider"] == "hash"
+    assert report["manifest"]["semantic_model"] == "local-hash-v1"
 
 
 def test_report_comparison_is_paired_by_task_and_class() -> None:

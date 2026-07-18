@@ -5,7 +5,7 @@ import sqlite3
 import subprocess
 import uuid
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
@@ -13,7 +13,9 @@ from time import perf_counter
 from typing import Any, ClassVar
 
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.domain import SearchHit
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
+from meetily_memory.retrieval import LexicalRetrievalStrategy, RetrievalStrategy
 
 EVALUATION_SCHEMA_VERSION = "meetily-memory.eval.v1"
 PRIMARY_RELEVANCE = 2
@@ -213,6 +215,17 @@ class EvaluationManifest:
 
 
 @dataclass(frozen=True)
+class EvaluationRetrievalConfig:
+    strategy: RetrievalStrategy | None = None
+    mode: str = "fts5"
+    parameters: dict[str, Any] = field(default_factory=dict)
+    semantic_provider: str | None = None
+    semantic_model: str | None = None
+    semantic_dimension: int | None = None
+    repository_root: Path | None = None
+
+
+@dataclass(frozen=True)
 class EvaluationReport:
     manifest: EvaluationManifest
     dataset_name: str
@@ -312,25 +325,28 @@ def evaluate_retrieval(
     *,
     limit: int = 5,
     context: int = 0,
-    repository_root: Path | None = None,
+    config: EvaluationRetrievalConfig | None = None,
 ) -> EvaluationReport:
     if limit < EVALUATION_CUTOFF:
         message = "evaluation limit must be at least 5"
         raise ValueError(message)
     index_path = Path(index_path)
     repo = IndexRepository(index_path)
+    retrieval_config = config or EvaluationRetrievalConfig()
+    strategy = retrieval_config.strategy or LexicalRetrievalStrategy(repo)
     observed: list[ObservedTask] = []
     for task in dataset.tasks:
         started = perf_counter()
-        rows = repo.search(task.query, limit, context=context)
+        hits = strategy.search(task.query, limit, context=context)
         latency_ms = (perf_counter() - started) * 1000
-        observed.append(observe_task(task, rows, latency_ms))
+        observed.append(observe_task(task, hits, latency_ms))
+    manifest_parameters: dict[str, Any] = {"limit": limit, "context": context}
+    manifest_parameters.update(retrieval_config.parameters)
     manifest = build_manifest(
         dataset,
         index_path,
-        limit=limit,
-        context=context,
-        repository_root=repository_root,
+        config=retrieval_config,
+        retrieval_parameters=manifest_parameters,
     )
     tasks = tuple(observed)
     return EvaluationReport(
@@ -343,17 +359,17 @@ def evaluate_retrieval(
 
 
 def observe_task(
-    task: EvaluationTask, rows: list[dict[str, Any]], latency_ms: float
+    task: EvaluationTask, hits: tuple[SearchHit, ...], latency_ms: float
 ) -> ObservedTask:
     relevance_by_id = {item.evidence_id: item.relevance for item in task.expected}
     retrieved = tuple(
         RetrievedEvidence(
-            evidence_id=evidence_id_from_row(row),
-            meeting_external_id=str(row["meeting_external_id"]),
-            relevance=relevance_by_id.get(evidence_id_from_row(row), 0),
+            evidence_id=evaluation_evidence_id(hit),
+            meeting_external_id=hit.meeting.external_id,
+            relevance=relevance_by_id.get(evaluation_evidence_id(hit), 0),
             rank=rank,
         )
-        for rank, row in enumerate(rows, start=1)
+        for rank, hit in enumerate(hits, start=1)
     )
     primary_ranks = [item.rank for item in retrieved if item.relevance == PRIMARY_RELEVANCE]
     first_primary_rank = min(primary_ranks, default=None)
@@ -512,11 +528,10 @@ def build_manifest(
     dataset: EvaluationDataset,
     index_path: Path,
     *,
-    limit: int,
-    context: int,
-    repository_root: Path | None,
+    config: EvaluationRetrievalConfig,
+    retrieval_parameters: dict[str, Any],
 ) -> EvaluationManifest:
-    root = repository_root or Path.cwd()
+    root = config.repository_root or Path.cwd()
     commit = git_output(root, "rev-parse", "HEAD") or "unknown"
     dirty = bool(git_output(root, "status", "--porcelain"))
     with sqlite3.connect(index_path) as conn:
@@ -529,8 +544,11 @@ def build_manifest(
         dataset_fingerprint=dataset.fingerprint,
         corpus_fingerprint=corpus_fingerprint(index_path),
         index_schema_version=schema_version,
-        retrieval_mode="fts5",
-        retrieval_parameters={"limit": limit, "context": context},
+        retrieval_mode=config.mode,
+        retrieval_parameters=retrieval_parameters,
+        semantic_provider=config.semantic_provider,
+        semantic_model=config.semantic_model,
+        semantic_dimension=config.semantic_dimension,
     )
 
 
@@ -549,19 +567,19 @@ def corpus_fingerprint(index_path: Path) -> str:
     return sha256_payload([list(row) for row in rows])
 
 
-def evidence_id_from_row(row: dict[str, Any]) -> str:
-    meeting_id = str(row["meeting_external_id"])
-    chunk_external_id = row.get("chunk_external_id")
+def evaluation_evidence_id(hit: SearchHit) -> str:
+    meeting_id = hit.meeting.external_id
+    chunk_external_id = hit.excerpt.chunk_external_id
     if chunk_external_id:
         return f"{meeting_id}/{chunk_external_id}"
     fallback = sha256_payload(
         {
-            "kind": row["kind"],
-            "ordinal": row["ordinal"],
-            "text": row["text"],
+            "kind": hit.excerpt.kind,
+            "ordinal": hit.excerpt.ordinal,
+            "text": hit.excerpt.text,
         }
     )
-    return f"{meeting_id}/{row['kind']}:{row['ordinal']}:{fallback}"
+    return f"{meeting_id}/{hit.excerpt.kind}:{hit.excerpt.ordinal}:{fallback}"
 
 
 def dataset_payload(dataset: EvaluationDataset) -> dict[str, Any]:

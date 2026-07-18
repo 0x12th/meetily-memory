@@ -34,6 +34,28 @@ uv run scripts/evaluate-retrieval.py \
   --output .docs/eval/candidate.json
 ```
 
+Evaluate the explicit hybrid RRF experiment only after semantic embeddings have been indexed:
+
+```bash
+uv run scripts/evaluate-retrieval.py \
+  .docs/eval/tasks.v1.json \
+  --index .docs/eval/index.sqlite \
+  --baseline .docs/eval/baseline.json \
+  --output .docs/eval/hybrid.json \
+  --retrieval hybrid \
+  --embedding-provider ollama \
+  --allow-drift retrieval_mode \
+  --allow-drift retrieval_parameters \
+  --allow-drift semantic_provider \
+  --allow-drift semantic_model \
+  --allow-drift semantic_dimension
+```
+
+Hybrid evaluation never creates embeddings during a query. It records the provider, model,
+dimension, RRF constant, and candidate multiplier in the manifest. Its lexical and semantic
+ranks remain diagnostic retrieval trace data and are not added to `SearchHit`. A successful
+single comparison does not change standard lexical search or expose hybrid retrieval in the CLI.
+
 Reports are immutable: the runner refuses to overwrite an existing output path. Automatic
 comparison is rejected when the dataset, corpus, index schema, retrieval mode or parameters,
 or semantic provider/model/dimension differ. Code commits and dirty-tree state remain recorded
