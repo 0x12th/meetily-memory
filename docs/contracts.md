@@ -12,7 +12,9 @@ payload is a data-only
 `ContextBundle`; it does not contain Markdown. `MemoryEntity` values use the canonical kinds
 `decision`, `task`, `risk`, and `question`, point directly to their source excerpt, and are
 marked non-authoritative. Extractor confidence remains internal diagnostics and is not part of
-the domain contract.
+the domain contract or generated Obsidian notes. The heuristic task extractor requires an
+explicit action verb or assignment phrase; generic mentions of a task or what one "can do" are
+not treated as established action items.
 
 `CompactSearchHit` is an explicit preview projection. Its `truncated`, `preview_length`,
 `projection_version`, and `is_context` fields are always present. Changing the preview length

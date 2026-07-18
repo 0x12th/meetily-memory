@@ -218,6 +218,19 @@ def test_dataset_rejects_critical_task_without_predeclared_reason() -> None:
         )
 
 
+def test_dataset_accepts_open_question_tasks() -> None:
+    task = EvaluationTask(
+        id="question-team-composition",
+        query="open team composition question",
+        task_class="question",
+        critical=False,
+        critical_reason=None,
+        expected=(ExpectedEvidence("meeting/chunk", 2),),
+    )
+
+    assert task.task_class == "question"
+
+
 def test_evaluation_uses_external_evidence_identity_after_index_rebuild(
     meetily_db: Path, tmp_path: Path
 ) -> None:

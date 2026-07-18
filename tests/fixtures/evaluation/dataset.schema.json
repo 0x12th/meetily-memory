@@ -25,6 +25,7 @@
               "fuzzy_recall",
               "decision",
               "task",
+              "question",
               "risk",
               "person",
               "project",

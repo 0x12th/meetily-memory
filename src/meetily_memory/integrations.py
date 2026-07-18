@@ -205,7 +205,6 @@ def render_obsidian_entity_note(entity: dict[str, Any]) -> str:
         f"- Kind: `{entity['kind']}`",
         f"- Meeting: [[{entity['meeting_title']}]]",
         f"- Source: {source_label(entity)}",
-        f"- Confidence: {float(entity['confidence']):.2f}",
         "",
         title,
     ]

@@ -27,6 +27,7 @@ TASK_CLASSES = frozenset(
         "fuzzy_recall",
         "decision",
         "task",
+        "question",
         "risk",
         "person",
         "project",

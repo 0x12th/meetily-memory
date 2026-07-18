@@ -22,6 +22,7 @@ def test_obsidian_sync_creates_managed_note_network(meetily_db: Path, tmp_path: 
     assert MANAGED_MARKER in task_text
     assert "[[Dobrynya Follow-up]]" in task_text
     assert "Source: meeting-2 /" in task_text
+    assert "Confidence:" not in task_text
 
 
 def test_obsidian_sync_does_not_overwrite_unmanaged_notes(meetily_db: Path, tmp_path: Path) -> None:
