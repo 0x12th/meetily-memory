@@ -192,6 +192,24 @@ mm refresh
 
 Refresh the local index when automatic refreshes are disabled.
 
+### Move Or Restore The Meetily Database
+
+Select a different validated Meetily database as a new source:
+
+```bash
+mm config source /path/to/meeting_minutes.sqlite
+```
+
+If the same database was moved or restored from a copy, preserve its source identity and
+user-owned state explicitly:
+
+```bash
+mm config source /path/to/meeting_minutes.sqlite --rebind
+```
+
+Rebinding succeeds only after the new database passes schema validation and shares stable
+meeting IDs with the selected source.
+
 ---
 
 ## Optional Features

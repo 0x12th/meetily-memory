@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 - 2026-07-18
+
+- Add `mm config source NEW_PATH` for selecting a validated Meetily database and
+  `--rebind` for explicitly preserving source identity after a verified move or restore.
+- Persist source identity and task status in dedicated user state so index migrations and
+  rebuilds do not discard user-owned state.
+- Add stable, versioned evidence and context contracts for retrieval consumers, with an
+  explicit opt-in Core v2 path for MCP clients.
+- Keep `mm c` lexical and source-ranked by default while allowing bounded neighboring
+  excerpts through explicit `--context N`.
+- Add reproducible retrieval evaluation datasets, manifests, comparison gates, and reports
+  so experimental strategies can be measured without changing the stable search path.
+- Tighten heuristic task extraction and document the measured product gates before task
+  workflows can be promoted beyond experimental status.
+
 ## 0.3.2 - 2026-07-06
 
 - Add `mm s --context/-C` to expand search hits with neighboring chunks.
