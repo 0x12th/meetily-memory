@@ -18,7 +18,7 @@ from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 
 
 def test_synthetic_evaluation_dataset_is_valid() -> None:
-    dataset = load_dataset(Path("eval/synthetic_dataset.json"))
+    dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
 
     assert dataset.schema_version == "meetily-memory.eval.v1"
     assert {evidence.relevance for task in dataset.tasks for evidence in task.expected} == {1, 2}
@@ -28,7 +28,7 @@ def test_synthetic_evaluation_dataset_is_valid() -> None:
 def test_evaluation_calculates_ranked_and_product_metrics(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    dataset = load_dataset(Path("eval/synthetic_dataset.json"))
+    dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
 
     report = evaluate_retrieval(dataset, index_path, limit=5)
 
@@ -50,7 +50,7 @@ def test_evaluation_records_explicit_neighbor_context_parameter(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    dataset = load_dataset(Path("eval/synthetic_dataset.json"))
+    dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
 
     report = evaluate_retrieval(dataset, index_path, limit=5, context=1)
 
@@ -137,7 +137,7 @@ def test_evaluation_uses_external_evidence_identity_after_index_rebuild(
     index_path = tmp_path / "index.sqlite"
     scanner = MeetilySQLiteScanner(index_path)
     scanner.scan(meetily_db)
-    dataset = load_dataset(Path("eval/synthetic_dataset.json"))
+    dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
     first = evaluate_retrieval(dataset, index_path, limit=5)
 
     index_path.unlink()

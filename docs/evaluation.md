@@ -1,8 +1,9 @@
 # Retrieval evaluation
 
-Meetily Memory includes a reproducible FTS5 evaluation runner. The public dataset in
-`eval/synthetic_dataset.json` verifies the dataset format, stable evidence keys, metrics, and
-comparison rules in CI. It is synthetic and must not be used as evidence of retrieval quality.
+Meetily Memory includes a reproducible FTS5 evaluation runner. The public fixture in
+`tests/fixtures/evaluation/synthetic_dataset.json` verifies the dataset format, stable evidence
+keys, metrics, and comparison rules in CI. It is synthetic and must not be used as evidence of
+retrieval quality.
 
 Real queries, relevance labels, reports, and manual reviews belong under the ignored
 `.docs/eval/` directory. A real dataset should contain 30–50 tasks from actual use, cover all
