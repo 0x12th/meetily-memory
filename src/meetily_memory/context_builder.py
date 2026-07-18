@@ -1,6 +1,8 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from meetily_memory.domain import ContextBundle, SearchHit
+
 DEFAULT_CONTEXT_LIMIT = 8
 
 
@@ -13,10 +15,23 @@ class ContextMeeting:
     excerpts: list[Mapping[str, object]]
 
 
+@dataclass(frozen=True)
+class ContextRenderer:
+    def render(self, bundle: ContextBundle) -> str:
+        return render_context_markdown(
+            bundle.question,
+            group_hits_by_meeting(bundle.evidence),
+        )
+
+
 def build_context_markdown(
     question: str,
     search_results: Sequence[Mapping[str, object]],
 ) -> str:
+    return render_context_markdown(question, group_results_by_meeting(search_results))
+
+
+def render_context_markdown(question: str, meetings: Sequence[ContextMeeting]) -> str:
     lines = [
         "# Question",
         "",
@@ -25,11 +40,11 @@ def build_context_markdown(
         "# Relevant meetings",
     ]
 
-    if not search_results:
+    if not meetings:
         lines.extend(["", "No relevant excerpts found."])
         return finish_with_question(lines, question)
 
-    for meeting in group_results_by_meeting(search_results):
+    for meeting in meetings:
         lines.extend(
             [
                 "",
@@ -45,6 +60,33 @@ def build_context_markdown(
             lines.extend(["", format_excerpt(excerpt)])
 
     return finish_with_question(lines, question)
+
+
+def group_hits_by_meeting(hits: Sequence[SearchHit]) -> list[ContextMeeting]:
+    meetings_by_id: dict[str, ContextMeeting] = {}
+    for rank, hit in enumerate(hits):
+        meeting = meetings_by_id.get(hit.meeting.external_id)
+        if meeting is None:
+            meeting = ContextMeeting(
+                external_id=hit.meeting.external_id,
+                title=hit.meeting.title,
+                date=hit.meeting.updated_at or hit.meeting.created_at or "unknown",
+                best_rank=float(rank),
+                excerpts=[],
+            )
+            meetings_by_id[hit.meeting.external_id] = meeting
+        meeting.excerpts.append(search_hit_as_context_row(hit))
+    return list(meetings_by_id.values())
+
+
+def search_hit_as_context_row(hit: SearchHit) -> dict[str, object]:
+    return {
+        "meeting_external_id": hit.meeting.external_id,
+        "chunk_external_id": hit.excerpt.chunk_external_id,
+        "text": hit.excerpt.text,
+        "speaker": hit.excerpt.speaker,
+        "timestamp_label": hit.excerpt.timestamp_label,
+    }
 
 
 def group_results_by_meeting(

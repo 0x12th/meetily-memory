@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from meetily_memory.context_builder import build_context_markdown
+from meetily_memory.context_builder import ContextRenderer
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.domain import CompactSearchHit, ContextBundle, SearchHit
 from meetily_memory.local_memory import (
@@ -11,6 +11,7 @@ from meetily_memory.local_memory import (
     summary_memory,
     timeline_signals,
 )
+from meetily_memory.retrieval import LexicalRetrievalStrategy, RetrievalStrategy
 
 CORE_V1_VERSION = "meetily-memory.core.v1"
 CORE_V2_VERSION = "meetily-memory.core.v2"
@@ -32,8 +33,16 @@ class CoreResponse:
 
 
 class MeetilyMemoryCore:
-    def __init__(self, index_path: Path, *, state_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        index_path: Path,
+        *,
+        state_path: Path | None = None,
+        retrieval_strategy: RetrievalStrategy | None = None,
+    ) -> None:
         self.repo = IndexRepository(Path(index_path), state_path=state_path)
+        self.retrieval_strategy = retrieval_strategy or LexicalRetrievalStrategy(self.repo)
+        self.context_renderer = ContextRenderer()
 
     def search(
         self,
@@ -44,8 +53,12 @@ class MeetilyMemoryCore:
         contract_version: str = CORE_V1_VERSION,
     ) -> CoreResponse:
         validate_contract_version(contract_version)
-        rows = self.repo.search(query, limit, context=context)
-        hits = tuple(self.repo.search_hit_from_row(row) for row in rows)
+        if contract_version == CORE_V2_VERSION:
+            rows: list[dict[str, Any]] = []
+            hits = self.search_hits(query, limit, context)
+        else:
+            rows = self.repo.search(query, limit, context=context)
+            hits = tuple(self.repo.search_hit_from_row(row) for row in rows)
         return CoreResponse(
             "search",
             {
@@ -57,7 +70,7 @@ class MeetilyMemoryCore:
         )
 
     def search_hits(self, query: str, limit: int = 10, context: int = 0) -> tuple[SearchHit, ...]:
-        return self.repo.search_hits(query, limit, context=context)
+        return self.retrieval_strategy.search(query, limit, context=context)
 
     def compact_search_hits(
         self,
@@ -71,8 +84,14 @@ class MeetilyMemoryCore:
     def get_search_hit(self, evidence_id: str) -> SearchHit | None:
         return self.repo.get_search_hit(evidence_id)
 
-    def context_bundle(self, question: str, limit: int = 8) -> ContextBundle:
-        evidence = self.search_hits(question, limit)
+    def context_bundle(
+        self,
+        question: str,
+        limit: int = 8,
+        *,
+        meeting_id: int | None = None,
+    ) -> ContextBundle:
+        evidence = self.retrieval_strategy.search(question, limit, meeting_id=meeting_id)
         return ContextBundle(
             question=question,
             evidence=evidence,
@@ -87,20 +106,17 @@ class MeetilyMemoryCore:
         contract_version: str = CORE_V1_VERSION,
     ) -> CoreResponse:
         validate_contract_version(contract_version)
+        if contract_version == CORE_V2_VERSION:
+            bundle = self.context_bundle(question, limit)
+            return CoreResponse("context", bundle.as_payload(), contract_version)
         rows = self.repo.search(question, limit)
         evidence = tuple(self.repo.search_hit_from_row(row) for row in rows)
-        if contract_version == CORE_V2_VERSION:
-            bundle = ContextBundle(
-                question=question,
-                evidence=evidence,
-                entities=self.repo.memory_entities_for_hits(evidence),
-            )
-            return CoreResponse("context", bundle.as_payload(), contract_version)
+        bundle = ContextBundle(question=question, evidence=evidence, entities=())
         return CoreResponse(
             "context",
             {
                 "question": question,
-                "markdown": build_context_markdown(question, rows),
+                "markdown": self.context_renderer.render(bundle),
                 "evidence": serialize_hits(evidence, rows, CORE_V1_VERSION),
             },
             contract_version,
@@ -119,21 +135,18 @@ class MeetilyMemoryCore:
         if meeting is None:
             message = f"Meeting not found: {meeting_id}"
             raise ValueError(message)
+        if contract_version == CORE_V2_VERSION:
+            bundle = self.context_bundle(question, limit, meeting_id=int(meeting["id"]))
+            return CoreResponse("meeting_context", bundle.as_payload(), contract_version)
         rows = self.repo.search(question, limit, meeting_id=int(meeting["id"]))
         evidence = tuple(self.repo.search_hit_from_row(row) for row in rows)
-        if contract_version == CORE_V2_VERSION:
-            bundle = ContextBundle(
-                question=question,
-                evidence=evidence,
-                entities=self.repo.memory_entities_for_hits(evidence),
-            )
-            return CoreResponse("meeting_context", bundle.as_payload(), contract_version)
+        bundle = ContextBundle(question=question, evidence=evidence, entities=())
         return CoreResponse(
             "meeting_context",
             {
                 "question": question,
                 "meeting": meeting,
-                "markdown": build_context_markdown(question, rows),
+                "markdown": self.context_renderer.render(bundle),
                 "evidence": serialize_hits(evidence, rows, CORE_V1_VERSION),
             },
             contract_version,
