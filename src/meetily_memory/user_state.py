@@ -100,6 +100,26 @@ class UserStateRepository:
     def source_uuid(self, kind: str, path: str, *, now: str) -> str:
         return self.get_or_create_source(kind, path, now=now)
 
+    def get_source(self, source_uuid: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT uuid, kind, current_path FROM sources WHERE uuid = ?",
+                (source_uuid,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_source_by_path(self, kind: str, path: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT uuid, kind, current_path
+                FROM sources
+                WHERE kind = ? AND current_path = ?
+                """,
+                (kind, path),
+            ).fetchone()
+            return dict(row) if row else None
+
     def update_source_path(self, source_uuid: str, path: str, *, now: str) -> None:
         with self._connect() as conn:
             cursor = conn.execute(

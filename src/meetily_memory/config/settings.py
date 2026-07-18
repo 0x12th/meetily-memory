@@ -31,6 +31,7 @@ class SemanticSettings:
 @dataclass(frozen=True)
 class AppSettings:
     source_path: str | None = None
+    source_uuid: str | None = None
     ui_language: str | None = None
     autosync_enabled: bool = False
     last_update_at: str | None = None
@@ -39,8 +40,8 @@ class AppSettings:
     semantic: SemanticSettings = SemanticSettings()
 
     def as_payload(self) -> dict[str, Any]:
-        return {
-            "source_path": self.source_path,
+        payload = {
+            "source_uuid": self.source_uuid,
             "ui_language": self.ui_language,
             "autosync_enabled": self.autosync_enabled,
             "last_update_at": self.last_update_at,
@@ -61,6 +62,9 @@ class AppSettings:
                 "ollama_url": self.semantic.ollama_url,
             },
         }
+        if self.source_path is not None:
+            payload["source_path"] = self.source_path
+        return payload
 
 
 def load_app_settings() -> AppSettings:
@@ -78,6 +82,7 @@ def load_app_settings() -> AppSettings:
     semantic = semantic_from_payload(semantic_payload if isinstance(semantic_payload, dict) else {})
     return AppSettings(
         source_path=optional_str(payload.get("source_path")),
+        source_uuid=optional_str(payload.get("source_uuid")),
         ui_language=normalize_ui_language(optional_str(payload.get("ui_language"))),
         autosync_enabled=bool(payload.get("autosync_enabled", False)),
         last_update_at=optional_str(payload.get("last_update_at")),
@@ -98,6 +103,7 @@ def update_app_settings(**changes: object) -> AppSettings:
     settings = load_app_settings()
     updated = AppSettings(
         source_path=string_change(changes, "source_path", settings.source_path),
+        source_uuid=string_change(changes, "source_uuid", settings.source_uuid),
         ui_language=normalize_ui_language(
             string_change(changes, "ui_language", settings.ui_language)
         ),

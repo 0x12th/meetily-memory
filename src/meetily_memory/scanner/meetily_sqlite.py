@@ -152,6 +152,12 @@ def validate_meetily_schema(conn: Any) -> None:
             raise RuntimeError(message)
 
 
+def meeting_external_ids(source_path: Path) -> set[str]:
+    with readonly_sqlite_connection(source_path) as conn:
+        validate_meetily_schema(conn)
+        return {str(row["id"]) for row in conn.execute("SELECT id FROM meetings")}
+
+
 def normalize_meeting(
     source_id: int,
     source_path: Path,

@@ -38,6 +38,10 @@ source UUID + meeting external ID + chunk external ID + task kind + normalized t
 ```
 
 The source UUID lives in `state.sqlite`; its current source path can change without changing the
-UUID. A legacy record without the complete strict identity is retained as an orphan and is never
+UUID. App settings select that UUID and do not keep a second authoritative path after the legacy
+`source_path` setting migrates. `mm config source NEW_PATH --rebind` preserves the UUID only
+after the new Meetily DB passes schema validation and shares at least one stable meeting ID with
+the indexed source. Ordinary source selection and scanning never infer a move. A legacy record
+without the complete strict identity is retained as an orphan and is never
 attached by fuzzy matching. `mm db status` reports the latest migration counts. After migration,
 `index.sqlite` can be deleted and rebuilt without losing task statuses or notes.

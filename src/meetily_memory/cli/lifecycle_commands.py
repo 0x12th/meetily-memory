@@ -17,12 +17,16 @@ from meetily_memory.cli.common import (
     sqlite_has_fts5,
 )
 from meetily_memory.config.paths import discover_meetily_db
-from meetily_memory.config.settings import load_app_settings, update_app_settings
+from meetily_memory.config.settings import AppSettings, load_app_settings, update_app_settings
 from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import index_connection
 from meetily_memory.integrations import sync_obsidian_vault
-from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner, inspect_meetily_schema
+from meetily_memory.scanner.meetily_sqlite import (
+    MeetilySQLiteScanner,
+    inspect_meetily_schema,
+    meeting_external_ids,
+)
 from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
 from meetily_memory.semantic_search import (
     index_semantic_embeddings,
@@ -41,10 +45,33 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def configured_source_path(explicit_source: Path | None = None) -> Path | None:
+SOURCE_KIND = "meetily_sqlite"
+
+
+def migrated_source_settings(index_path: Path) -> AppSettings:
+    settings = load_app_settings()
+    repo = IndexRepository(index_path)
+    if settings.source_uuid:
+        return settings
+    if not settings.source_path:
+        return settings
+    source_uuid = repo.user_state.get_or_create_source(
+        SOURCE_KIND,
+        str(Path(settings.source_path).expanduser()),
+        now=utc_now_iso(),
+    )
+    return update_app_settings(source_uuid=source_uuid, source_path=None)
+
+
+def configured_source_path(index_path: Path, explicit_source: Path | None = None) -> Path | None:
     if explicit_source is not None:
         return explicit_source
-    settings = load_app_settings()
+    settings = migrated_source_settings(index_path)
+    if settings.source_uuid:
+        source = IndexRepository(index_path).user_state.get_source(settings.source_uuid)
+        configured = Path(str(source["current_path"])).expanduser() if source else None
+        if configured and configured.exists():
+            return configured
     if settings.source_path:
         configured = Path(settings.source_path).expanduser()
         if configured.exists():
@@ -109,7 +136,7 @@ def init(
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    source_path = configured_source_path(source)
+    source_path = configured_source_path(ctx.obj["index_path"], source)
     if source_path is None:
         message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
         raise typer.BadParameter(message)
@@ -117,8 +144,13 @@ def init(
     if enable_autosync is None:
         enable_autosync = typer.confirm("Enable automatic index refreshes?", default=False)
     payload, _ = scan_update(ctx.obj["index_path"], source_path)
+    repo = IndexRepository(ctx.obj["index_path"])
+    source_uuid = repo.user_state.get_or_create_source(
+        SOURCE_KIND, str(source_path), now=utc_now_iso()
+    )
     settings = update_app_settings(
-        source_path=str(source_path),
+        source_uuid=source_uuid,
+        source_path=None,
         autosync_enabled=enable_autosync,
         last_update_at=utc_now_iso(),
     )
@@ -144,9 +176,13 @@ def status(
     ctx: typer.Context,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    settings = load_app_settings()
     index_path = ctx.obj["index_path"]
     repo = IndexRepository(index_path)
+    settings = migrated_source_settings(index_path)
+    selected_source = (
+        repo.user_state.get_source(settings.source_uuid) if settings.source_uuid else None
+    )
+    source_path = str(selected_source["current_path"]) if selected_source else None
     stats = repo.stats()
     semantic_config = load_semantic_config()
     obsidian_configured = bool(settings.obsidian.vault_path)
@@ -154,7 +190,7 @@ def status(
     resolved_ui_language = resolve_ui_language(index_path)
     payload = {
         "index_path": str(index_path),
-        "source_path": settings.source_path,
+        "source_path": source_path,
         "ui_language": settings.ui_language,
         "resolved_ui_language": resolved_ui_language,
         "last_update_at": settings.last_update_at,
@@ -168,7 +204,7 @@ def status(
         print_json(payload)
         return
     print_text_block(f"index path: {index_path}")
-    print_text_block(f"source path: {settings.source_path or 'not configured'}")
+    print_text_block(f"source path: {source_path or 'not configured'}")
     configured_label = "configured" if settings.ui_language else "auto"
     print_text_block(f"language: {resolved_ui_language} ({configured_label})")
     print_text_block(f"last refresh: {settings.last_update_at or 'never'}")
@@ -204,6 +240,83 @@ def config_language(
     print_text_block(f"ui language: {settings.ui_language or 'auto'}")
 
 
+@config_app.command("source")
+def config_source(
+    ctx: typer.Context,
+    new_path: Annotated[Path, typer.Argument(help="Path to Meetily meeting_minutes.sqlite.")],
+    rebind: Annotated[
+        bool,
+        typer.Option("--rebind", help="Preserve the selected source UUID after verification."),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
+) -> None:
+    new_path = new_path.expanduser()
+    valid, schema_error = inspect_meetily_schema(new_path)
+    if not valid:
+        raise typer.BadParameter(schema_error or "Meetily DB schema is unsupported.")
+    index_path = ctx.obj["index_path"]
+    repo = IndexRepository(index_path)
+    settings = migrated_source_settings(index_path)
+    payload = (
+        rebind_selected_source(repo, settings, new_path)
+        if rebind
+        else select_source(repo, new_path)
+    )
+    if json_output:
+        print_json(payload)
+        return
+    if payload["rebound"]:
+        print_text_block(f"old source path: {payload['old_source_path']}")
+        print_text_block(f"new source path: {payload['new_source_path']}")
+        print_text_block(f"matching meetings: {payload['matching_meetings']}")
+        return
+    print_text_block(f"source path: {payload['source_path']}")
+    print_text_block(f"source uuid: {payload['source_uuid']}")
+
+
+def select_source(repo: IndexRepository, new_path: Path) -> dict[str, object]:
+    source_uuid = repo.user_state.get_or_create_source(
+        SOURCE_KIND, str(new_path), now=utc_now_iso()
+    )
+    update_app_settings(source_uuid=source_uuid, source_path=None)
+    return {"source_uuid": source_uuid, "source_path": str(new_path), "rebound": False}
+
+
+def rebind_selected_source(
+    repo: IndexRepository, settings: AppSettings, new_path: Path
+) -> dict[str, object]:
+    if not settings.source_uuid:
+        message = "No selected source is available to rebind."
+        raise typer.BadParameter(message)
+    current = repo.user_state.get_source(settings.source_uuid)
+    if current is None:
+        message = "The selected source no longer exists in user state."
+        raise typer.BadParameter(message)
+    old_path = str(current["current_path"])
+    target = repo.user_state.get_source_by_path(SOURCE_KIND, str(new_path))
+    if target and target["uuid"] != settings.source_uuid:
+        message = "The new path is already linked to another source UUID."
+        raise typer.BadParameter(message)
+    indexed_ids = repo.source_meeting_external_ids(SOURCE_KIND, old_path)
+    if not indexed_ids:
+        return select_source(repo, new_path)
+    matching = indexed_ids & meeting_external_ids(new_path)
+    if not matching:
+        message = "The new source has no matching meeting IDs."
+        raise typer.BadParameter(message)
+
+    repo.user_state.update_source_path(settings.source_uuid, str(new_path), now=utc_now_iso())
+    repo.update_source_path_projection(SOURCE_KIND, old_path, str(new_path))
+    update_app_settings(source_uuid=settings.source_uuid, source_path=None)
+    return {
+        "source_uuid": settings.source_uuid,
+        "old_source_path": old_path,
+        "new_source_path": str(new_path),
+        "matching_meetings": len(matching),
+        "rebound": True,
+    }
+
+
 @app.command()
 def scan(
     ctx: typer.Context,
@@ -221,7 +334,7 @@ def scan(
         typer.Option("--analyze/--no-analyze", help="Analyze new or changed meetings."),
     ] = True,
 ) -> None:
-    source_path = configured_source_path(source)
+    source_path = configured_source_path(ctx.obj["index_path"], source)
     if source_path is None:
         message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
         raise typer.BadParameter(message)
@@ -263,14 +376,22 @@ def refresh(
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    source_path = configured_source_path(source)
+    source_path = configured_source_path(ctx.obj["index_path"], source)
     if source_path is None:
         message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
         raise typer.BadParameter(message)
     settings = load_app_settings()
     run_semantic = semantic or bool(load_semantic_config().provider)
     payload, _ = scan_update(ctx.obj["index_path"], source_path, semantic=run_semantic)
-    settings = update_app_settings(source_path=str(source_path), last_update_at=utc_now_iso())
+    repo = IndexRepository(ctx.obj["index_path"])
+    source_uuid = repo.user_state.get_or_create_source(
+        SOURCE_KIND, str(source_path), now=utc_now_iso()
+    )
+    settings = update_app_settings(
+        source_uuid=source_uuid,
+        source_path=None,
+        last_update_at=utc_now_iso(),
+    )
     obsidian_synced = False
     if settings.obsidian.vault_path and settings.obsidian.sync_after_update:
         sync_obsidian_vault(

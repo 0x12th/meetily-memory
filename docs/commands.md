@@ -12,6 +12,8 @@ This page describes the public command model after scope narrowing.
 | `mm status` | Short system state: Meetily DB path, index path, UI language, last refresh, autosync, Obsidian, LLM, and semantic status. |
 | `mm doctor` | Diagnostics only. Checks Meetily DB access/schema, SQLite/FTS5/sqlite-vec support, index permissions, and config. It does not change state. |
 | `mm config language ru` | Stores the stable CLI UI language. Supported values are `en`, `ru`, and `auto`. |
+| `mm config source NEW_PATH` | Selects a validated Meetily DB as a new source identity. |
+| `mm config source NEW_PATH --rebind` | Explicitly moves the selected source identity after matching its Meetily schema and meeting IDs. |
 
 ## Search And Context
 

@@ -129,6 +129,35 @@ class IndexRepository:
     def get_source(self, kind: str, path: str) -> dict[str, Any] | None:
         return self.meetings.get_source(kind, path)
 
+    def source_meeting_external_ids(self, kind: str, path: str) -> set[str]:
+        with index_connection(self.index_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT m.external_id
+                FROM meetings m
+                JOIN sources s ON s.id = m.source_id
+                WHERE s.kind = ? AND s.path = ?
+                """,
+                (kind, path),
+            ).fetchall()
+        return {str(row["external_id"]) for row in rows}
+
+    def update_source_path_projection(self, kind: str, old_path: str, new_path: str) -> None:
+        with index_connection(self.index_path) as conn:
+            source = conn.execute(
+                "SELECT id FROM sources WHERE kind = ? AND path = ?",
+                (kind, old_path),
+            ).fetchone()
+            if source is None:
+                return
+            source_id = int(source["id"])
+            conn.execute("UPDATE sources SET path = ? WHERE id = ?", (new_path, source_id))
+            conn.execute(
+                "UPDATE meetings SET source_path = ? WHERE source_id = ?",
+                (new_path, source_id),
+            )
+            conn.commit()
+
     def get_meeting_by_external_id(self, source_id: int, external_id: str) -> dict[str, Any] | None:
         return self.meetings.get_meeting_by_external_id(source_id, external_id)
 
