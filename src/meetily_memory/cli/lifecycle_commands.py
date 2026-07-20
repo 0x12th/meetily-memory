@@ -8,6 +8,7 @@ from typing import Annotated, cast
 
 import typer
 
+from meetily_memory.cli.autosync_commands import autosync_runtime_status, enable_autosync
 from meetily_memory.cli.common import (
     console,
     make_typer,
@@ -48,8 +49,8 @@ def utc_now_iso() -> str:
 SOURCE_KIND = "meetily_sqlite"
 
 
-def migrated_source_settings(index_path: Path) -> AppSettings:
-    settings = load_app_settings()
+def migrated_source_settings(index_path: Path, settings_path: Path) -> AppSettings:
+    settings = load_app_settings(settings_path)
     repo = IndexRepository(index_path)
     if settings.source_uuid:
         return settings
@@ -60,13 +61,21 @@ def migrated_source_settings(index_path: Path) -> AppSettings:
         str(Path(settings.source_path).expanduser()),
         now=utc_now_iso(),
     )
-    return update_app_settings(source_uuid=source_uuid, source_path=None)
+    return update_app_settings(
+        settings_path=settings_path,
+        source_uuid=source_uuid,
+        source_path=None,
+    )
 
 
-def configured_source_path(index_path: Path, explicit_source: Path | None = None) -> Path | None:
+def configured_source_path(
+    index_path: Path,
+    settings_path: Path,
+    explicit_source: Path | None = None,
+) -> Path | None:
     if explicit_source is not None:
         return explicit_source
-    settings = migrated_source_settings(index_path)
+    settings = migrated_source_settings(index_path, settings_path)
     if settings.source_uuid:
         source = IndexRepository(index_path).user_state.get_source(settings.source_uuid)
         configured = Path(str(source["current_path"])).expanduser() if source else None
@@ -136,24 +145,35 @@ def init(
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    source_path = configured_source_path(ctx.obj["index_path"], source)
+    source_path = configured_source_path(ctx.obj["index_path"], ctx.obj["settings_path"], source)
     if source_path is None:
         message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
         raise typer.BadParameter(message)
-    enable_autosync = autosync
-    if enable_autosync is None:
-        enable_autosync = typer.confirm("Enable automatic index refreshes?", default=False)
+    should_enable_autosync = autosync
+    if should_enable_autosync is None:
+        should_enable_autosync = typer.confirm("Enable automatic index refreshes?", default=False)
     payload, _ = scan_update(ctx.obj["index_path"], source_path)
     repo = IndexRepository(ctx.obj["index_path"])
     source_uuid = repo.user_state.get_or_create_source(
         SOURCE_KIND, str(source_path), now=utc_now_iso()
     )
     settings = update_app_settings(
+        settings_path=ctx.obj["settings_path"],
         source_uuid=source_uuid,
         source_path=None,
-        autosync_enabled=enable_autosync,
+        autosync_enabled=False,
         last_update_at=utc_now_iso(),
     )
+    if should_enable_autosync:
+        try:
+            enable_autosync(
+                ctx.obj["index_path"],
+                ctx.obj["settings_path"],
+                interval_minutes=30,
+            )
+        except RuntimeError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        settings = load_app_settings(ctx.obj["settings_path"])
     response = {
         "initialized": True,
         "index_path": str(ctx.obj["index_path"]),
@@ -178,7 +198,8 @@ def status(
 ) -> None:
     index_path = ctx.obj["index_path"]
     repo = IndexRepository(index_path)
-    settings = migrated_source_settings(index_path)
+    settings = migrated_source_settings(index_path, ctx.obj["settings_path"])
+    autosync_status = autosync_runtime_status(ctx.obj["settings_path"], index_path)
     selected_source = (
         repo.user_state.get_source(settings.source_uuid) if settings.source_uuid else None
     )
@@ -187,14 +208,17 @@ def status(
     semantic_config = load_semantic_config()
     obsidian_configured = bool(settings.obsidian.vault_path)
     llm_provider = settings.llm.provider or "not configured"
-    resolved_ui_language = resolve_ui_language(index_path)
+    resolved_ui_language = resolve_ui_language(index_path, ctx.obj["settings_path"])
     payload = {
         "index_path": str(index_path),
         "source_path": source_path,
         "ui_language": settings.ui_language,
         "resolved_ui_language": resolved_ui_language,
         "last_update_at": settings.last_update_at,
-        "autosync_enabled": settings.autosync_enabled,
+        "autosync_enabled": autosync_status.enabled,
+        "autosync_configured": autosync_status.configured,
+        "autosync_installed": autosync_status.installed,
+        "autosync_active": autosync_status.active,
         "semantic_provider": semantic_config.provider,
         "obsidian_configured": obsidian_configured,
         "llm_provider": settings.llm.provider,
@@ -208,7 +232,7 @@ def status(
     configured_label = "configured" if settings.ui_language else "auto"
     print_text_block(f"language: {resolved_ui_language} ({configured_label})")
     print_text_block(f"last refresh: {settings.last_update_at or 'never'}")
-    print_text_block(f"autosync: {'enabled' if settings.autosync_enabled else 'disabled'}")
+    print_text_block(f"autosync: {autosync_status.label}")
     print_text_block(f"semantic: {semantic_config.provider or 'not configured'}")
     print_text_block(f"obsidian: {'configured' if obsidian_configured else 'not configured'}")
     print_text_block(f"llm: {llm_provider}")
@@ -218,6 +242,7 @@ def status(
 
 @config_app.command("language")
 def config_language(
+    ctx: typer.Context,
     language: Annotated[
         str,
         typer.Argument(help="UI language: en, ru, or auto."),
@@ -226,9 +251,11 @@ def config_language(
 ) -> None:
     normalized = language.casefold().replace("_", "-").split("-", maxsplit=1)[0]
     if normalized == "auto":
-        settings = update_app_settings(ui_language=None)
+        settings = update_app_settings(settings_path=ctx.obj["settings_path"], ui_language=None)
     elif normalized in {"en", "ru"}:
-        settings = update_app_settings(ui_language=normalized)
+        settings = update_app_settings(
+            settings_path=ctx.obj["settings_path"], ui_language=normalized
+        )
     else:
         message = "UI language must be one of: en, ru, auto."
         raise typer.BadParameter(message)
@@ -256,11 +283,11 @@ def config_source(
         raise typer.BadParameter(schema_error or "Meetily DB schema is unsupported.")
     index_path = ctx.obj["index_path"]
     repo = IndexRepository(index_path)
-    settings = migrated_source_settings(index_path)
+    settings = migrated_source_settings(index_path, ctx.obj["settings_path"])
     payload = (
-        rebind_selected_source(repo, settings, new_path)
+        rebind_selected_source(repo, settings, new_path, ctx.obj["settings_path"])
         if rebind
-        else select_source(repo, new_path)
+        else select_source(repo, new_path, ctx.obj["settings_path"])
     )
     if json_output:
         print_json(payload)
@@ -274,16 +301,20 @@ def config_source(
     print_text_block(f"source uuid: {payload['source_uuid']}")
 
 
-def select_source(repo: IndexRepository, new_path: Path) -> dict[str, object]:
+def select_source(repo: IndexRepository, new_path: Path, settings_path: Path) -> dict[str, object]:
     source_uuid = repo.user_state.get_or_create_source(
         SOURCE_KIND, str(new_path), now=utc_now_iso()
     )
-    update_app_settings(source_uuid=source_uuid, source_path=None)
+    update_app_settings(
+        settings_path=settings_path,
+        source_uuid=source_uuid,
+        source_path=None,
+    )
     return {"source_uuid": source_uuid, "source_path": str(new_path), "rebound": False}
 
 
 def rebind_selected_source(
-    repo: IndexRepository, settings: AppSettings, new_path: Path
+    repo: IndexRepository, settings: AppSettings, new_path: Path, settings_path: Path
 ) -> dict[str, object]:
     if not settings.source_uuid:
         message = "No selected source is available to rebind."
@@ -299,7 +330,7 @@ def rebind_selected_source(
         raise typer.BadParameter(message)
     indexed_ids = repo.source_meeting_external_ids(SOURCE_KIND, old_path)
     if not indexed_ids:
-        return select_source(repo, new_path)
+        return select_source(repo, new_path, settings_path)
     matching = indexed_ids & meeting_external_ids(new_path)
     if not matching:
         message = "The new source has no matching meeting IDs."
@@ -307,7 +338,11 @@ def rebind_selected_source(
 
     repo.user_state.update_source_path(settings.source_uuid, str(new_path), now=utc_now_iso())
     repo.update_source_path_projection(SOURCE_KIND, old_path, str(new_path))
-    update_app_settings(source_uuid=settings.source_uuid, source_path=None)
+    update_app_settings(
+        settings_path=settings_path,
+        source_uuid=settings.source_uuid,
+        source_path=None,
+    )
     return {
         "source_uuid": settings.source_uuid,
         "old_source_path": old_path,
@@ -334,7 +369,7 @@ def scan(
         typer.Option("--analyze/--no-analyze", help="Analyze new or changed meetings."),
     ] = True,
 ) -> None:
-    source_path = configured_source_path(ctx.obj["index_path"], source)
+    source_path = configured_source_path(ctx.obj["index_path"], ctx.obj["settings_path"], source)
     if source_path is None:
         message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
         raise typer.BadParameter(message)
@@ -376,11 +411,11 @@ def refresh(
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    source_path = configured_source_path(ctx.obj["index_path"], source)
+    source_path = configured_source_path(ctx.obj["index_path"], ctx.obj["settings_path"], source)
     if source_path is None:
         message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
         raise typer.BadParameter(message)
-    settings = load_app_settings()
+    settings = load_app_settings(ctx.obj["settings_path"])
     run_semantic = semantic or bool(load_semantic_config().provider)
     payload, _ = scan_update(ctx.obj["index_path"], source_path, semantic=run_semantic)
     repo = IndexRepository(ctx.obj["index_path"])
@@ -388,6 +423,7 @@ def refresh(
         SOURCE_KIND, str(source_path), now=utc_now_iso()
     )
     settings = update_app_settings(
+        settings_path=ctx.obj["settings_path"],
         source_uuid=source_uuid,
         source_path=None,
         last_update_at=utc_now_iso(),

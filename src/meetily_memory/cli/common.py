@@ -79,11 +79,11 @@ def core_from_context(ctx: typer.Context) -> MeetilyMemoryCore:
 
 
 def ui_language_from_context(ctx: typer.Context) -> str:
-    return resolve_ui_language(ctx.obj["index_path"])
+    return resolve_ui_language(ctx.obj["index_path"], ctx.obj["settings_path"])
 
 
-def resolve_ui_language(index_path: Path) -> str:
-    settings = load_app_settings()
+def resolve_ui_language(index_path: Path, settings_path: Path | None = None) -> str:
+    settings = load_app_settings(settings_path)
     if settings.ui_language:
         return settings.ui_language
     indexed_language = normalize_ui_language(

@@ -67,8 +67,8 @@ class AppSettings:
         return payload
 
 
-def load_app_settings() -> AppSettings:
-    path = app_config_path()
+def load_app_settings(path: Path | None = None) -> AppSettings:
+    path = path or app_config_path()
     if not path.exists():
         return AppSettings()
     payload = loads_json(path.read_text())
@@ -92,15 +92,15 @@ def load_app_settings() -> AppSettings:
     )
 
 
-def save_app_settings(settings: AppSettings) -> Path:
-    path = app_config_path()
+def save_app_settings(settings: AppSettings, path: Path | None = None) -> Path:
+    path = path or app_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(dumps_json(settings.as_payload()) + "\n", encoding="utf-8")
     return path
 
 
-def update_app_settings(**changes: object) -> AppSettings:
-    settings = load_app_settings()
+def update_app_settings(*, settings_path: Path | None = None, **changes: object) -> AppSettings:
+    settings = load_app_settings(settings_path)
     updated = AppSettings(
         source_path=string_change(changes, "source_path", settings.source_path),
         source_uuid=string_change(changes, "source_uuid", settings.source_uuid),
@@ -117,7 +117,7 @@ def update_app_settings(**changes: object) -> AppSettings:
         llm=llm_change(changes.get("llm"), settings.llm),
         semantic=semantic_change(changes.get("semantic"), settings.semantic),
     )
-    save_app_settings(updated)
+    save_app_settings(updated, settings_path)
     return updated
 
 

@@ -35,6 +35,31 @@ def test_legacy_source_path_migrates_idempotently_to_selected_uuid(
         assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 1
 
 
+def test_explicit_index_keeps_source_settings_out_of_user_data(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    fake_home = tmp_path / "home"
+    user_data_dir = fake_home / "Library" / "Application Support" / "meetily-memory"
+    user_data_dir.mkdir(parents=True)
+    user_settings = user_data_dir / "settings.json"
+    user_settings.write_text(json.dumps({"ui_language": "ru"}) + "\n")
+    workspace = tmp_path / "workspace"
+    index_path = workspace / "index.sqlite"
+    runner = CliRunner()
+
+    refresh = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env={"HOME": str(fake_home), "MEETILY_MEMORY_DATA_DIR": ""},
+    )
+
+    assert refresh.exit_code == 0
+    assert loads_json(user_settings.read_text()) == {"ui_language": "ru"}
+    workspace_settings = loads_json((workspace / "settings.json").read_text())
+    assert workspace_settings["source_uuid"]
+    assert workspace_settings["last_update_at"]
+
+
 def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     meetily_db: Path, tmp_path: Path
 ) -> None:

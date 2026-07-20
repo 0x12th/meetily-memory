@@ -96,6 +96,37 @@ def test_cli_config_language_persists_ui_language(tmp_path: Path) -> None:
     assert config["ui_language"] is None
 
 
+def test_cli_autosync_status_reports_missing_scheduler(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "settings.json").write_text(
+        json.dumps({"autosync_enabled": True}) + "\n",
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+
+    status = runner.invoke(
+        app,
+        ["autosync", "status", "--json"],
+        env={"HOME": str(tmp_path / "home"), "MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+
+    assert status.exit_code == 0
+    payload = loads_json(status.stdout)
+    assert payload["configured"] is True
+    assert payload["installed"] is False
+    assert payload["active"] is False
+    assert payload["enabled"] is False
+
+    main_status = runner.invoke(
+        app,
+        ["--index", str(tmp_path / "index.sqlite"), "status"],
+        env={"HOME": str(tmp_path / "home"), "MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+    assert main_status.exit_code == 0
+    assert "autosync: misconfigured" in main_status.stdout
+
+
 def scan_twice(runner: CliRunner, index_path: Path, meetily_db: Path) -> None:
     scan = runner.invoke(
         app,

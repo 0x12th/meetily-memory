@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -13,6 +14,7 @@ from meetily_memory.cli.obsidian_commands import obsidian_app
 from meetily_memory.cli.search_commands import app as search_app
 from meetily_memory.cli.semantic_commands import app as semantic_root_app
 from meetily_memory.cli.semantic_commands import semantic_app
+from meetily_memory.config.paths import app_config_path
 
 app = make_typer(
     "Local Meetily history index.\n\n"
@@ -53,7 +55,14 @@ def callback(
     ] = False,
 ) -> None:
     del version_output
-    ctx.obj = {"index_path": index_option(index)}
+    index_path = index_option(index)
+    explicit_data_dir = os.environ.get("MEETILY_MEMORY_DATA_DIR")
+    settings_path = (
+        app_config_path()
+        if index is None or explicit_data_dir
+        else index_path.with_name("settings.json")
+    )
+    ctx.obj = {"index_path": index_path, "settings_path": settings_path}
 
 
 def main() -> None:
