@@ -9,7 +9,7 @@ This page describes the public command model after scope narrowing.
 | `mm init` | First-run setup. Discovers the Meetily DB, creates `index.sqlite`, runs the first refresh, and asks before enabling automatic index refreshes. |
 | `mm refresh` | Main manual index refresh. Reads the Meetily DB, updates the local index, and rebuilds structured memory. If semantic search or Obsidian are configured, it also refreshes those derived layers. |
 | `mm update` | Updates the installed `meetily-memory` utility through Homebrew. |
-| `mm status` | Short system state: Meetily DB path, index path, UI language, last refresh, autosync, Obsidian, LLM, and semantic status. |
+| `mm status` | Short system state: Meetily DB path, index path, UI language, last refresh, actual autosync scheduler state, Obsidian, LLM, and semantic status. |
 | `mm doctor` | Diagnostics only. Checks Meetily DB access/schema, SQLite/FTS5/sqlite-vec support, index permissions, and config. It does not change state. |
 | `mm config language ru` | Stores the stable CLI UI language. Supported values are `en`, `ru`, and `auto`. |
 | `mm config source NEW_PATH` | Selects a validated Meetily DB as a new source identity. |
@@ -100,12 +100,16 @@ Managed notes use:
 
 | Command | Public role |
 |---|---|
-| `mm autosync start` | Installs or starts the background refresh job. On macOS this is launchd; on Linux it is systemd when available. |
-| `mm autosync stop` | Disables automatic refreshes and removes generated launchd/systemd files when present. |
-| `mm autosync status` | Shows whether automatic refreshes are enabled and when they last ran. |
+| `mm autosync start` | Installs and activates the background refresh job. On macOS this is launchd; on Linux it is systemd when available. |
+| `mm autosync stop` | Stops automatic refreshes and removes generated launchd/systemd files when present. |
+| `mm autosync status` | Verifies saved configuration, scheduler installation, runtime registration, and the last successful refresh. |
 
 The background cycle runs `mm refresh`, then semantic indexing if configured, then
 Obsidian sync if configured.
+
+Autosync status is `enabled` only when configuration, scheduler files, and runtime registration
+agree. A `misconfigured` status can be repaired by rerunning `mm autosync start`. Background
+stdout and stderr are stored in the Meetily Memory data directory.
 
 There should be no separate public watch command.
 

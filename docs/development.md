@@ -6,6 +6,10 @@ comparison workflow.
 See [Core contracts and persistent user state](contracts.md) for v1/v2 compatibility and the
 schema-v4 user-state migration boundary.
 
+An explicit `--index` without `MEETILY_MEMORY_DATA_DIR` uses `settings.json` beside that index.
+This keeps temporary CLI workspaces and tests from changing the default desktop configuration.
+Set `MEETILY_MEMORY_DATA_DIR` when an alternate index should intentionally share a data directory.
+
 Development setup:
 
 ```bash

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1 - 2026-07-20
+
+- Prevent commands using an explicit temporary `--index` from replacing the selected source
+  in the default user settings.
+- Make `mm autosync start` install and activate the launchd or systemd scheduler instead of
+  only storing an enabled flag.
+- Make `mm init --autosync`, `mm autosync stop`, and both status commands manage and report
+  the real scheduler lifecycle.
+- Pin background refreshes to their index and data directory, keep the executable path stable
+  across Homebrew upgrades, and write dedicated autosync stdout/stderr logs.
+- Report `autosync: misconfigured` when saved configuration, scheduler files, and runtime state
+  disagree.
+
 ## 0.4.0 - 2026-07-18
 
 - Add `mm config source NEW_PATH` for selecting a validated Meetily database and

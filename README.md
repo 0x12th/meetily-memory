@@ -192,6 +192,25 @@ mm refresh
 
 Refresh the local index when automatic refreshes are disabled.
 
+### Automatic Refresh
+
+Install and start a background refresh every 30 minutes:
+
+```bash
+mm autosync start
+```
+
+Verify both the saved configuration and the operating-system scheduler:
+
+```bash
+mm autosync status
+```
+
+`enabled` means the launchd or systemd job is installed and active. `misconfigured` means
+the saved setting and scheduler state disagree; rerun `mm autosync start` to repair it.
+Background output is written to `autosync.stdout.log` and `autosync.stderr.log` in the
+Meetily Memory data directory.
+
 ### Move Or Restore The Meetily Database
 
 Select a different validated Meetily database as a new source:
