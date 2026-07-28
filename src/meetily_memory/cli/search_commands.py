@@ -75,7 +75,7 @@ def print_search_excerpt(result: dict[str, object]) -> None:
     console.print()
 
 
-@app.command("c")
+@app.command("c", hidden=True)
 def context(
     ctx: typer.Context,
     question: str,
@@ -89,7 +89,7 @@ def context(
     print_text_block(str(data["markdown"]))
 
 
-@app.command("t")
+@app.command("t", hidden=True)
 def topic_memory(
     ctx: typer.Context,
     query: str,

@@ -21,28 +21,34 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert "Options:" in help_result.stdout
     assert "Commands:" in help_result.stdout
     assert "--version" in help_result.stdout
-    assert "Everyday:" in help_result.stdout
-    assert "Experimental:" in help_result.stdout
+    assert "Local search over Meetily meeting history." in help_result.stdout
+    assert "Main workflow:" in help_result.stdout
+    assert "mm s QUERY" in help_result.stdout
+    assert "mm open ID" in help_result.stdout
     assert "\n  ask" not in help_result.stdout
     assert "ask answers" not in help_result.stdout
     assert "--install-completion" not in help_result.stdout
     assert "--show-completion" not in help_result.stdout
     assert "╭" not in help_result.stdout
 
-    assert "init" in help_result.stdout
-    assert "status" in help_result.stdout
-    assert "config" in help_result.stdout
-    assert "llm" in help_result.stdout
-    assert "obsidian" in help_result.stdout
-    assert "Obsidian" in help_result.stdout
-    assert "autosync" in help_result.stdout
-    assert "\n  t\n" in help_result.stdout
-    assert "\n  topic" not in help_result.stdout
-    assert "export" not in help_result.stdout
-    assert "spotlight" not in help_result.stdout
-    assert "graph" not in help_result.stdout
-    assert "project" not in help_result.stdout
-    assert "person" not in help_result.stdout
+    for command in ("init", "status", "refresh", "update", "doctor", "s", "open", "autosync"):
+        assert f"\n  {command}" in help_result.stdout
+    for command in (
+        "scan",
+        "analyze",
+        "c",
+        "t",
+        "topic",
+        "sem",
+        "semantic",
+        "ask",
+        "llm",
+        "obsidian",
+        "config",
+        "db",
+        "mcp",
+    ):
+        assert f"\n  {command}" not in help_result.stdout
 
     open_help = runner.invoke(app, ["open", "--help"])
     assert open_help.exit_code == 0
@@ -53,6 +59,32 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert obsidian_init_help.exit_code == 0
     assert "--sync-after-refresh" in obsidian_init_help.stdout
     assert "--sync-after-update" not in obsidian_init_help.stdout
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (("scan",), "--source"),
+        (("analyze",), "MEETING_ID"),
+        (("c",), "QUESTION"),
+        (("t",), "QUERY"),
+        (("sem",), "QUERY"),
+        (("semantic",), "search"),
+        (("llm",), "init"),
+        (("obsidian",), "sync"),
+        (("config",), "source"),
+        (("db",), "status"),
+        (("mcp",), "serve"),
+    ],
+)
+def test_hidden_commands_remain_directly_accessible(
+    command: tuple[str, ...],
+    expected: str,
+) -> None:
+    result = CliRunner().invoke(app, [*command, "--help"])
+
+    assert result.exit_code == 0
+    assert expected in result.stdout
 
 
 def test_cli_version_outputs_package_version() -> None:

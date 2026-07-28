@@ -352,7 +352,7 @@ def rebind_selected_source(
     }
 
 
-@app.command()
+@app.command(hidden=True)
 def scan(
     ctx: typer.Context,
     source: Annotated[
@@ -513,7 +513,7 @@ def mcp_serve(
     run_mcp_server(ctx.obj["index_path"], transport=cast("MCPTransport", transport))
 
 
-@app.command()
+@app.command(hidden=True)
 def analyze(
     ctx: typer.Context,
     meeting_id: Annotated[

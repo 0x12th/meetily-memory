@@ -81,7 +81,7 @@ def semantic_search_command(
 
 
 semantic_app.command("search")(semantic_search_command)
-app.command("sem")(semantic_search_command)
+app.command("sem", hidden=True)(semantic_search_command)
 
 
 @semantic_app.command("init")
