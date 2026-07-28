@@ -15,6 +15,7 @@ from meetily_memory.cli.common import (
 )
 from meetily_memory.cli.renderers import print_topic_memory
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT
+from meetily_memory.core import CORE_V3_VERSION
 from meetily_memory.db.repository import IndexRepository
 
 app = make_typer("Search and context commands.")
@@ -31,7 +32,16 @@ def search(
     ] = 0,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    results = core_from_context(ctx).search(query, limit, context).data["results"]
+    results = (
+        core_from_context(ctx)
+        .search(
+            query,
+            limit,
+            context,
+            contract_version=CORE_V3_VERSION,
+        )
+        .data["results"]
+    )
     if json_output:
         print_json(results)
         return

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0 - 2026-07-28
+
+- Focus the public workflow on meeting search, opening original records, and explicit
+  meeting tags.
+- Add persistent tags in `state.sqlite`, including add, remove, list, and non-mutating
+  suggestions based on existing tags.
+- Return one ranked result per meeting from `mm s`, combining exact tag matches, lexical
+  evidence, and token-level tag matches with bounded source context.
+- Add the opt-in Core v3 meeting-result contract while preserving the existing Core v1 and
+  v2 payloads for API and MCP consumers.
+- Extend retrieval evaluation with meeting-level and tag-only tasks, reproducible fingerprints,
+  and strict semantic-index coverage checks.
+- Keep hybrid lexical/semantic retrieval experimental: it remains disabled until its promotion
+  gate demonstrates improvements on semantic and paraphrase tasks without regressions.
+
 ## 0.4.1 - 2026-07-20
 
 - Prevent commands using an explicit temporary `--index` from replacing the selected source

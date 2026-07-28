@@ -55,8 +55,10 @@ uv run scripts/evaluate-retrieval.py \
 ```
 
 Use `mm semantic status` to verify that every current chunk has matching metadata and a vector
-row for the selected provider, model, and dimensions. Hybrid skips semantic completely when
-coverage is partial or stale, and falls back to FTS plus tags if semantic query execution fails.
+row for the selected provider, model, and dimensions. The evaluation runner rejects an incomplete
+or stale semantic index instead of allowing the regression gate to certify an FTS-plus-tags
+fallback as hybrid. Runtime hybrid retrieval still falls back when semantic query execution
+fails.
 
 Hybrid evaluation never creates embeddings during a query. It records the provider, model,
 dimension, RRF constant, candidate multiplier, FTS/semantic/tag weights, and warmup in the

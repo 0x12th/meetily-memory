@@ -1,5 +1,6 @@
 import re
 import sqlite3
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -471,16 +472,14 @@ class TagService:
                 self.index_repository.index_path,
                 provider,
             )
-            if not coverage.complete:
-                return tuple(suggestions)
-            rows = semantic_search(
-                self.index_repository.index_path,
-                document[:SEMANTIC_SUGGESTION_QUERY_LENGTH],
-                SEMANTIC_SUGGESTION_CANDIDATES,
-                embedding_provider=provider,
-            )
         except (RuntimeError, sqlite3.Error):
             return tuple(suggestions)
+        if not coverage.complete:
+            return tuple(suggestions)
+        source = self._semantic_suggestion_source(identity, document, provider)
+        if source is None:
+            return tuple(suggestions)
+        similar_meeting_id, tags = source
         assigned = {
             tag.normalized_name
             for tag in self.repository.list_for_meeting(
@@ -489,33 +488,61 @@ class TagService:
             )
         }
         suggested = {item.tag.normalized_name for item in suggestions}
-        for row in rows:
-            hit = self.index_repository.search_hit_from_row(row)
-            key = (hit.meeting.source_uuid, hit.meeting.external_id)
-            if key == (identity.source_uuid, identity.meeting_external_id):
+        for tag in tags:
+            if len(suggestions) >= TAG_SUGGESTION_LIMIT:
+                break
+            if tag.normalized_name in assigned or tag.normalized_name in suggested:
                 continue
-            tags = self.repository.list_for_meeting(*key)
-            if not tags:
-                continue
-            resolved = self.index_repository.meeting_ref_by_identity(*key)
-            if resolved is None:
-                continue
-            similar_meeting_id, _ = resolved
-            for tag in tags:
-                if len(suggestions) >= TAG_SUGGESTION_LIMIT:
-                    break
-                if tag.normalized_name in assigned or tag.normalized_name in suggested:
-                    continue
-                suggestions.append(
-                    TagSuggestion(
-                        tag=tag,
-                        reason="similar meeting",
-                        similar_meeting_id=similar_meeting_id,
-                    )
+            suggestions.append(
+                TagSuggestion(
+                    tag=tag,
+                    reason="similar meeting",
+                    similar_meeting_id=similar_meeting_id,
                 )
-                suggested.add(tag.normalized_name)
-            break
+            )
+            suggested.add(tag.normalized_name)
         return tuple(suggestions)
+
+    def _semantic_suggestion_source(
+        self,
+        identity: MeetingTagIdentity,
+        document: str,
+        provider: EmbeddingProvider,
+    ) -> tuple[int, tuple[Tag, ...]] | None:
+        target_key = (identity.source_uuid, identity.meeting_external_id)
+        try:
+            batches = self._semantic_candidate_batches(document, provider)
+            for rows in batches:
+                for row in rows:
+                    hit = self.index_repository.search_hit_from_row(row)
+                    key = (hit.meeting.source_uuid, hit.meeting.external_id)
+                    if key == target_key:
+                        continue
+                    tags = self.repository.list_for_meeting(*key)
+                    resolved = self.index_repository.meeting_ref_by_identity(*key)
+                    if tags and resolved is not None:
+                        return resolved[0], tags
+        except (RuntimeError, sqlite3.Error):
+            return None
+        return None
+
+    def _semantic_candidate_batches(
+        self,
+        document: str,
+        provider: EmbeddingProvider,
+    ) -> Iterator[list[dict[str, object]]]:
+        candidate_limit = SEMANTIC_SUGGESTION_CANDIDATES
+        while True:
+            rows = semantic_search(
+                self.index_repository.index_path,
+                document[:SEMANTIC_SUGGESTION_QUERY_LENGTH],
+                candidate_limit,
+                embedding_provider=provider,
+            )
+            yield rows
+            if len(rows) < candidate_limit:
+                return
+            candidate_limit *= 2
 
     def _assignment_is_active(self, assignment: TagAssignment) -> bool:
         return (

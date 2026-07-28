@@ -36,7 +36,7 @@ async def test_mcp_tools_are_thin_core_adapters(meetily_db: Path, tmp_path: Path
     search = await call_payload(server, "search", {"query": "migration risks", "limit": 3})
     assert search["kind"] == "search"
     assert search["contract_version"] == "meetily-memory.core.v1"
-    assert search["data"]["results"][0]["meeting"]["external_id"] == "meeting-2"
+    assert search["data"]["results"][0]["meeting_external_id"] == "meeting-2"
 
     context = await call_payload(
         server,
@@ -52,9 +52,7 @@ async def test_mcp_tools_are_thin_core_adapters(meetily_db: Path, tmp_path: Path
 
 
 @pytest.mark.anyio
-async def test_mcp_search_and_context_require_explicit_v2_selection(
-    meetily_db: Path, tmp_path: Path
-) -> None:
+async def test_mcp_search_contract_versions_are_explicit(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
     server = create_mcp_server(index_path)
@@ -66,6 +64,15 @@ async def test_mcp_search_and_context_require_explicit_v2_selection(
             "query": "migration risks",
             "limit": 3,
             "contract_version": "meetily-memory.core.v2",
+        },
+    )
+    meeting_search = await call_payload(
+        server,
+        "search",
+        {
+            "query": "migration risks",
+            "limit": 3,
+            "contract_version": "meetily-memory.core.v3",
         },
     )
     context = await call_payload(
@@ -80,6 +87,13 @@ async def test_mcp_search_and_context_require_explicit_v2_selection(
 
     assert search["contract_version"] == "meetily-memory.core.v2"
     assert set(search["data"]["results"][0]) == {
+        "id",
+        "meeting",
+        "excerpt",
+        "is_context",
+    }
+    assert meeting_search["contract_version"] == "meetily-memory.core.v3"
+    assert set(meeting_search["data"]["results"][0]) == {
         "meeting_id",
         "meeting",
         "rank",

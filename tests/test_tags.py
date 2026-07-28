@@ -7,7 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
-from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.core import CORE_V3_VERSION, MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import (
@@ -17,6 +17,15 @@ from meetily_memory.semantic_search import (
 from meetily_memory.tagging import TagService
 from meetily_memory.user_state import UserStateRepository
 from tests.semantic_helpers import requires_sqlite_vec
+
+
+class TargetBiasedEmbeddingProvider:
+    name = "target-biased"
+    model = "target-biased-v1"
+    dims: int | None = 2
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[0.0, 1.0] if text == "other semantic topic" else [1.0, 0.0] for text in texts]
 
 
 def test_tag_repository_normalizes_assigns_idempotently_and_removes_unused_tags(
@@ -283,8 +292,14 @@ def test_search_returns_meetings_with_real_or_empty_evidence(
     service = service_class(core.repo)
     service.assign(("2",), ("Сбер",))
 
-    tag_only = core.search("сбер").data["results"]
-    lexical = core.search("migration risks").data["results"]
+    tag_only = core.search(
+        "сбер",
+        contract_version=CORE_V3_VERSION,
+    ).data["results"]
+    lexical = core.search(
+        "migration risks",
+        contract_version=CORE_V3_VERSION,
+    ).data["results"]
 
     assert len(tag_only) == 1
     assert tag_only[0]["meeting_id"] == 2
@@ -312,8 +327,14 @@ def test_search_orders_exact_tag_before_lexical_before_token_tag(
     service = service_class(core.repo)
     service.assign(("2",), ("pricing decision",))
 
-    exact_then_lexical = core.search("pricing decision").data["results"]
-    lexical_then_token = core.search("pricing").data["results"]
+    exact_then_lexical = core.search(
+        "pricing decision",
+        contract_version=CORE_V3_VERSION,
+    ).data["results"]
+    lexical_then_token = core.search(
+        "pricing",
+        contract_version=CORE_V3_VERSION,
+    ).data["results"]
 
     assert [result["meeting_id"] for result in exact_then_lexical[:2]] == [2, 1]
     assert exact_then_lexical[0]["match_sources"] == ["tag"]
@@ -373,6 +394,65 @@ def test_tag_suggestions_prioritize_title_text_then_similar_meeting(
         ("Launch Planning", "title match", None),
         ("pricing decision", "text match", None),
         ("migration-team", "similar meeting", 2),
+    ]
+
+
+@requires_sqlite_vec
+def test_tag_suggestions_skip_all_target_chunks_to_find_another_meeting(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    with sqlite3.connect(meetily_db) as conn:
+        conn.execute("DELETE FROM transcripts")
+        conn.execute("DELETE FROM summary_processes")
+        conn.execute("DELETE FROM meeting_notes")
+        conn.executemany(
+            """
+            INSERT INTO transcripts (
+                id, meeting_id, transcript, timestamp, audio_start_time,
+                audio_end_time, duration, speaker
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    f"target-{ordinal}",
+                    "meeting-1",
+                    "target semantic topic",
+                    f"10:{ordinal:02d}:00",
+                    float(ordinal),
+                    float(ordinal + 1),
+                    1.0,
+                    "Alice",
+                )
+                for ordinal in range(60)
+            ]
+            + [
+                (
+                    "other-1",
+                    "meeting-2",
+                    "other semantic topic",
+                    "11:00:00",
+                    0.0,
+                    1.0,
+                    1.0,
+                    "Bob",
+                )
+            ],
+        )
+        conn.commit()
+    index_path = tmp_path / "index.sqlite"
+    state_path = tmp_path / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    provider = TargetBiasedEmbeddingProvider()
+    index_semantic_embeddings(index_path, embedding_provider=provider)
+    service = TagService(IndexRepository(index_path, state_path=state_path))
+    service.assign(("2",), ("private-label",))
+
+    suggestions = service.suggest("1", embedding_provider=provider)
+
+    assert [(item.tag.display_name, item.similar_meeting_id) for item in suggestions] == [
+        ("private-label", 2)
     ]
 
 

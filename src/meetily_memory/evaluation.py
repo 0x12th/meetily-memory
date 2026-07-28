@@ -10,12 +10,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
 from time import perf_counter
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar
 
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.domain import MeetingSearchResult, RetrievalSource, SearchHit
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
-from meetily_memory.retrieval import LexicalRetrievalStrategy, RetrievalStrategy
+from meetily_memory.retrieval import (
+    LexicalRetrievalStrategy,
+    MeetingRetrievalStrategy,
+    RetrievalStrategy,
+)
 from meetily_memory.tagging import TagRepository
 
 EVALUATION_SCHEMA_VERSION = "meetily-memory.eval.v2"
@@ -229,15 +233,6 @@ class EvaluationManifest:
             for field in self.COMPATIBILITY_FIELDS
             if getattr(self, field) != getattr(other, field)
         ]
-
-
-class MeetingRetrievalStrategy(Protocol):
-    def search_meetings(
-        self,
-        query: str,
-        limit: int = 10,
-        context: int = 0,
-    ) -> tuple[MeetingSearchResult, ...]: ...
 
 
 @dataclass(frozen=True)

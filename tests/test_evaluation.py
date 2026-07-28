@@ -1,3 +1,4 @@
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass, replace
@@ -287,6 +288,51 @@ def test_evaluation_script_runs_explicit_hybrid_mode(meetily_db: Path, tmp_path:
     assert report["manifest"]["semantic_model"] == "local-hash-v1"
     assert report["manifest"]["retrieval_parameters"]["warmed_up"] is True
     assert report["cold_start_latency_ms"] >= 0
+
+
+@requires_sqlite_vec
+def test_evaluation_script_rejects_incomplete_hybrid_index(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    output_path = tmp_path / "hybrid.json"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    index_semantic_embeddings(
+        index_path,
+        embedding_provider=LocalHashEmbeddingProvider(),
+    )
+    with sqlite3.connect(index_path) as conn:
+        conn.execute(
+            """
+            DELETE FROM chunk_embeddings
+            WHERE chunk_id = (SELECT MIN(chunk_id) FROM chunk_embeddings)
+            """
+        )
+        conn.commit()
+
+    result = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/evaluate-retrieval.py",
+            "tests/fixtures/evaluation/synthetic_dataset.json",
+            "--index",
+            str(index_path),
+            "--output",
+            str(output_path),
+            "--retrieval",
+            "hybrid",
+            "--embedding-provider",
+            "hash",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "semantic index is incomplete" in result.stderr
+    assert not output_path.exists()
 
 
 def test_report_comparison_is_paired_by_task_and_class() -> None:

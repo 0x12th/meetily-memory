@@ -108,7 +108,10 @@ def main() -> None:
         }
         semantic_provider = provider.name
         semantic_model = provider.model
-        semantic_dimension = semantic_index_coverage(args.index, provider).dimensions
+        coverage = semantic_index_coverage(args.index, provider)
+        if not coverage.complete:
+            parser.error("semantic index is incomplete for the selected provider/model.")
+        semantic_dimension = coverage.dimensions
         if semantic_dimension is None:
             parser.error("No indexed dimensions found for the selected semantic provider/model.")
 

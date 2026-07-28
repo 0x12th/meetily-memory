@@ -25,6 +25,15 @@ class RetrievalStrategy(Protocol):
     ) -> tuple[SearchHit, ...]: ...
 
 
+class MeetingRetrievalStrategy(Protocol):
+    def search_meetings(
+        self,
+        query: str,
+        limit: int = 10,
+        context: int = 0,
+    ) -> tuple[MeetingSearchResult, ...]: ...
+
+
 @dataclass(frozen=True)
 class LexicalRetrievalStrategy:
     repository: IndexRepository
@@ -62,6 +71,60 @@ class TagRetrievalStrategy:
 
     def search(self, query: str) -> tuple[TagMatch, ...]:
         return self.repository.search(query)
+
+
+@dataclass(frozen=True)
+class LexicalTagMeetingRetrievalStrategy:
+    repository: IndexRepository
+    lexical: RetrievalStrategy
+    tags: TagRetrievalStrategy
+    candidate_multiplier: int = HYBRID_CANDIDATE_MULTIPLIER
+
+    def search_meetings(
+        self,
+        query: str,
+        limit: int = 10,
+        context: int = 0,
+    ) -> tuple[MeetingSearchResult, ...]:
+        fts_ranks, fts_evidence = collect_hits_by_meeting(
+            self.lexical,
+            query,
+            limit,
+            candidate_multiplier=self.candidate_multiplier,
+        )
+        exact_tag_order, token_tag_order, matched_tags = tag_candidates(
+            self.repository,
+            self.tags,
+            query,
+        )
+        ordered_keys = tuple(dict.fromkeys((*exact_tag_order, *fts_ranks, *token_tag_order)))
+        results: list[MeetingSearchResult] = []
+        for key in ordered_keys[:limit]:
+            resolved = self.repository.meeting_ref_by_identity(*key)
+            if resolved is None:
+                continue
+            meeting_id, meeting = resolved
+            evidence = fts_evidence.get(key, ())
+            if context and evidence:
+                evidence = self.repository.expand_search_hits(evidence, context)
+            sources: list[RetrievalSource] = []
+            if key in exact_tag_order:
+                sources.append(RetrievalSource.TAG)
+            if key in fts_ranks:
+                sources.append(RetrievalSource.FTS)
+            if key in token_tag_order and RetrievalSource.TAG not in sources:
+                sources.append(RetrievalSource.TAG)
+            results.append(
+                MeetingSearchResult(
+                    meeting_id=meeting_id,
+                    meeting=meeting,
+                    rank=len(results) + 1,
+                    match_sources=tuple(sources),
+                    evidence=evidence,
+                    matched_tags=matched_tags.get(key, ()),
+                )
+            )
+        return tuple(results)
 
 
 @dataclass(frozen=True)
@@ -116,11 +179,16 @@ class HybridRetrievalStrategy:
         limit: int = 10,
         context: int = 0,
     ) -> RetrievalResult:
-        candidate_limit = max(limit, limit * self.candidate_multiplier)
-        lexical_hits = self.lexical.search(query, candidate_limit)
-        semantic_hits, semantic_status = self._semantic_hits(query, candidate_limit)
-        fts_ranks, fts_evidence = collapse_hits_by_meeting(lexical_hits)
-        semantic_ranks, semantic_evidence = collapse_hits_by_meeting(semantic_hits)
+        fts_ranks, fts_evidence = collect_hits_by_meeting(
+            self.lexical,
+            query,
+            limit,
+            candidate_multiplier=self.candidate_multiplier,
+        )
+        semantic_ranks, semantic_evidence, semantic_status = self._semantic_candidates(
+            query,
+            limit,
+        )
         tag_ranks, matched_tags = self._tag_candidates(query)
         candidate_keys = tuple(dict.fromkeys((*fts_ranks, *semantic_ranks, *tag_ranks)))
         traces = tuple(
@@ -179,11 +247,15 @@ class HybridRetrievalStrategy:
             ),
         )
 
-    def _semantic_hits(
+    def _semantic_candidates(
         self,
         query: str,
         limit: int,
-    ) -> tuple[tuple[SearchHit, ...], str]:
+    ) -> tuple[
+        dict[MeetingKey, int],
+        dict[MeetingKey, tuple[SearchHit, ...]],
+        str,
+    ]:
         if self.require_complete_semantic_index:
             try:
                 coverage = semantic_index_coverage(
@@ -191,36 +263,80 @@ class HybridRetrievalStrategy:
                     self.semantic_provider,
                 )
             except (RuntimeError, sqlite3.Error):
-                return (), "unavailable"
+                return {}, {}, "unavailable"
             if not coverage.complete:
-                return (), "incomplete"
+                return {}, {}, "incomplete"
             status = "complete"
         else:
             status = "forced"
         try:
-            return self.semantic.search(query, limit), status
+            result = collect_hits_by_meeting(
+                self.semantic,
+                query,
+                limit,
+                candidate_multiplier=self.candidate_multiplier,
+            )
         except (RuntimeError, sqlite3.Error):
-            return (), "error"
+            return {}, {}, "error"
+        else:
+            ranks, evidence = result
+            return ranks, evidence, status
 
     def _tag_candidates(
         self,
         query: str,
     ) -> tuple[dict[MeetingKey, int], dict[MeetingKey, tuple[str, ...]]]:
-        ordered_keys: list[MeetingKey] = []
-        names: dict[MeetingKey, list[str]] = {}
-        for match in self.tags.search(query):
-            key = (match.source_uuid, match.meeting_external_id)
-            if self.repository.get_meeting_by_identity(*key) is None:
-                continue
-            if key not in ordered_keys:
-                ordered_keys.append(key)
-            values = names.setdefault(key, [])
-            if match.tag.display_name not in values:
-                values.append(match.tag.display_name)
+        exact_order, token_order, names = tag_candidates(
+            self.repository,
+            self.tags,
+            query,
+        )
+        ordered_keys = [*exact_order, *(key for key in token_order if key not in exact_order)]
         return (
             {key: rank for rank, key in enumerate(ordered_keys, start=1)},
-            {key: tuple(values) for key, values in names.items()},
+            names,
         )
+
+
+def collect_hits_by_meeting(
+    strategy: RetrievalStrategy,
+    query: str,
+    meeting_limit: int,
+    *,
+    candidate_multiplier: int,
+) -> tuple[dict[MeetingKey, int], dict[MeetingKey, tuple[SearchHit, ...]]]:
+    candidate_limit = max(meeting_limit, meeting_limit * candidate_multiplier)
+    while True:
+        hits = strategy.search(query, candidate_limit)
+        ranks, evidence = collapse_hits_by_meeting(hits)
+        if len(ranks) >= meeting_limit or len(hits) < candidate_limit:
+            return ranks, evidence
+        candidate_limit *= 2
+
+
+def tag_candidates(
+    repository: IndexRepository,
+    tags: TagRetrievalStrategy,
+    query: str,
+) -> tuple[list[MeetingKey], list[MeetingKey], dict[MeetingKey, tuple[str, ...]]]:
+    exact_order: list[MeetingKey] = []
+    token_order: list[MeetingKey] = []
+    names: dict[MeetingKey, list[str]] = {}
+    for match in tags.search(query):
+        key = (match.source_uuid, match.meeting_external_id)
+        if repository.get_meeting_by_identity(*key) is None:
+            continue
+        order = exact_order if match.kind == "exact" else token_order
+        if key not in order:
+            order.append(key)
+        values = names.setdefault(key, [])
+        if match.tag.display_name not in values:
+            values.append(match.tag.display_name)
+    return (
+        exact_order,
+        token_order,
+        {key: tuple(values) for key, values in names.items()},
+    )
 
 
 def collapse_hits_by_meeting(

@@ -7,6 +7,7 @@ import pytest
 from meetily_memory.core import (
     CORE_V1_VERSION,
     CORE_V2_VERSION,
+    CORE_V3_VERSION,
     ContextRetrievalOptions,
     MeetilyMemoryCore,
 )
@@ -14,25 +15,37 @@ from meetily_memory.domain import CompactSearchHit, MemoryEntity, SearchHit
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 
 
-def test_core_v1_remains_default_and_v2_is_explicit(meetily_db: Path, tmp_path: Path) -> None:
+def test_search_contract_versions_preserve_old_shapes_and_add_meeting_v3(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
     core = MeetilyMemoryCore(index_path)
 
     v1 = core.search("migration risks", limit=3).as_payload()
     v2 = core.search("migration risks", limit=3, contract_version=CORE_V2_VERSION).as_payload()
+    v3 = core.search("migration risks", limit=3, contract_version=CORE_V3_VERSION).as_payload()
 
     fixture = json.loads(Path("tests/fixtures/core_v1_contract.json").read_text())
     assert v1["contract_version"] == fixture["contract_version"] == CORE_V1_VERSION
     assert set(v1["data"]) == set(fixture["search_data_fields"])
     assert set(v1["data"]["results"][0]) == set(fixture["search_result_fields"])
     assert v2["contract_version"] == CORE_V2_VERSION
-    assert set(v2["data"]["results"][0]) == set(fixture["search_result_fields"])
-    assert set(v2["data"]["results"][0]["evidence"][0]) == {
+    assert set(v2["data"]["results"][0]) == {
         "id",
         "meeting",
         "excerpt",
         "is_context",
+    }
+    assert v3["contract_version"] == CORE_V3_VERSION
+    assert set(v3["data"]["results"][0]) == {
+        "meeting_id",
+        "meeting",
+        "rank",
+        "match_sources",
+        "evidence",
+        "matched_tags",
     }
 
     context = core.build_context("migration risks", limit=3).as_payload()
@@ -100,9 +113,15 @@ def test_v2_context_is_data_only_and_uses_canonical_memory_entities(
     payload = core.build_context(
         "migration risks", limit=5, contract_version=CORE_V2_VERSION
     ).as_payload()
+    v3_payload = core.build_context(
+        "migration risks",
+        limit=5,
+        contract_version=CORE_V3_VERSION,
+    ).as_payload()
 
     assert "markdown" not in payload["data"]
     assert payload["data"] == bundle.as_payload()
+    assert v3_payload["data"] == bundle.as_payload()
     assert bundle.evidence
     assert all(isinstance(hit, SearchHit) for hit in bundle.evidence)
     assert all(isinstance(entity, MemoryEntity) for entity in bundle.entities)
@@ -123,7 +142,7 @@ def test_context_neighbors_are_explicit_without_changing_search_default(
     MeetilySQLiteScanner(index_path).scan(meetily_db)
     core = MeetilyMemoryCore(index_path)
 
-    search = core.search("migration risks", limit=3, contract_version=CORE_V2_VERSION)
+    search = core.search("migration risks", limit=3, contract_version=CORE_V3_VERSION)
     context = core.build_context("migration risks", limit=3, contract_version=CORE_V2_VERSION)
     expanded = core.build_context(
         "migration risks", limit=3, context=2, contract_version=CORE_V2_VERSION

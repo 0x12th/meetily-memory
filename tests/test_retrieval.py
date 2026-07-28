@@ -3,8 +3,8 @@ from pathlib import Path
 
 from meetily_memory import retrieval
 from meetily_memory.context_builder import ContextRenderer
-from meetily_memory.core import CORE_V2_VERSION, MeetilyMemoryCore
-from meetily_memory.domain import ContextBundle, SearchHit
+from meetily_memory.core import CORE_V2_VERSION, CORE_V3_VERSION, MeetilyMemoryCore
+from meetily_memory.domain import ContextBundle, MeetingSearchResult, RetrievalSource, SearchHit
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import LocalHashEmbeddingProvider, index_semantic_embeddings
@@ -26,7 +26,70 @@ class FixedRetrievalStrategy:
         return self.hits[:limit]
 
 
-def test_selected_strategy_drives_only_explicit_v2_search(
+@dataclass(frozen=True)
+class FixedMeetingRetrievalStrategy:
+    results: tuple[MeetingSearchResult, ...]
+
+    def search_meetings(
+        self,
+        query: str,
+        limit: int = 10,
+        context: int = 0,
+    ) -> tuple[MeetingSearchResult, ...]:
+        del query, context
+        return self.results[:limit]
+
+
+def test_core_delegates_public_search_to_meeting_retrieval_strategy(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    lexical_hit = MeetilyMemoryCore(index_path).search_hits("pricing decision")[0]
+    result = MeetingSearchResult(
+        meeting_id=1,
+        meeting=lexical_hit.meeting,
+        rank=1,
+        match_sources=(RetrievalSource.FTS,),
+        evidence=(lexical_hit,),
+        matched_tags=(),
+    )
+    core = MeetilyMemoryCore(
+        index_path,
+        meeting_retrieval_strategy=FixedMeetingRetrievalStrategy((result,)),
+    )
+
+    response = core.search_meetings("query ignored by strategy")
+
+    assert response == (result,)
+
+
+def test_meeting_retrieval_expands_candidates_until_limit_has_unique_meetings(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    core = MeetilyMemoryCore(index_path)
+    first = core.search_hits("pricing decision", 1)[0]
+    second = core.search_hits("migration risks", 1)[0]
+    saturated = FixedRetrievalStrategy((*((first,) * 40), second))
+    strategy = retrieval.LexicalTagMeetingRetrievalStrategy(
+        repository=core.repo,
+        lexical=saturated,
+        tags=retrieval.TagRetrievalStrategy(core.tag_repository),
+    )
+
+    results = strategy.search_meetings("query ignored by strategy", limit=2)
+
+    assert [result.meeting.external_id for result in results] == [
+        "meeting-1",
+        "meeting-2",
+    ]
+
+
+def test_selected_strategy_drives_only_explicit_v3_search(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
@@ -38,7 +101,7 @@ def test_selected_strategy_drives_only_explicit_v2_search(
         retrieval_strategy=FixedRetrievalStrategy((lexical_hit,)),
     )
 
-    search = core.search("query ignored by strategy", contract_version=CORE_V2_VERSION)
+    search = core.search("query ignored by strategy", contract_version=CORE_V3_VERSION)
     bundle = core.context_bundle("migration risks")
     context = core.build_context(
         "migration risks",

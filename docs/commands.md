@@ -1,6 +1,7 @@
 # Command Reference
 
-This page describes the public command model after scope narrowing.
+This page describes the focused public workflow and the advanced commands that remain
+available for compatibility and experiments.
 
 ## Core
 
@@ -11,18 +12,24 @@ This page describes the public command model after scope narrowing.
 | `mm update` | Updates the installed `meetily-memory` utility through Homebrew. |
 | `mm status` | Short system state: Meetily DB path, index path, UI language, last refresh, actual autosync scheduler state, Obsidian, LLM, and semantic status. |
 | `mm doctor` | Diagnostics only. Checks Meetily DB access/schema, SQLite/FTS5/sqlite-vec support, index permissions, and config. It does not change state. |
+| `mm tag add 10 11 migration` | Assigns an explicit tag to one or more meetings. Tags are user state stored separately from the rebuildable index. |
+| `mm tag list [MEETING_ID]` | Lists all active tags or the tags assigned to one meeting. |
+| `mm tag suggest MEETING_ID` | Suggests up to five existing tags without changing assignments. |
+| `mm tag remove 10 11 migration` | Removes a tag assignment from one or more meetings. |
 | `mm config language ru` | Stores the stable CLI UI language. Supported values are `en`, `ru`, and `auto`. |
 | `mm config source NEW_PATH` | Selects a validated Meetily DB as a new source identity. |
 | `mm config source NEW_PATH --rebind` | Explicitly moves the selected source identity after matching its Meetily schema and meeting IDs. |
 
 ## Search And Context
 
-`mm s QUERY --context 1` keeps ranked lexical matches first and appends adjacent source chunks
-afterward. Neighbor expansion is explicit; the default remains `--context 0`.
+`mm s QUERY` returns one ranked result per meeting. Exact tag matches rank first, followed by
+lexical transcript matches and token-level tag matches. Each result includes source evidence
+when available. `--context N` appends adjacent chunks around matching excerpts; the default
+remains `--context 0`.
 
 | Command | Public role |
 |---|---|
-| `mm s "migration risk"` | Fast FTS search over indexed meetings. Returns meeting id, title, chunk id, timestamp/source, and enough evidence to open the source. |
+| `mm s "migration risk"` | Meeting-level search over explicit tags and indexed transcript text. Returns the meeting, matched tags, source excerpts, and an `mm open` command. |
 | `mm s "migration risk" --context 2` | Expands each hit with neighboring chunks before and after the match. Use this when the matching snippet is too short. |
 | `mm open 12` | Opens the meeting folder so the original Meetily record can be inspected. |
 | `mm open 12 --source` | Opens the indexed source file/path. |

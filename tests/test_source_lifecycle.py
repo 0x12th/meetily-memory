@@ -81,7 +81,7 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     before = MeetilyMemoryCore(index_path)
     evidence_id = before.search("migration risks", limit=1, contract_version=CORE_V2_VERSION).data[
         "results"
-    ][0]["evidence"][0]["id"]
+    ][0]["id"]
     task = before.repo.list_structured_entity_details("action_items")[0]
     before.set_task_status(task["id"], "done", note="survives move")
     TagService(before.repo).assign(("1",), ("Сбер",))
@@ -106,7 +106,7 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     assert (
         after.search("migration risks", limit=1, contract_version=CORE_V2_VERSION).data["results"][
             0
-        ]["evidence"][0]["id"]
+        ]["id"]
         == evidence_id
     )
     matching_tasks = [
