@@ -22,6 +22,7 @@ from meetily_memory.evaluation import (
 from meetily_memory.json_codec import loads_json
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import LocalHashEmbeddingProvider, index_semantic_embeddings
+from meetily_memory.tagging import TagService
 from tests.semantic_helpers import requires_sqlite_vec
 
 
@@ -44,15 +45,88 @@ class FixedEvaluationStrategy:
 def test_synthetic_evaluation_dataset_is_valid() -> None:
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
 
-    assert dataset.schema_version == "meetily-memory.eval.v1"
+    assert dataset.schema_version == "meetily-memory.eval.v2"
     assert {evidence.relevance for task in dataset.tasks for evidence in task.expected} == {1, 2}
     assert all(task.critical_reason for task in dataset.tasks if task.critical)
+    assert all(task.expected_meetings for task in dataset.tasks)
+    assert next(task for task in dataset.tasks if task.task_class == "tag").expected == ()
+
+
+def test_v1_dataset_is_migrated_to_meeting_level_on_read(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "legacy-v1.json"
+    dataset_path.write_text(
+        """
+        {
+          "schema_version": "meetily-memory.eval.v1",
+          "dataset_version": "1",
+          "name": "legacy",
+          "tasks": [{
+            "id": "legacy",
+            "query": "pricing",
+            "class": "exact_match",
+            "critical": false,
+            "critical_reason": null,
+            "expected": [
+              {"evidence_id": "meeting-1/transcript-1", "relevance": 2},
+              {"evidence_id": "meeting-1/summary:meeting-1", "relevance": 1}
+            ]
+          }]
+        }
+        """
+    )
+
+    dataset = load_dataset(dataset_path)
+
+    assert dataset.schema_version == "meetily-memory.eval.v2"
+    assert dataset.tasks[0].expected_meetings == ("meeting-1",)
+
+
+def test_v2_dataset_accepts_tag_only_and_semantic_classes(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "meeting-v2.json"
+    dataset_path.write_text(
+        """
+        {
+          "schema_version": "meetily-memory.eval.v2",
+          "dataset_version": "2",
+          "name": "meeting-level",
+          "tasks": [
+            {
+              "id": "tag-only",
+              "query": "private-label",
+              "class": "tag",
+              "critical": false,
+              "critical_reason": null,
+              "expected_meetings": ["meeting-2"],
+              "expected": []
+            },
+            {
+              "id": "paraphrase",
+              "query": "who handles the move",
+              "class": "paraphrase",
+              "critical": false,
+              "critical_reason": null,
+              "expected_meetings": ["meeting-2"],
+              "expected": []
+            }
+          ]
+        }
+        """
+    )
+
+    dataset = load_dataset(dataset_path)
+
+    assert [task.task_class for task in dataset.tasks] == ["tag", "paraphrase"]
+    assert dataset.tasks[0].expected == ()
 
 
 def test_evaluation_calculates_ranked_and_product_metrics(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
+    dataset = replace(
+        dataset,
+        tasks=tuple(task for task in dataset.tasks if task.task_class != "tag"),
+    )
 
     report = evaluate_retrieval(dataset, index_path, limit=5)
 
@@ -60,13 +134,57 @@ def test_evaluation_calculates_ranked_and_product_metrics(meetily_db: Path, tmp_
     assert report.metrics.hit_at_3 == 1.0
     assert report.metrics.hit_at_5 == 1.0
     assert report.metrics.mrr == 1.0
-    assert report.metrics.ndcg == pytest.approx(0.9131173286)
+    assert report.metrics.ndcg == 1.0
     assert report.metrics.source_accuracy == 1.0
     assert report.metrics.median_source_openings == 1.0
     assert report.metrics.empty_result_rate == 0.0
     assert report.metrics.median_latency_ms >= 0
     assert report.metrics.p95_latency_ms >= report.metrics.median_latency_ms
     assert all(task.success for task in report.tasks)
+    assert report.tasks[0].retrieved[0].meeting_external_id == "meeting-1"
+    assert report.tasks[0].retrieved[0].evidence_ids
+
+
+def test_evaluation_supports_tag_only_meeting_results_and_fingerprints_tag_state(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    core = MeetilyMemoryCore(index_path)
+    dataset = EvaluationDataset(
+        schema_version="meetily-memory.eval.v2",
+        dataset_version="2",
+        name="tag-only",
+        tasks=(
+            EvaluationTask(
+                id="tag-only",
+                query="private-label",
+                task_class="tag",
+                critical=False,
+                critical_reason=None,
+                expected=(),
+                expected_meetings=("meeting-2",),
+            ),
+        ),
+    )
+    before = evaluate_retrieval(dataset, index_path, limit=5)
+    TagService(core.repo).assign(("2",), ("private-label",))
+
+    report = evaluate_retrieval(
+        dataset,
+        index_path,
+        limit=5,
+        config=EvaluationRetrievalConfig(
+            meeting_strategy=core,
+            mode="fts5_tags",
+        ),
+    )
+
+    assert report.tasks[0].success is True
+    assert report.tasks[0].retrieved[0].meeting_external_id == "meeting-2"
+    assert report.tasks[0].retrieved[0].evidence_ids == ()
+    assert before.manifest.tag_state_fingerprint != report.manifest.tag_state_fingerprint
 
 
 def test_evaluation_records_explicit_neighbor_context_parameter(
@@ -180,6 +298,21 @@ def test_report_comparison_rejects_incompatible_manifests() -> None:
         compare_reports(baseline, candidate)
 
 
+def test_report_comparison_rejects_tag_state_drift() -> None:
+    baseline_manifest = EvaluationManifest.compatible_for_tests()
+    candidate_manifest = replace(
+        baseline_manifest,
+        run_id="candidate",
+        tag_state_fingerprint="changed",
+    )
+
+    with pytest.raises(ValueError, match="tag_state_fingerprint"):
+        compare_reports(
+            EvaluationReport.for_tests(baseline_manifest, []),
+            EvaluationReport.for_tests(candidate_manifest, []),
+        )
+
+
 def test_report_comparison_allows_explicit_index_schema_drift() -> None:
     baseline_manifest = EvaluationManifest.compatible_for_tests()
     candidate_manifest = replace(
@@ -202,7 +335,7 @@ def test_report_comparison_allows_explicit_index_schema_drift() -> None:
 def test_dataset_rejects_critical_task_without_predeclared_reason() -> None:
     with pytest.raises(ValueError, match="critical_reason"):
         EvaluationDataset(
-            schema_version="meetily-memory.eval.v1",
+            schema_version="meetily-memory.eval.v2",
             dataset_version="1",
             name="invalid",
             tasks=(
@@ -245,5 +378,5 @@ def test_evaluation_uses_external_evidence_identity_after_index_rebuild(
     scanner.scan(meetily_db)
     second = evaluate_retrieval(dataset, index_path, limit=5)
 
-    assert first.tasks[0].retrieved[0].evidence_id == "meeting-1/transcript-1"
-    assert second.tasks[0].retrieved[0].evidence_id == "meeting-1/transcript-1"
+    assert first.tasks[0].retrieved[0].evidence_ids[0] == "meeting-1/transcript-1"
+    assert second.tasks[0].retrieved[0].evidence_ids[0] == "meeting-1/transcript-1"

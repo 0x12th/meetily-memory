@@ -1,20 +1,23 @@
 # Retrieval evaluation
 
-Meetily Memory includes a reproducible FTS5 evaluation runner. The public fixture in
-`tests/fixtures/evaluation/synthetic_dataset.json` verifies the dataset format, stable evidence
-keys, metrics, and comparison rules in CI. It is synthetic and must not be used as evidence of
-retrieval quality.
+Meetily Memory includes a reproducible meeting-level retrieval evaluation runner. The public
+fixture in `tests/fixtures/evaluation/synthetic_dataset.json` verifies the v2 dataset format,
+stable meeting and evidence keys, tag-only tasks, metrics, and comparison rules in CI. It is
+synthetic and must not be used as evidence of retrieval quality. Existing v1 datasets are
+migrated to v2 when read by deriving meetings from their evidence IDs.
 
 Real queries, relevance labels, reports, and manual reviews belong under the ignored
 `.docs/eval/` directory. A real dataset should contain 30–50 tasks from actual use, cover all
-supported task classes, allow multiple primary (`2`) and supporting (`1`) evidence fragments,
-and record a reason for every critical task before any candidate strategy is evaluated.
+supported task classes, declare `expected_meetings`, optionally allow multiple primary (`2`) and
+supporting (`1`) evidence fragments, and record a reason for every critical task before any
+candidate strategy is evaluated. A tag-only task has one or more `expected_meetings` and an
+empty `expected` evidence list.
 
 Run the unchanged FTS5 path against an existing index:
 
 ```bash
 uv run scripts/evaluate-retrieval.py \
-  .docs/eval/tasks.v1.json \
+  .docs/eval/tasks.v2.json \
   --index .docs/eval/index.sqlite \
   --output .docs/eval/baseline.json
 ```
@@ -28,7 +31,7 @@ Compare a candidate with a compatible baseline:
 
 ```bash
 uv run scripts/evaluate-retrieval.py \
-  .docs/eval/tasks.v1.json \
+  .docs/eval/tasks.v2.json \
   --index .docs/eval/index.sqlite \
   --baseline .docs/eval/baseline.json \
   --output .docs/eval/candidate.json
@@ -38,7 +41,7 @@ Evaluate the explicit hybrid RRF experiment only after semantic embeddings have 
 
 ```bash
 uv run scripts/evaluate-retrieval.py \
-  .docs/eval/tasks.v1.json \
+  .docs/eval/tasks.v2.json \
   --index .docs/eval/index.sqlite \
   --baseline .docs/eval/baseline.json \
   --output .docs/eval/hybrid.json \
@@ -57,9 +60,10 @@ ranks remain diagnostic retrieval trace data and are not added to `SearchHit`. A
 single comparison does not change standard lexical search or expose hybrid retrieval in the CLI.
 
 Reports are immutable: the runner refuses to overwrite an existing output path. Automatic
-comparison is rejected when the dataset, corpus, index schema, retrieval mode or parameters,
-or semantic provider/model/dimension differ. Code commits and dirty-tree state remain recorded
-for traceability but do not by themselves make two retrieval runs incompatible.
+comparison is rejected when the dataset, corpus, tag-state fingerprint, index schema, retrieval
+mode or parameters, or semantic provider/model/dimension differ. Code commits and dirty-tree
+state remain recorded for traceability but do not by themselves make two retrieval runs
+incompatible.
 
 An intentional migration can be analyzed with an explicit drift field, for example
 `--allow-drift index_schema_version`. The comparison records the allowed mismatch; this mode is

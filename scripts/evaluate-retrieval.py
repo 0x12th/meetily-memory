@@ -38,6 +38,7 @@ def main() -> None:
             "index_schema_version",
             "retrieval_mode",
             "retrieval_parameters",
+            "tag_state_fingerprint",
             "semantic_provider",
             "semantic_model",
             "semantic_dimension",

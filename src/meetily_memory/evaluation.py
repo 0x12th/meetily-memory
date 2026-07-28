@@ -10,14 +10,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
 from time import perf_counter
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
 from meetily_memory.db.repository import IndexRepository
-from meetily_memory.domain import SearchHit
+from meetily_memory.domain import MeetingSearchResult, RetrievalSource, SearchHit
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
 from meetily_memory.retrieval import LexicalRetrievalStrategy, RetrievalStrategy
+from meetily_memory.tagging import TagRepository
 
-EVALUATION_SCHEMA_VERSION = "meetily-memory.eval.v1"
+EVALUATION_SCHEMA_VERSION = "meetily-memory.eval.v2"
+LEGACY_EVALUATION_SCHEMA_VERSION = "meetily-memory.eval.v1"
 PRIMARY_RELEVANCE = 2
 HIT_AT_THREE = 3
 EVALUATION_CUTOFF = 5
@@ -32,6 +34,9 @@ TASK_CLASSES = frozenset(
         "person",
         "project",
         "neighbor_context",
+        "tag",
+        "semantic",
+        "paraphrase",
     }
 )
 
@@ -58,6 +63,7 @@ class EvaluationTask:
     critical: bool
     critical_reason: str | None
     expected: tuple[ExpectedEvidence, ...]
+    expected_meetings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id or not self.query:
@@ -69,8 +75,15 @@ class EvaluationTask:
         if self.critical and not self.critical_reason:
             message = f"critical task {self.id!r} requires critical_reason"
             raise ValueError(message)
-        if not self.expected:
-            message = f"evaluation task {self.id!r} requires expected evidence"
+        expected_meetings = self.expected_meetings or tuple(
+            dict.fromkeys(item.evidence_id.split("/", 1)[0] for item in self.expected)
+        )
+        object.__setattr__(self, "expected_meetings", expected_meetings)
+        if not expected_meetings:
+            message = f"evaluation task {self.id!r} requires expected meetings"
+            raise ValueError(message)
+        if len(expected_meetings) != len(set(expected_meetings)):
+            message = f"evaluation task {self.id!r} has duplicate expected meetings"
             raise ValueError(message)
         evidence_ids = [item.evidence_id for item in self.expected]
         if len(evidence_ids) != len(set(evidence_ids)):
@@ -103,11 +116,11 @@ class EvaluationDataset:
 
 
 @dataclass(frozen=True)
-class RetrievedEvidence:
-    evidence_id: str
+class RetrievedMeeting:
     meeting_external_id: str
     relevance: int
     rank: int
+    evidence_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -124,7 +137,7 @@ class ObservedTask:
     source_accurate: bool
     source_openings: int
     latency_ms: float
-    retrieved: tuple[RetrievedEvidence, ...]
+    retrieved: tuple[RetrievedMeeting, ...]
 
     @classmethod
     def for_tests(
@@ -178,6 +191,7 @@ class EvaluationManifest:
     index_schema_version: int
     retrieval_mode: str
     retrieval_parameters: dict[str, Any]
+    tag_state_fingerprint: str = ""
     semantic_provider: str | None = None
     semantic_model: str | None = None
     semantic_dimension: int | None = None
@@ -188,6 +202,7 @@ class EvaluationManifest:
         "index_schema_version",
         "retrieval_mode",
         "retrieval_parameters",
+        "tag_state_fingerprint",
         "semantic_provider",
         "semantic_model",
         "semantic_dimension",
@@ -205,6 +220,7 @@ class EvaluationManifest:
             index_schema_version=1,
             retrieval_mode="fts5",
             retrieval_parameters={"limit": 5},
+            tag_state_fingerprint="tags",
         )
 
     def compatibility_mismatches(self, other: "EvaluationManifest") -> list[str]:
@@ -215,9 +231,19 @@ class EvaluationManifest:
         ]
 
 
+class MeetingRetrievalStrategy(Protocol):
+    def search_meetings(
+        self,
+        query: str,
+        limit: int = 10,
+        context: int = 0,
+    ) -> tuple[MeetingSearchResult, ...]: ...
+
+
 @dataclass(frozen=True)
 class EvaluationRetrievalConfig:
     strategy: RetrievalStrategy | None = None
+    meeting_strategy: MeetingRetrievalStrategy | None = None
     mode: str = "fts5"
     parameters: dict[str, Any] = field(default_factory=dict)
     semantic_provider: str | None = None
@@ -273,20 +299,27 @@ def load_dataset(path: Path) -> EvaluationDataset:
     if not isinstance(payload, dict):
         message = "evaluation dataset must be a JSON object"
         raise TypeError(message)
+    source_schema_version = str(payload.get("schema_version") or "")
+    if source_schema_version not in {
+        EVALUATION_SCHEMA_VERSION,
+        LEGACY_EVALUATION_SCHEMA_VERSION,
+    }:
+        message = f"unsupported evaluation schema: {source_schema_version}"
+        raise ValueError(message)
     raw_tasks = payload.get("tasks")
     if not isinstance(raw_tasks, list):
         message = "evaluation dataset tasks must be a list"
         raise TypeError(message)
-    tasks = tuple(task_from_payload(item) for item in raw_tasks)
+    tasks = tuple(task_from_payload(item, source_schema_version) for item in raw_tasks)
     return EvaluationDataset(
-        schema_version=str(payload.get("schema_version") or ""),
+        schema_version=EVALUATION_SCHEMA_VERSION,
         dataset_version=str(payload.get("dataset_version") or ""),
         name=str(payload.get("name") or ""),
         tasks=tasks,
     )
 
 
-def task_from_payload(payload: object) -> EvaluationTask:
+def task_from_payload(payload: object, schema_version: str) -> EvaluationTask:
     if not isinstance(payload, dict):
         message = "evaluation task must be a JSON object"
         raise TypeError(message)
@@ -295,6 +328,16 @@ def task_from_payload(payload: object) -> EvaluationTask:
         message = "evaluation task expected must be a list"
         raise TypeError(message)
     expected = tuple(expected_from_payload(item) for item in raw_expected)
+    raw_expected_meetings = payload.get("expected_meetings")
+    if schema_version == EVALUATION_SCHEMA_VERSION:
+        if not isinstance(raw_expected_meetings, list):
+            message = "evaluation task expected_meetings must be a list"
+            raise TypeError(message)
+        expected_meetings = tuple(str(item) for item in raw_expected_meetings)
+    else:
+        expected_meetings = tuple(
+            dict.fromkeys(item.evidence_id.split("/", 1)[0] for item in expected)
+        )
     critical_reason = payload.get("critical_reason")
     return EvaluationTask(
         id=str(payload.get("id") or ""),
@@ -303,6 +346,7 @@ def task_from_payload(payload: object) -> EvaluationTask:
         critical=payload.get("critical") is True,
         critical_reason=str(critical_reason) if critical_reason is not None else None,
         expected=expected,
+        expected_meetings=expected_meetings,
     )
 
 
@@ -338,11 +382,19 @@ def evaluate_retrieval(
     observed: list[ObservedTask] = []
     for task in dataset.tasks:
         started = perf_counter()
-        hits = strategy.search(task.query, limit)
-        if context:
-            hits = repo.expand_search_hits(hits, context)
+        if retrieval_config.meeting_strategy is not None:
+            results = retrieval_config.meeting_strategy.search_meetings(
+                task.query,
+                limit,
+                context,
+            )
+        else:
+            hits = strategy.search(task.query, limit)
+            if context:
+                hits = repo.expand_search_hits(hits, context)
+            results = collapse_search_hits(repo, hits, retrieval_config.mode)
         latency_ms = (perf_counter() - started) * 1000
-        observed.append(observe_task(task, hits, latency_ms))
+        observed.append(observe_task(task, results, latency_ms))
     manifest_parameters: dict[str, Any] = {"limit": limit, "context": context}
     manifest_parameters.update(retrieval_config.parameters)
     manifest = build_manifest(
@@ -362,25 +414,22 @@ def evaluate_retrieval(
 
 
 def observe_task(
-    task: EvaluationTask, hits: tuple[SearchHit, ...], latency_ms: float
+    task: EvaluationTask,
+    results: tuple[MeetingSearchResult, ...],
+    latency_ms: float,
 ) -> ObservedTask:
-    relevance_by_id = {item.evidence_id: item.relevance for item in task.expected}
+    expected_meetings = set(task.expected_meetings)
     retrieved = tuple(
-        RetrievedEvidence(
-            evidence_id=evaluation_evidence_id(hit),
-            meeting_external_id=hit.meeting.external_id,
-            relevance=relevance_by_id.get(evaluation_evidence_id(hit), 0),
+        RetrievedMeeting(
+            meeting_external_id=result.meeting.external_id,
+            relevance=PRIMARY_RELEVANCE if result.meeting.external_id in expected_meetings else 0,
             rank=rank,
+            evidence_ids=tuple(evaluation_evidence_id(hit) for hit in result.evidence),
         )
-        for rank, hit in enumerate(hits, start=1)
+        for rank, result in enumerate(results, start=1)
     )
     primary_ranks = [item.rank for item in retrieved if item.relevance == PRIMARY_RELEVANCE]
     first_primary_rank = min(primary_ranks, default=None)
-    expected_meetings = {
-        evidence.evidence_id.split("/", 1)[0]
-        for evidence in task.expected
-        if evidence.relevance > 0
-    }
     source_accurate = bool(retrieved and retrieved[0].meeting_external_id in expected_meetings)
     return ObservedTask(
         id=task.id,
@@ -391,12 +440,41 @@ def observe_task(
         hit_at_3=float(first_primary_rank is not None and first_primary_rank <= HIT_AT_THREE),
         hit_at_5=float(first_primary_rank is not None and first_primary_rank <= EVALUATION_CUTOFF),
         reciprocal_rank=1 / first_primary_rank if first_primary_rank else 0.0,
-        ndcg=ndcg_at_five(retrieved, task.expected),
+        ndcg=ndcg_at_five(retrieved, task.expected_meetings),
         source_accurate=source_accurate,
         source_openings=source_openings(retrieved, first_primary_rank),
         latency_ms=latency_ms,
         retrieved=retrieved,
     )
+
+
+def collapse_search_hits(
+    repository: IndexRepository,
+    hits: tuple[SearchHit, ...],
+    mode: str,
+) -> tuple[MeetingSearchResult, ...]:
+    grouped: dict[tuple[str, str], list[SearchHit]] = {}
+    for hit in hits:
+        key = (hit.meeting.source_uuid, hit.meeting.external_id)
+        grouped.setdefault(key, []).append(hit)
+    source = RetrievalSource.SEMANTIC if mode == "semantic" else RetrievalSource.FTS
+    results: list[MeetingSearchResult] = []
+    for key, evidence in grouped.items():
+        resolved = repository.meeting_ref_by_identity(*key)
+        if resolved is None:
+            continue
+        meeting_id, meeting = resolved
+        results.append(
+            MeetingSearchResult(
+                meeting_id=meeting_id,
+                meeting=meeting,
+                rank=len(results) + 1,
+                match_sources=(source,),
+                evidence=tuple(evidence),
+                matched_tags=(),
+            )
+        )
+    return tuple(results)
 
 
 def aggregate_metrics(tasks: tuple[ObservedTask, ...]) -> EvaluationMetrics:
@@ -502,11 +580,17 @@ def load_report(path: Path) -> EvaluationReport:
 
 def observed_task_from_payload(payload: dict[str, Any]) -> ObservedTask:
     retrieved = tuple(
-        RetrievedEvidence(
-            evidence_id=str(item["evidence_id"]),
+        RetrievedMeeting(
             meeting_external_id=str(item["meeting_external_id"]),
             relevance=int(item["relevance"]),
             rank=int(item["rank"]),
+            evidence_ids=tuple(
+                str(value)
+                for value in item.get(
+                    "evidence_ids",
+                    [item["evidence_id"]] if item.get("evidence_id") else [],
+                )
+            ),
         )
         for item in payload["retrieved"]
     )
@@ -549,6 +633,7 @@ def build_manifest(
         index_schema_version=schema_version,
         retrieval_mode=config.mode,
         retrieval_parameters=retrieval_parameters,
+        tag_state_fingerprint=tag_state_fingerprint(IndexRepository(index_path).state_path),
         semantic_provider=config.semantic_provider,
         semantic_model=config.semantic_model,
         semantic_dimension=config.semantic_dimension,
@@ -568,6 +653,20 @@ def corpus_fingerprint(index_path: Path) -> str:
             """
         ).fetchall()
     return sha256_payload([list(row) for row in rows])
+
+
+def tag_state_fingerprint(state_path: Path) -> str:
+    assignments = TagRepository(state_path).list_assignments()
+    return sha256_payload(
+        [
+            [
+                assignment.identity.source_uuid,
+                assignment.identity.meeting_external_id,
+                assignment.tag.normalized_name,
+            ]
+            for assignment in assignments
+        ]
+    )
 
 
 def evaluation_evidence_id(hit: SearchHit) -> str:
@@ -597,6 +696,7 @@ def dataset_payload(dataset: EvaluationDataset) -> dict[str, Any]:
                 "class": task.task_class,
                 "critical": task.critical,
                 "critical_reason": task.critical_reason,
+                "expected_meetings": list(task.expected_meetings),
                 "expected": [asdict(item) for item in task.expected],
             }
             for task in dataset.tasks
@@ -605,10 +705,11 @@ def dataset_payload(dataset: EvaluationDataset) -> dict[str, Any]:
 
 
 def ndcg_at_five(
-    retrieved: tuple[RetrievedEvidence, ...], expected: tuple[ExpectedEvidence, ...]
+    retrieved: tuple[RetrievedMeeting, ...],
+    expected_meetings: tuple[str, ...],
 ) -> float:
     actual = [item.relevance for item in retrieved[:EVALUATION_CUTOFF]]
-    ideal = sorted((item.relevance for item in expected), reverse=True)[:EVALUATION_CUTOFF]
+    ideal = [PRIMARY_RELEVANCE] * min(len(expected_meetings), EVALUATION_CUTOFF)
     ideal_score = discounted_gain(ideal)
     return discounted_gain(actual) / ideal_score if ideal_score else 0.0
 
@@ -619,9 +720,7 @@ def discounted_gain(relevances: list[int]) -> float:
     )
 
 
-def source_openings(
-    retrieved: tuple[RetrievedEvidence, ...], first_primary_rank: int | None
-) -> int:
+def source_openings(retrieved: tuple[RetrievedMeeting, ...], first_primary_rank: int | None) -> int:
     relevant_slice = retrieved[:first_primary_rank] if first_primary_rank else retrieved
     return len({item.meeting_external_id for item in relevant_slice})
 

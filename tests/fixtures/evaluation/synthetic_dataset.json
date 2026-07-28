@@ -1,5 +1,5 @@
 {
-  "schema_version": "meetily-memory.eval.v1",
+  "schema_version": "meetily-memory.eval.v2",
   "dataset_version": "1",
   "name": "synthetic-format-and-metrics-only",
   "tasks": [
@@ -9,6 +9,7 @@
       "class": "exact_match",
       "critical": true,
       "critical_reason": "Known exact evidence used to protect lexical retrieval.",
+      "expected_meetings": ["meeting-1"],
       "expected": [
         {"evidence_id": "meeting-1/transcript-1", "relevance": 2},
         {"evidence_id": "meeting-1/summary:meeting-1", "relevance": 1}
@@ -20,10 +21,20 @@
       "class": "task",
       "critical": false,
       "critical_reason": null,
+      "expected_meetings": ["meeting-2"],
       "expected": [
         {"evidence_id": "meeting-2/transcript-2", "relevance": 2},
         {"evidence_id": "meeting-2/note:meeting-2", "relevance": 1}
       ]
+    },
+    {
+      "id": "tag-private-label",
+      "query": "private-label",
+      "class": "tag",
+      "critical": false,
+      "critical_reason": null,
+      "expected_meetings": ["meeting-2"],
+      "expected": []
     }
   ]
 }

@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://meetily-memory.local/schemas/evaluation-dataset-v1.json",
+  "$id": "https://meetily-memory.local/schemas/evaluation-dataset-v2.json",
   "title": "Meetily Memory retrieval evaluation dataset",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "dataset_version", "name", "tasks"],
   "properties": {
-    "schema_version": {"const": "meetily-memory.eval.v1"},
+    "schema_version": {"const": "meetily-memory.eval.v2"},
     "dataset_version": {"type": "string", "minLength": 1},
     "name": {"type": "string", "minLength": 1},
     "tasks": {
@@ -15,7 +15,15 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "query", "class", "critical", "critical_reason", "expected"],
+        "required": [
+          "id",
+          "query",
+          "class",
+          "critical",
+          "critical_reason",
+          "expected_meetings",
+          "expected"
+        ],
         "properties": {
           "id": {"type": "string", "minLength": 1},
           "query": {"type": "string", "minLength": 1},
@@ -29,14 +37,22 @@
               "risk",
               "person",
               "project",
-              "neighbor_context"
+              "neighbor_context",
+              "tag",
+              "semantic",
+              "paraphrase"
             ]
           },
           "critical": {"type": "boolean"},
           "critical_reason": {"type": ["string", "null"]},
-          "expected": {
+          "expected_meetings": {
             "type": "array",
             "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "expected": {
+            "type": "array",
             "items": {
               "type": "object",
               "additionalProperties": false,
