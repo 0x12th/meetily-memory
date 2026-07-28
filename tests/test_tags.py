@@ -10,7 +10,13 @@ from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.semantic_search import (
+    LocalHashEmbeddingProvider,
+    index_semantic_embeddings,
+)
+from meetily_memory.tagging import TagService
 from meetily_memory.user_state import UserStateRepository
+from tests.semantic_helpers import requires_sqlite_vec
 
 
 def test_tag_repository_normalizes_assigns_idempotently_and_removes_unused_tags(
@@ -341,3 +347,150 @@ def test_cli_search_explains_tag_only_match(meetily_db: Path, tmp_path: Path) ->
     assert "matched tag: сбер" in result.stdout
     assert "chunk #" not in result.stdout
     assert "open: mm open 2" in result.stdout
+
+
+@requires_sqlite_vec
+def test_tag_suggestions_prioritize_title_text_then_similar_meeting(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    state_path = tmp_path / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    provider = LocalHashEmbeddingProvider()
+    index_semantic_embeddings(index_path, embedding_provider=provider)
+    service = TagService(IndexRepository(index_path, state_path=state_path))
+    service.assign(
+        ("2",),
+        ("Launch Planning", "pricing decision", "migration-team"),
+    )
+
+    suggestions = service.suggest("1", embedding_provider=provider)
+
+    assert [
+        (item.tag.display_name, item.reason, item.similar_meeting_id) for item in suggestions
+    ] == [
+        ("Launch Planning", "title match", None),
+        ("pricing decision", "text match", None),
+        ("migration-team", "similar meeting", 2),
+    ]
+
+
+class ExplodingEmbeddingProvider:
+    name = "never"
+    model = "never"
+    dims: int | None = 128
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        del texts
+        message = "must not run"
+        raise AssertionError(message)
+
+
+class UnavailableHashProvider:
+    name = "hash"
+    model = "local-hash-v1"
+    dims: int | None = 128
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        del texts
+        message = "provider unavailable"
+        raise RuntimeError(message)
+
+
+def test_tag_suggestions_fall_back_without_complete_semantic_index(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    state_path = tmp_path / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    service = TagService(IndexRepository(index_path, state_path=state_path))
+    service.assign(("2",), ("Launch Planning", "pricing decision", "migration-team"))
+    service.assign(("1",), ("pricing decision",))
+
+    suggestions = service.suggest(
+        "1",
+        embedding_provider=ExplodingEmbeddingProvider(),
+    )
+
+    assert [(item.tag.display_name, item.reason) for item in suggestions] == [
+        ("Launch Planning", "title match"),
+    ]
+
+
+@requires_sqlite_vec
+def test_tag_suggestions_fall_back_when_ready_semantic_provider_fails(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    state_path = tmp_path / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    index_semantic_embeddings(
+        index_path,
+        embedding_provider=LocalHashEmbeddingProvider(),
+    )
+    service = TagService(IndexRepository(index_path, state_path=state_path))
+    service.assign(("2",), ("Launch Planning", "migration-team"))
+
+    suggestions = service.suggest(
+        "1",
+        embedding_provider=UnavailableHashProvider(),
+    )
+
+    assert [(item.tag.display_name, item.reason) for item in suggestions] == [
+        ("Launch Planning", "title match"),
+    ]
+
+
+def test_cli_suggests_existing_tags_without_persisting_suggestions(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    data_dir = tmp_path / "data"
+    env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+    assert (
+        runner.invoke(
+            app,
+            ["--index", str(index_path), "scan", "--source", str(meetily_db)],
+            env=env,
+        ).exit_code
+        == 0
+    )
+    assert (
+        runner.invoke(
+            app,
+            [
+                "--index",
+                str(index_path),
+                "tag",
+                "add",
+                "2",
+                "Launch Planning,pricing decision",
+            ],
+            env=env,
+        ).exit_code
+        == 0
+    )
+
+    suggested = runner.invoke(
+        app,
+        ["--index", str(index_path), "tag", "suggest", "1"],
+        env=env,
+    )
+
+    assert suggested.exit_code == 0
+    assert "Suggested tags for meeting #1:" in suggested.stdout
+    assert "1. Launch Planning — title match" in suggested.stdout
+    assert "2. pricing decision — text match" in suggested.stdout
+    with sqlite3.connect(index_path.with_name("state.sqlite")) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert "meeting_tag_suggestions" not in tables

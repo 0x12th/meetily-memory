@@ -64,6 +64,27 @@ def list_tags(
         print_text_block(f"{tag.display_name}  {tag.active_meetings} meetings")
 
 
+@tag_app.command("suggest")
+def suggest_tags(
+    ctx: typer.Context,
+    meeting_id: Annotated[str, typer.Argument()],
+) -> None:
+    service = TagService(core_from_context(ctx).repo)
+    try:
+        suggestions = service.suggest(meeting_id)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    print_text_block(f"Suggested tags for meeting #{meeting_id}:")
+    if not suggestions:
+        print_text_block("No suggestions.")
+        return
+    for rank, suggestion in enumerate(suggestions, start=1):
+        reason = suggestion.reason
+        if suggestion.similar_meeting_id is not None:
+            reason = f"similar to meeting #{suggestion.similar_meeting_id}"
+        print_text_block(f"{rank}. {suggestion.tag.display_name} — {reason}")
+
+
 def parse_tag_arguments(values: list[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
     meeting_ids: list[str] = []
     tag_arguments: list[str] = []

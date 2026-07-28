@@ -422,6 +422,17 @@ class IndexRepository:
             return None
         return int(meeting["id"]), meeting_ref_from_row(meeting, source_uuid)
 
+    def meeting_transcript_text(self, external_or_internal_id: str) -> str:
+        meeting = self.get_meeting(external_or_internal_id)
+        if meeting is None:
+            message = f"Meeting not found: {external_or_internal_id}"
+            raise ValueError(message)
+        with index_connection(self.index_path) as conn:
+            rows = self.meetings.chunk_rows(conn, int(meeting["id"]))
+        return "\n".join(
+            str(row["text"]) for row in rows if row["kind"] == "transcript" and row["text"]
+        )
+
     def dominant_meeting_language(self) -> str | None:
         return self.meetings.dominant_meeting_language()
 

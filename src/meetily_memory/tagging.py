@@ -1,12 +1,23 @@
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from meetily_memory.semantic_search import (
+    EmbeddingProvider,
+    resolve_embedding_provider,
+    semantic_index_coverage,
+    semantic_search,
+)
 from meetily_memory.user_state import ensure_user_state_schema
 
 if TYPE_CHECKING:
     from meetily_memory.repositories.index import IndexRepository
+
+TAG_SUGGESTION_LIMIT = 5
+SEMANTIC_SUGGESTION_CANDIDATES = 50
+SEMANTIC_SUGGESTION_QUERY_LENGTH = 8_000
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,13 @@ class TagCount:
     normalized_name: str
     display_name: str
     active_meetings: int
+
+
+@dataclass(frozen=True)
+class TagSuggestion:
+    tag: Tag
+    reason: str
+    similar_meeting_id: int | None = None
 
 
 class TagRepository:
@@ -375,6 +393,130 @@ class TagService:
             for assignment in self.repository.list_assignments()
         )
 
+    def suggest(
+        self,
+        meeting_id: str,
+        *,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> tuple[TagSuggestion, ...]:
+        identity = self._resolve_meetings((meeting_id,))[0]
+        meeting = self.index_repository.get_meeting(meeting_id)
+        if meeting is None:
+            message = f"Meeting not found: {meeting_id}"
+            raise ValueError(message)
+        assigned = {
+            tag.normalized_name
+            for tag in self.repository.list_for_meeting(
+                identity.source_uuid,
+                identity.meeting_external_id,
+            )
+        }
+        active_tags = tuple(
+            Tag(item.normalized_name, item.display_name)
+            for item in self.list_all()
+            if item.normalized_name not in assigned
+        )
+        title = str(meeting["title"])
+        text = self.index_repository.meeting_transcript_text(meeting_id)
+        suggestions: list[TagSuggestion] = []
+        self._append_text_suggestions(
+            suggestions,
+            active_tags,
+            title,
+            "title match",
+        )
+        remaining = tuple(
+            tag
+            for tag in active_tags
+            if tag.normalized_name not in {item.tag.normalized_name for item in suggestions}
+        )
+        self._append_text_suggestions(
+            suggestions,
+            remaining,
+            text,
+            "text match",
+        )
+        if len(suggestions) >= TAG_SUGGESTION_LIMIT:
+            return tuple(suggestions)
+        provider = embedding_provider or resolve_embedding_provider()
+        return self._append_semantic_suggestions(
+            suggestions,
+            identity,
+            f"{title}\n{text}",
+            provider,
+        )
+
+    def _append_text_suggestions(
+        self,
+        suggestions: list[TagSuggestion],
+        tags: tuple[Tag, ...],
+        text: str,
+        reason: str,
+    ) -> None:
+        for tag in tags:
+            if len(suggestions) >= TAG_SUGGESTION_LIMIT:
+                return
+            if normalized_phrase_in_text(tag.normalized_name, text):
+                suggestions.append(TagSuggestion(tag, reason))
+
+    def _append_semantic_suggestions(
+        self,
+        suggestions: list[TagSuggestion],
+        identity: MeetingTagIdentity,
+        document: str,
+        provider: EmbeddingProvider,
+    ) -> tuple[TagSuggestion, ...]:
+        try:
+            coverage = semantic_index_coverage(
+                self.index_repository.index_path,
+                provider,
+            )
+            if not coverage.complete:
+                return tuple(suggestions)
+            rows = semantic_search(
+                self.index_repository.index_path,
+                document[:SEMANTIC_SUGGESTION_QUERY_LENGTH],
+                SEMANTIC_SUGGESTION_CANDIDATES,
+                embedding_provider=provider,
+            )
+        except (RuntimeError, sqlite3.Error):
+            return tuple(suggestions)
+        assigned = {
+            tag.normalized_name
+            for tag in self.repository.list_for_meeting(
+                identity.source_uuid,
+                identity.meeting_external_id,
+            )
+        }
+        suggested = {item.tag.normalized_name for item in suggestions}
+        for row in rows:
+            hit = self.index_repository.search_hit_from_row(row)
+            key = (hit.meeting.source_uuid, hit.meeting.external_id)
+            if key == (identity.source_uuid, identity.meeting_external_id):
+                continue
+            tags = self.repository.list_for_meeting(*key)
+            if not tags:
+                continue
+            resolved = self.index_repository.meeting_ref_by_identity(*key)
+            if resolved is None:
+                continue
+            similar_meeting_id, _ = resolved
+            for tag in tags:
+                if len(suggestions) >= TAG_SUGGESTION_LIMIT:
+                    break
+                if tag.normalized_name in assigned or tag.normalized_name in suggested:
+                    continue
+                suggestions.append(
+                    TagSuggestion(
+                        tag=tag,
+                        reason="similar meeting",
+                        similar_meeting_id=similar_meeting_id,
+                    )
+                )
+                suggested.add(tag.normalized_name)
+            break
+        return tuple(suggestions)
+
     def _assignment_is_active(self, assignment: TagAssignment) -> bool:
         return (
             self.index_repository.get_meeting_by_identity(
@@ -414,3 +556,9 @@ class TagService:
             return
         message = "No tags provided."
         raise ValueError(message)
+
+
+def normalized_phrase_in_text(normalized_phrase: str, text: str) -> bool:
+    normalized_text = " ".join(text.casefold().split())
+    pattern = rf"(?<!\w){re.escape(normalized_phrase)}(?!\w)"
+    return re.search(pattern, normalized_text) is not None

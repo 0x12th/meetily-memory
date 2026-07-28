@@ -92,6 +92,12 @@ mm tag list
 mm tag list 10
 ```
 
+Suggest up to five existing tags without changing stored assignments:
+
+```bash
+mm tag suggest 10
+```
+
 Remove assignments:
 
 ```bash
