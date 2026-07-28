@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from importlib.metadata import version
 from pathlib import Path
@@ -9,7 +10,9 @@ from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
 from meetily_memory.cli.common import open_path
+from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import loads_json
+from meetily_memory.tagging import TagRepository
 from tests.semantic_helpers import requires_sqlite_vec
 
 
@@ -31,8 +34,18 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert "--show-completion" not in help_result.stdout
     assert "╭" not in help_result.stdout
 
-    for command in ("init", "status", "refresh", "update", "doctor", "s", "open", "autosync"):
-        assert f"\n  {command}" in help_result.stdout
+    for command in (
+        "init",
+        "status",
+        "refresh",
+        "update",
+        "doctor",
+        "s",
+        "open",
+        "tag",
+        "autosync",
+    ):
+        assert re.search(rf"\n  {re.escape(command)}(?:\s{{2,}}|\n)", help_result.stdout)
     for command in (
         "scan",
         "analyze",
@@ -48,7 +61,7 @@ def test_cli_help_uses_plain_click_format() -> None:
         "db",
         "mcp",
     ):
-        assert f"\n  {command}" not in help_result.stdout
+        assert not re.search(rf"\n  {re.escape(command)}(?:\s{{2,}}|\n)", help_result.stdout)
 
     open_help = runner.invoke(app, ["open", "--help"])
     assert open_help.exit_code == 0
@@ -710,6 +723,34 @@ def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
     assert f"index path: {index_path}" in status.stdout
     assert "schema version: 4" in status.stdout
     assert "current schema version: 4" in status.stdout
+    assert "orphaned tag assignments: 0" in status.stdout
+
+
+def test_cli_db_status_reports_orphaned_tag_assignments(tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    repo = IndexRepository(index_path)
+    source_uuid = repo.user_state.get_or_create_source(
+        "meetily_sqlite",
+        "/missing.sqlite",
+        now="1",
+    )
+    TagRepository(repo.state_path).assign(
+        source_uuid,
+        ("missing-meeting",),
+        ("Сбер",),
+        now="2",
+    )
+    runner = CliRunner()
+
+    status = runner.invoke(app, ["--index", str(index_path), "db", "status"])
+    json_status = runner.invoke(
+        app,
+        ["--index", str(index_path), "db", "status", "--json"],
+    )
+
+    assert status.exit_code == 0
+    assert "orphaned tag assignments: 1" in status.stdout
+    assert json.loads(json_status.stdout)["orphaned_tag_assignments"] == 1
 
 
 @requires_sqlite_vec

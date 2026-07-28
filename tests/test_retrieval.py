@@ -8,6 +8,8 @@ from meetily_memory.domain import ContextBundle, SearchHit
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import LocalHashEmbeddingProvider, index_semantic_embeddings
+from meetily_memory.tagging import TagRepository
+from meetily_memory.user_state import UserStateRepository
 from tests.semantic_helpers import requires_sqlite_vec
 
 
@@ -43,10 +45,27 @@ def test_selected_strategy_drives_only_explicit_v2_search(
         contract_version=CORE_V2_VERSION,
     )
 
-    assert search.data["results"] == [lexical_hit.as_payload()]
+    assert search.data["results"][0]["evidence"] == [lexical_hit.as_payload()]
+    assert search.data["results"][0]["match_sources"] == ["fts"]
     assert bundle.evidence[0].excerpt.chunk_external_id == "transcript-2"
     assert bundle.evidence != (lexical_hit,)
     assert context.data == bundle.as_payload()
+
+
+def test_tag_retrieval_strategy_keeps_lookup_behind_strategy_boundary(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    state = UserStateRepository(state_path)
+    source_uuid = state.get_or_create_source("meetily_sqlite", "/source.sqlite", now="1")
+    repository = TagRepository(state_path)
+    repository.assign(source_uuid, ("meeting-1",), ("Сбер собес",), now="2")
+
+    matches = retrieval.TagRetrievalStrategy(repository).search("сбер")
+
+    assert [(match.meeting_external_id, match.kind) for match in matches] == [
+        ("meeting-1", "token")
+    ]
 
 
 def test_context_renderer_uses_context_bundle_without_storage_rows(

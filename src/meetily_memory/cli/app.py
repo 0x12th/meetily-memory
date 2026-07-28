@@ -14,6 +14,7 @@ from meetily_memory.cli.obsidian_commands import obsidian_app
 from meetily_memory.cli.search_commands import app as search_app
 from meetily_memory.cli.semantic_commands import app as semantic_root_app
 from meetily_memory.cli.semantic_commands import semantic_app
+from meetily_memory.cli.tag_commands import tag_app
 from meetily_memory.config.paths import app_config_path
 
 app = make_typer(
@@ -21,12 +22,14 @@ app = make_typer(
     "\b\n"
     "Main workflow:\n"
     "  mm s QUERY       Find meetings and source excerpts.\n"
-    "  mm open ID       Open the original meeting."
+    "  mm open ID       Open the original meeting.\n"
+    "  mm tag ...       Mark related meetings."
 )
 app.add_typer(lifecycle_app)
 app.add_typer(semantic_root_app)
 app.add_typer(llm_root_app)
 app.add_typer(search_app)
+app.add_typer(tag_app, name="tag")
 app.add_typer(semantic_app, name="semantic", hidden=True)
 app.add_typer(llm_app, name="llm", hidden=True)
 app.add_typer(obsidian_app, name="obsidian", hidden=True)

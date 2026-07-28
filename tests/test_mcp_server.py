@@ -36,7 +36,7 @@ async def test_mcp_tools_are_thin_core_adapters(meetily_db: Path, tmp_path: Path
     search = await call_payload(server, "search", {"query": "migration risks", "limit": 3})
     assert search["kind"] == "search"
     assert search["contract_version"] == "meetily-memory.core.v1"
-    assert search["data"]["results"][0]["meeting_external_id"] == "meeting-2"
+    assert search["data"]["results"][0]["meeting"]["external_id"] == "meeting-2"
 
     context = await call_payload(
         server,
@@ -80,10 +80,12 @@ async def test_mcp_search_and_context_require_explicit_v2_selection(
 
     assert search["contract_version"] == "meetily-memory.core.v2"
     assert set(search["data"]["results"][0]) == {
-        "id",
+        "meeting_id",
         "meeting",
-        "excerpt",
-        "is_context",
+        "rank",
+        "match_sources",
+        "evidence",
+        "matched_tags",
     }
     assert context["contract_version"] == "meetily-memory.core.v2"
     assert "markdown" not in context["data"]

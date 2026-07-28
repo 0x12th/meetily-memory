@@ -52,6 +52,31 @@ CREATE TABLE IF NOT EXISTS migration_reports (
   created_at TEXT NOT NULL
 );
 """
+TAG_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tags (
+  id INTEGER PRIMARY KEY,
+  normalized_name TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meeting_tags (
+  source_uuid TEXT NOT NULL REFERENCES sources(uuid) ON DELETE RESTRICT,
+  meeting_external_id TEXT NOT NULL,
+  tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  source TEXT NOT NULL DEFAULT 'manual',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (source_uuid, meeting_external_id, tag_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_meeting_tags_meeting
+ON meeting_tags(source_uuid, meeting_external_id);
+
+CREATE INDEX IF NOT EXISTS idx_meeting_tags_tag_id
+ON meeting_tags(tag_id);
+"""
+CURRENT_USER_STATE_SCHEMA_VERSION = 2
+TAG_STATE_SCHEMA_VERSION = 2
 LEGACY_INDEX_SCHEMA_VERSION = 3
 
 
@@ -69,9 +94,7 @@ class UserStateRepository:
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
-            conn.executescript(USER_STATE_SCHEMA)
-            conn.execute("PRAGMA user_version = 1")
-            conn.commit()
+            ensure_user_state_schema(conn)
 
     def get_or_create_source(self, kind: str, path: str, *, now: str) -> str:
         with self._connect() as conn:
@@ -297,6 +320,25 @@ def task_identity(
 def content_fingerprint(text: str) -> str:
     normalized = " ".join(text.casefold().split())
     return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def ensure_user_state_schema(conn: sqlite3.Connection) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version > CURRENT_USER_STATE_SCHEMA_VERSION:
+        message = (
+            f"Unsupported user-state schema version {version}; "
+            f"this binary supports {CURRENT_USER_STATE_SCHEMA_VERSION}."
+        )
+        raise RuntimeError(message)
+    if version < 1:
+        conn.executescript(USER_STATE_SCHEMA)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+        version = 1
+    if version < TAG_STATE_SCHEMA_VERSION:
+        conn.executescript(TAG_STATE_SCHEMA)
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
 
 
 def prepare_user_state_migration(

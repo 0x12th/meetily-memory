@@ -1,5 +1,6 @@
 import hashlib
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from typing import Literal
 
 from meetily_memory.json_codec import dumps_json_bytes
@@ -77,6 +78,32 @@ class SearchHit:
             preview_length=preview_length,
             projection_version=COMPACT_SEARCH_HIT_PROJECTION_VERSION,
         )
+
+
+class RetrievalSource(StrEnum):
+    FTS = "fts"
+    SEMANTIC = "semantic"
+    TAG = "tag"
+
+
+@dataclass(frozen=True)
+class MeetingSearchResult:
+    meeting_id: int
+    meeting: MeetingRef
+    rank: int
+    match_sources: tuple[RetrievalSource, ...]
+    evidence: tuple[SearchHit, ...]
+    matched_tags: tuple[str, ...]
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "meeting_id": self.meeting_id,
+            "meeting": self.meeting.as_payload(),
+            "rank": self.rank,
+            "match_sources": [source.value for source in self.match_sources],
+            "evidence": [hit.as_payload() for hit in self.evidence],
+            "matched_tags": list(self.matched_tags),
+        }
 
 
 @dataclass(frozen=True)

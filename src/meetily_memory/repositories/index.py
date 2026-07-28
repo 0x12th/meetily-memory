@@ -380,6 +380,48 @@ class IndexRepository:
     def get_meeting(self, external_or_internal_id: str) -> dict[str, Any] | None:
         return self.meetings.get_meeting(external_or_internal_id)
 
+    def meeting_source_identity(
+        self,
+        external_or_internal_id: str,
+    ) -> dict[str, Any] | None:
+        meeting = self.get_meeting(external_or_internal_id)
+        if meeting is None:
+            return None
+        source = self._source_details(int(meeting["id"]))
+        source_uuid = self.user_state.source_uuid(
+            str(source["kind"]),
+            str(source["path"]),
+            now=utc_now(),
+        )
+        return {
+            "source_uuid": source_uuid,
+            "meeting_external_id": str(meeting["external_id"]),
+            "meeting": meeting,
+        }
+
+    def get_meeting_by_identity(
+        self,
+        source_uuid: str,
+        meeting_external_id: str,
+    ) -> dict[str, Any] | None:
+        source = self.user_state.get_source(source_uuid)
+        if source is None:
+            return None
+        indexed_source = self.get_source(str(source["kind"]), str(source["current_path"]))
+        if indexed_source is None:
+            return None
+        return self.get_meeting_by_external_id(int(indexed_source["id"]), meeting_external_id)
+
+    def meeting_ref_by_identity(
+        self,
+        source_uuid: str,
+        meeting_external_id: str,
+    ) -> tuple[int, MeetingRef] | None:
+        meeting = self.get_meeting_by_identity(source_uuid, meeting_external_id)
+        if meeting is None:
+            return None
+        return int(meeting["id"]), meeting_ref_from_row(meeting, source_uuid)
+
     def dominant_meeting_language(self) -> str | None:
         return self.meetings.dominant_meeting_language()
 
@@ -472,7 +514,7 @@ def utc_now() -> str:
 def meeting_ref_from_row(row: dict[str, Any], source_uuid: str) -> MeetingRef:
     return MeetingRef(
         source_uuid=source_uuid,
-        external_id=str(row["meeting_external_id"]),
+        external_id=str(row.get("meeting_external_id") or row["external_id"]),
         title=str(row["title"]),
         source_path=str(row["source_path"]),
         created_at=optional_str(row.get("created_at")),

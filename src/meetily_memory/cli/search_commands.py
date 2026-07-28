@@ -39,38 +39,39 @@ def search(
 
 
 def print_search_results(results: list[dict[str, object]]) -> None:
-    grouped: dict[int, list[dict[str, object]]] = {}
-    for result in results:
-        meeting_id = int(cast("int | str", result["meeting_id"]))
-        grouped.setdefault(meeting_id, []).append(result)
-    for index, rows in enumerate(grouped.values()):
+    for index, result in enumerate(results):
         if index:
             console.print()
-        print_search_meeting_header(rows[0])
-        for result in rows:
-            print_search_excerpt(result)
+        print_search_meeting_header(result)
+        matched_tags = cast("list[str]", result["matched_tags"])
+        if matched_tags:
+            console.print(f"matched tag: {', '.join(matched_tags)}")
+        for evidence in cast("list[dict[str, object]]", result["evidence"]):
+            print_search_excerpt(evidence)
 
 
 def print_search_meeting_header(result: dict[str, object]) -> None:
     meeting_id = result["meeting_id"]
-    date = compact_date(result.get("updated_at") or result.get("created_at"))
+    meeting = cast("dict[str, object]", result["meeting"])
+    date = compact_date(meeting.get("updated_at") or meeting.get("created_at"))
     suffix = f" ({date})" if date else ""
-    console.print(f"#{meeting_id} {result['title']}{suffix}")
+    console.print(f"#{meeting_id} {meeting['title']}{suffix}")
     console.print(f"open: mm open {meeting_id}")
 
 
 def print_search_excerpt(result: dict[str, object]) -> None:
+    excerpt = cast("dict[str, object]", result["excerpt"])
     source_parts = [
-        f"chunk #{result['chunk_id']}",
+        f"chunk #{excerpt.get('chunk_external_id') or excerpt['ordinal']}",
     ]
-    if result.get("timestamp_label"):
-        source_parts.insert(0, str(result["timestamp_label"]))
+    if excerpt.get("timestamp_label"):
+        source_parts.insert(0, str(excerpt["timestamp_label"]))
     if result.get("is_context"):
         source_parts.append("context")
     console.print(" | ".join(source_parts))
-    text = str(result["text"])
-    if result.get("speaker"):
-        text = f"{result['speaker']}: {text}"
+    text = str(excerpt["text"])
+    if excerpt.get("speaker"):
+        text = f"{excerpt['speaker']}: {text}"
     console.print(text)
     console.print()
 

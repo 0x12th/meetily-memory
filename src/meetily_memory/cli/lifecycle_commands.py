@@ -35,6 +35,7 @@ from meetily_memory.semantic_search import (
     resolve_embedding_provider,
 )
 from meetily_memory.structure_analyzer import StructureAnalyzer
+from meetily_memory.tagging import TagService
 
 app = make_typer("Local Meetily history lifecycle commands.")
 config_app = make_typer("Manage CLI settings.")
@@ -472,12 +473,14 @@ def db_status(
     with index_connection(index_path) as conn:
         schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     migration_report = repo.user_state.latest_migration_report()
+    orphaned_tag_assignments = TagService(repo).orphaned_assignment_count()
     payload = {
         "index_path": str(index_path),
         "state_path": str(repo.state_path),
         "schema_version": schema_version,
         "current_schema_version": CURRENT_SCHEMA_VERSION,
         "user_state_migration": migration_report,
+        "orphaned_tag_assignments": orphaned_tag_assignments,
     }
     if json_output:
         print_json(payload)
@@ -486,6 +489,7 @@ def db_status(
     print_text_block(f"state path: {repo.state_path}")
     print_text_block(f"schema version: {schema_version}")
     print_text_block(f"current schema version: {CURRENT_SCHEMA_VERSION}")
+    print_text_block(f"orphaned tag assignments: {orphaned_tag_assignments}")
     if migration_report:
         print_text_block(
             "user state migration: "

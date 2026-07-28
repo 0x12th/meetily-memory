@@ -9,17 +9,30 @@ from meetily_memory.context_builder import (
     ContextRenderer,
 )
 from meetily_memory.db.repository import IndexRepository
-from meetily_memory.domain import CompactSearchHit, ContextBundle, SearchHit
+from meetily_memory.domain import (
+    CompactSearchHit,
+    ContextBundle,
+    MeetingSearchResult,
+    RetrievalSource,
+    SearchHit,
+)
 from meetily_memory.local_memory import (
     person_memory,
     project_memory,
     summary_memory,
     timeline_signals,
 )
-from meetily_memory.retrieval import LexicalRetrievalStrategy, RetrievalStrategy
+from meetily_memory.retrieval import (
+    LexicalRetrievalStrategy,
+    RetrievalStrategy,
+    TagRetrievalStrategy,
+)
+from meetily_memory.tagging import TagRepository
 
 CORE_V1_VERSION = "meetily-memory.core.v1"
 CORE_V2_VERSION = "meetily-memory.core.v2"
+MAX_EVIDENCE_PER_MEETING = 2
+MeetingKey = tuple[str, str]
 CONTRACT_VERSION = CORE_V1_VERSION
 
 
@@ -62,6 +75,8 @@ class MeetilyMemoryCore:
     ) -> None:
         self.repo = IndexRepository(Path(index_path), state_path=state_path)
         self.retrieval_strategy = retrieval_strategy or LexicalRetrievalStrategy(self.repo)
+        self.tag_repository = TagRepository(self.repo.state_path)
+        self.tag_retrieval_strategy = TagRetrievalStrategy(self.tag_repository)
         self.context_builder = ContextBundleBuilder(self.repo)
         self.context_renderer = ContextRenderer()
 
@@ -74,21 +89,90 @@ class MeetilyMemoryCore:
         contract_version: str = CORE_V1_VERSION,
     ) -> CoreResponse:
         validate_contract_version(contract_version)
-        if contract_version == CORE_V2_VERSION:
-            rows: list[dict[str, Any]] = []
-            hits = self.search_hits(query, limit, context)
-        else:
-            rows = self.repo.search(query, limit, context=context)
-            hits = tuple(self.repo.search_hit_from_row(row) for row in rows)
+        results = self.search_meetings(query, limit, context)
         return CoreResponse(
             "search",
             {
                 "query": query,
                 "context": context,
-                "results": serialize_hits(hits, rows, contract_version),
+                "results": [result.as_payload() for result in results],
             },
             contract_version,
         )
+
+    def search_meetings(
+        self,
+        query: str,
+        limit: int = 10,
+        context: int = 0,
+    ) -> tuple[MeetingSearchResult, ...]:
+        candidate_limit = max(limit, limit * 4)
+        lexical_by_meeting, lexical_order = self._lexical_candidates(query, candidate_limit)
+        exact_tag_order, token_tag_order, tag_names = self._tag_candidates(query)
+
+        ordered_keys = unique_keys((*exact_tag_order, *lexical_order, *token_tag_order))
+        results: list[MeetingSearchResult] = []
+        for key in ordered_keys[:limit]:
+            resolved = self.repo.meeting_ref_by_identity(*key)
+            if resolved is None:
+                continue
+            meeting_id, meeting_ref = resolved
+            evidence = tuple(lexical_by_meeting.get(key, ()))
+            if context and evidence:
+                evidence = self.repo.expand_search_hits(evidence, context)
+            sources: list[RetrievalSource] = []
+            if key in exact_tag_order:
+                sources.append(RetrievalSource.TAG)
+            if key in lexical_by_meeting:
+                sources.append(RetrievalSource.FTS)
+            if key in token_tag_order and RetrievalSource.TAG not in sources:
+                sources.append(RetrievalSource.TAG)
+            results.append(
+                MeetingSearchResult(
+                    meeting_id=meeting_id,
+                    meeting=meeting_ref,
+                    rank=len(results) + 1,
+                    match_sources=tuple(sources),
+                    evidence=evidence,
+                    matched_tags=tuple(tag_names.get(key, ())),
+                )
+            )
+        return tuple(results)
+
+    def _lexical_candidates(
+        self,
+        query: str,
+        limit: int,
+    ) -> tuple[dict[MeetingKey, list[SearchHit]], list[MeetingKey]]:
+        hits_by_meeting: dict[MeetingKey, list[SearchHit]] = {}
+        meeting_order: list[MeetingKey] = []
+        for hit in self.retrieval_strategy.search(query, limit):
+            key = (hit.meeting.source_uuid, hit.meeting.external_id)
+            if key not in hits_by_meeting:
+                hits_by_meeting[key] = []
+                meeting_order.append(key)
+            if len(hits_by_meeting[key]) < MAX_EVIDENCE_PER_MEETING:
+                hits_by_meeting[key].append(hit)
+        return hits_by_meeting, meeting_order
+
+    def _tag_candidates(
+        self,
+        query: str,
+    ) -> tuple[list[MeetingKey], list[MeetingKey], dict[MeetingKey, list[str]]]:
+        exact_order: list[MeetingKey] = []
+        token_order: list[MeetingKey] = []
+        tag_names: dict[MeetingKey, list[str]] = {}
+        for match in self.tag_retrieval_strategy.search(query):
+            key = (match.source_uuid, match.meeting_external_id)
+            if self.repo.get_meeting_by_identity(*key) is None:
+                continue
+            order = exact_order if match.kind == "exact" else token_order
+            if key not in order:
+                order.append(key)
+            names = tag_names.setdefault(key, [])
+            if match.tag.display_name not in names:
+                names.append(match.tag.display_name)
+        return exact_order, token_order, tag_names
 
     def search_hits(self, query: str, limit: int = 10, context: int = 0) -> tuple[SearchHit, ...]:
         hits = self.retrieval_strategy.search(query, limit)
@@ -336,3 +420,9 @@ def validate_contract_version(contract_version: str) -> None:
     if contract_version not in {CORE_V1_VERSION, CORE_V2_VERSION}:
         message = f"Unsupported core contract version: {contract_version}"
         raise ValueError(message)
+
+
+def unique_keys(
+    keys: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(dict.fromkeys(keys))

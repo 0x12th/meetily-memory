@@ -4,6 +4,7 @@ from typing import Protocol
 from meetily_memory.domain import SearchHit
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.semantic_search import EmbeddingProvider, semantic_search
+from meetily_memory.tagging import TagMatch, TagRepository
 
 RRF_K = 60
 HYBRID_CANDIDATE_MULTIPLIER = 4
@@ -46,6 +47,14 @@ class SemanticRetrievalStrategy:
             embedding_provider=self.embedding_provider,
         )
         return tuple(self.repository.search_hit_from_row(row) for row in rows)
+
+
+@dataclass(frozen=True)
+class TagRetrievalStrategy:
+    repository: TagRepository
+
+    def search(self, query: str) -> tuple[TagMatch, ...]:
+        return self.repository.search(query)
 
 
 @dataclass(frozen=True)

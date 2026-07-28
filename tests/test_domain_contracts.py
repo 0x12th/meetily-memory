@@ -27,8 +27,13 @@ def test_core_v1_remains_default_and_v2_is_explicit(meetily_db: Path, tmp_path: 
     assert set(v1["data"]) == set(fixture["search_data_fields"])
     assert set(v1["data"]["results"][0]) == set(fixture["search_result_fields"])
     assert v2["contract_version"] == CORE_V2_VERSION
-    assert set(v2["data"]["results"][0]) == {"id", "meeting", "excerpt", "is_context"}
-    assert "chunk_id" not in v2["data"]["results"][0]
+    assert set(v2["data"]["results"][0]) == set(fixture["search_result_fields"])
+    assert set(v2["data"]["results"][0]["evidence"][0]) == {
+        "id",
+        "meeting",
+        "excerpt",
+        "is_context",
+    }
 
     context = core.build_context("migration risks", limit=3).as_payload()
     assert set(context["data"]) == set(fixture["context_data_fields"])
@@ -124,7 +129,11 @@ def test_context_neighbors_are_explicit_without_changing_search_default(
         "migration risks", limit=3, context=2, contract_version=CORE_V2_VERSION
     )
 
-    assert all(result["is_context"] is False for result in search.data["results"])
+    assert all(
+        evidence["is_context"] is False
+        for result in search.data["results"]
+        for evidence in result["evidence"]
+    )
     assert all(result["is_context"] is False for result in context.data["evidence"])
     assert any(result["is_context"] is True for result in expanded.data["evidence"])
     assert len(expanded.data["evidence"]) <= 20

@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 from meetily_memory.cli.app import app
 from meetily_memory.core import CORE_V2_VERSION, MeetilyMemoryCore
 from meetily_memory.json_codec import loads_json
+from meetily_memory.tagging import TagService
 
 
 def test_legacy_source_path_migrates_idempotently_to_selected_uuid(
@@ -80,9 +81,10 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     before = MeetilyMemoryCore(index_path)
     evidence_id = before.search("migration risks", limit=1, contract_version=CORE_V2_VERSION).data[
         "results"
-    ][0]["id"]
+    ][0]["evidence"][0]["id"]
     task = before.repo.list_structured_entity_details("action_items")[0]
     before.set_task_status(task["id"], "done", note="survives move")
+    TagService(before.repo).assign(("1",), ("Сбер",))
     original_uuid = loads_json((data_dir / "settings.json").read_text())["source_uuid"]
 
     rebind = runner.invoke(
@@ -104,7 +106,7 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     assert (
         after.search("migration risks", limit=1, contract_version=CORE_V2_VERSION).data["results"][
             0
-        ]["id"]
+        ]["evidence"][0]["id"]
         == evidence_id
     )
     matching_tasks = [
@@ -114,6 +116,7 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     ]
     assert matching_tasks[0]["status"] == "done"
     assert matching_tasks[0]["status_note"] == "survives move"
+    assert [tag.display_name for tag in TagService(after.repo).list_for_meeting("1")] == ["Сбер"]
     with sqlite3.connect(index_path) as conn:
         sources = conn.execute("SELECT path FROM sources").fetchall()
     assert sources == [(str(moved_db),)]

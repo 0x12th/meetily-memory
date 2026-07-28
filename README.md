@@ -48,6 +48,13 @@ Open the meeting:
 mm open 10
 ```
 
+Group related meetings with a tag and find them through the same search:
+
+```bash
+mm tag add 10 11 migration
+mm s "migration"
+```
+
 If Meetily cannot be discovered automatically:
 
 ```bash
@@ -68,6 +75,31 @@ Use `--context N` when a matching excerpt needs adjacent transcript chunks:
 ```bash
 mm s "migration risk" --context 2
 ```
+
+## Tags
+
+Assign one or more tags to several meetings:
+
+```bash
+mm tag add 10 11 migration,backend
+mm tag add 10 11 "system design"
+```
+
+List active tags or tags for one meeting:
+
+```bash
+mm tag list
+mm tag list 10
+```
+
+Remove assignments:
+
+```bash
+mm tag remove 10 11 migration
+```
+
+Tags are normalized for matching, survive index rebuilds, and participate in
+ordinary `mm s` searches even when the tag text is absent from the transcript.
 
 ## Refresh
 
@@ -94,7 +126,8 @@ mm update
 
 - Meetily remains the read-only source of truth.
 - `index.sqlite` contains derived data and can be rebuilt.
-- Explicit user state is kept separately from the disposable index.
+- Explicit user state, including tags, is kept in `state.sqlite` separately
+  from the disposable index.
 - Search and indexing run locally.
 
 ## Advanced Commands

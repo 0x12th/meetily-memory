@@ -4,7 +4,7 @@ from pathlib import Path
 from meetily_memory.db.migrations import migrate_to_v1, migrate_to_v2, migrate_to_v3
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
-from meetily_memory.user_state import UserStateRepository
+from meetily_memory.user_state import USER_STATE_SCHEMA, UserStateRepository
 
 
 def test_legacy_task_status_migrates_to_persistent_state_before_index_schema(
@@ -76,6 +76,31 @@ def test_source_uuid_survives_explicit_path_update(tmp_path: Path) -> None:
     assert (
         state.get_or_create_source("meetily_sqlite", "/new/source.sqlite", now="3") == source_uuid
     )
+
+
+def test_user_state_v1_migrates_to_tag_schema_v2_idempotently(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    with sqlite3.connect(state_path) as conn:
+        conn.executescript(USER_STATE_SCHEMA)
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+
+    UserStateRepository(state_path)
+    UserStateRepository(state_path)
+
+    with sqlite3.connect(state_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {"tags", "meeting_tags"} <= tables
+        meeting_tag_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(meeting_tags)").fetchall()
+        }
+        assert {"source_uuid", "meeting_external_id", "tag_id", "source"} <= meeting_tag_columns
 
 
 def _create_v3_index_with_task_status(
