@@ -1,10 +1,11 @@
 # Meetily Memory
 
-Local search over your Meetily meeting history, with source excerpts you can
-verify in the original meeting.
+Find past Meetily discussions, verify them against source excerpts, and open
+the original meeting.
 
 Meetily Memory reads the local Meetily database, builds a private local index,
-and never modifies the source database.
+and never modifies the source database or sends meeting data to a cloud
+service.
 
 ## Install
 
@@ -48,13 +49,6 @@ Open the meeting:
 mm open 10
 ```
 
-Group related meetings with a tag and find them through the same search:
-
-```bash
-mm tag add 10 11 migration
-mm s "migration"
-```
-
 If Meetily cannot be discovered automatically:
 
 ```bash
@@ -76,38 +70,7 @@ Use `--context N` when a matching excerpt needs adjacent transcript chunks:
 mm s "migration risk" --context 2
 ```
 
-## Tags
-
-Assign one or more tags to several meetings:
-
-```bash
-mm tag add 10 11 migration,backend
-mm tag add 10 11 "system design"
-```
-
-List active tags or tags for one meeting:
-
-```bash
-mm tag list
-mm tag list 10
-```
-
-Suggest up to five existing tags without changing stored assignments:
-
-```bash
-mm tag suggest 10
-```
-
-Remove assignments:
-
-```bash
-mm tag remove 10 11 migration
-```
-
-Tags are normalized for matching, survive index rebuilds, and participate in
-ordinary `mm s` searches even when the tag text is absent from the transcript.
-
-## Refresh
+## Keep the Index Fresh
 
 Refresh the local index after new meetings:
 
@@ -128,12 +91,25 @@ Update the installed CLI:
 mm update
 ```
 
+## Optional: Organize With Tags
+
+Search works without manual organization. Add a tag only when several meetings
+belong to a project or topic that is not named consistently in their
+transcripts:
+
+```bash
+mm tag add 10 11 migration
+mm s "migration"
+```
+
+See the [command reference](docs/commands.md) for listing, suggesting, and
+removing tags.
+
 ## Privacy
 
 - Meetily remains the read-only source of truth.
 - `index.sqlite` contains derived data and can be rebuilt.
-- Explicit user state, including tags, is kept in `state.sqlite` separately
-  from the disposable index.
+- Explicit user state is kept separately from the disposable index.
 - Search and indexing run locally.
 
 ## Advanced Commands
