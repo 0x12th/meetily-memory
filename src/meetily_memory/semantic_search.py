@@ -70,6 +70,28 @@ class SemanticSearchConfig:
 
 
 @dataclass(frozen=True)
+class SemanticIndexCoverage:
+    provider: str
+    model: str
+    dimensions: int | None
+    total_chunks: int
+    current_chunks: int
+    vector_rows: int
+    complete: bool
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "dimensions": self.dimensions,
+            "total_chunks": self.total_chunks,
+            "current_chunks": self.current_chunks,
+            "vector_rows": self.vector_rows,
+            "complete": self.complete,
+        }
+
+
+@dataclass(frozen=True)
 class LocalHashEmbeddingProvider:
     name: str = "hash"
     model: str = EMBEDDING_MODEL
@@ -463,6 +485,100 @@ def count_indexed_embeddings(
             (provider.name, provider.model, dimensions),
         ).fetchone()[0]
     )
+
+
+def semantic_index_coverage(
+    index_path: Path,
+    provider: EmbeddingProvider,
+) -> SemanticIndexCoverage:
+    with index_connection(index_path) as conn:
+        total_chunks = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        dimensions = indexed_dimensions(conn, provider)
+        metadata_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'chunk_embeddings'"
+        ).fetchone()
+        if dimensions is None or metadata_exists is None:
+            return SemanticIndexCoverage(
+                provider=provider.name,
+                model=provider.model,
+                dimensions=dimensions,
+                total_chunks=total_chunks,
+                current_chunks=0,
+                vector_rows=0,
+                complete=False,
+            )
+        current_chunks = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM chunks c
+                JOIN chunk_embeddings e
+                  ON e.chunk_id = c.id
+                 AND e.embedding_provider = ?
+                 AND e.embedding_model = ?
+                 AND e.embedding_dimensions = ?
+                 AND e.chunk_fingerprint = c.fingerprint
+                """,
+                (provider.name, provider.model, dimensions),
+            ).fetchone()[0]
+        )
+        vector_table = vector_table_name(provider, dimensions)
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?",
+            (vector_table,),
+        ).fetchone()
+        vector_rows = 0
+        if table_exists is not None:
+            load_sqlite_vec(conn)
+            vector_rows = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {vector_table} v
+                    JOIN chunks c ON c.id = v.rowid
+                    JOIN chunk_embeddings e
+                      ON e.chunk_id = c.id
+                     AND e.embedding_provider = ?
+                     AND e.embedding_model = ?
+                     AND e.embedding_dimensions = ?
+                     AND e.chunk_fingerprint = c.fingerprint
+                    """,
+                    (provider.name, provider.model, dimensions),
+                ).fetchone()[0]
+            )
+    complete = total_chunks > 0 and current_chunks == total_chunks == vector_rows
+    return SemanticIndexCoverage(
+        provider=provider.name,
+        model=provider.model,
+        dimensions=dimensions,
+        total_chunks=total_chunks,
+        current_chunks=current_chunks,
+        vector_rows=vector_rows,
+        complete=complete,
+    )
+
+
+def indexed_dimensions(
+    conn: sqlite3.Connection,
+    provider: EmbeddingProvider,
+) -> int | None:
+    if provider.dims is not None:
+        return provider.dims
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'chunk_embeddings'"
+    ).fetchone()
+    if table_exists is None:
+        return None
+    rows = conn.execute(
+        """
+        SELECT DISTINCT embedding_dimensions
+        FROM chunk_embeddings
+        WHERE embedding_provider = ? AND embedding_model = ?
+        ORDER BY embedding_dimensions
+        """,
+        (provider.name, provider.model),
+    ).fetchall()
+    return int(rows[0][0]) if len(rows) == 1 else None
 
 
 def ollama_embed_endpoint(base_url: str) -> str:

@@ -54,10 +54,17 @@ uv run scripts/evaluate-retrieval.py \
   --allow-drift semantic_dimension
 ```
 
+Use `mm semantic status` to verify that every current chunk has matching metadata and a vector
+row for the selected provider, model, and dimensions. Hybrid skips semantic completely when
+coverage is partial or stale, and falls back to FTS plus tags if semantic query execution fails.
+
 Hybrid evaluation never creates embeddings during a query. It records the provider, model,
-dimension, RRF constant, and candidate multiplier in the manifest. Its lexical and semantic
-ranks remain diagnostic retrieval trace data and are not added to `SearchHit`. A successful
-single comparison does not change standard lexical search or expose hybrid retrieval in the CLI.
+dimension, RRF constant, candidate multiplier, FTS/semantic/tag weights, and warmup in the
+manifest. Fusion happens after each source is collapsed to meetings; source ranks and the fused
+score remain diagnostic trace data and are not added to `MeetingSearchResult`. When a compatible
+baseline is supplied, the runner includes the regression-gate result in its JSON output. A
+successful single comparison does not change standard search or expose hybrid controls in the
+public CLI.
 
 Reports are immutable: the runner refuses to overwrite an existing output path. Automatic
 comparison is rejected when the dataset, corpus, tag-state fingerprint, index schema, retrieval

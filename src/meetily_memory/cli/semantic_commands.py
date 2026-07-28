@@ -18,6 +18,7 @@ from meetily_memory.semantic_search import (
     load_semantic_config,
     resolve_embedding_provider,
     save_semantic_config,
+    semantic_index_coverage,
     semantic_search,
 )
 
@@ -150,6 +151,40 @@ def semantic_index_command(
         return
     print_text_block(f"embedding: {provider.name}/{provider.model}")
     print_text_block(f"embeddings indexed: {indexed}")
+
+
+@semantic_app.command("status")
+def semantic_status_command(
+    ctx: typer.Context,
+    embedding_provider: Annotated[
+        str | None,
+        typer.Option("--provider", "--embedding-provider"),
+    ] = None,
+    embedding_model: Annotated[
+        str | None,
+        typer.Option("--model", "--embedding-model"),
+    ] = None,
+    ollama_url: Annotated[
+        str | None,
+        typer.Option("--ollama-url"),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    provider = resolve_embedding_provider(
+        embedding_provider,
+        ollama_model=embedding_model,
+        ollama_url=ollama_url,
+    )
+    coverage = semantic_index_coverage(ctx.obj["index_path"], provider)
+    if json_output:
+        print_json(coverage.as_payload())
+        return
+    print_text_block(f"embedding: {coverage.provider}/{coverage.model}")
+    print_text_block(f"coverage: {coverage.current_chunks}/{coverage.total_chunks} chunks")
+    print_text_block(f"vector rows: {coverage.vector_rows}")
+    print_text_block(f"complete: {'yes' if coverage.complete else 'no'}")
+    if not coverage.complete:
+        print_text_block("next: mm semantic index")
 
 
 def semantic_setup(

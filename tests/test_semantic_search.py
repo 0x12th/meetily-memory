@@ -21,6 +21,7 @@ from meetily_memory.semantic_search import (
     load_semantic_config,
     load_sqlite_vec,
     resolve_embedding_provider,
+    semantic_index_coverage,
     semantic_search,
     vector_table_name,
 )
@@ -150,6 +151,52 @@ def test_semantic_index_cleans_orphaned_vector_rows(meetily_db: Path, tmp_path: 
 
     assert indexed == 0
     assert orphaned == 0
+
+
+@requires_sqlite_vec
+def test_semantic_coverage_requires_current_metadata_and_vector_rows(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    provider = StubEmbeddingProvider()
+    index_semantic_embeddings(index_path, embedding_provider=provider)
+
+    complete = semantic_index_coverage(index_path, provider)
+
+    assert complete.complete is True
+    assert complete.current_chunks == complete.total_chunks
+    assert complete.vector_rows == complete.total_chunks
+    with index_connection(index_path) as conn:
+        conn.execute("UPDATE chunk_embeddings SET chunk_fingerprint = 'stale' WHERE chunk_id = 1")
+        conn.commit()
+
+    stale = semantic_index_coverage(index_path, provider)
+
+    assert stale.complete is False
+    assert stale.current_chunks == stale.total_chunks - 1
+
+
+@requires_sqlite_vec
+def test_semantic_coverage_detects_missing_vector_row(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    provider = StubEmbeddingProvider()
+    index_semantic_embeddings(index_path, embedding_provider=provider)
+    vector_table = vector_table_name(provider, 3)
+    with index_connection(index_path) as conn:
+        load_sqlite_vec(conn)
+        conn.execute(f"DELETE FROM {vector_table} WHERE rowid = 1")  # noqa: S608
+        conn.commit()
+
+    coverage = semantic_index_coverage(index_path, provider)
+
+    assert coverage.complete is False
+    assert coverage.vector_rows == coverage.total_chunks - 1
 
 
 @requires_sqlite_vec

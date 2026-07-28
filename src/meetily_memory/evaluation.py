@@ -250,6 +250,7 @@ class EvaluationRetrievalConfig:
     semantic_model: str | None = None
     semantic_dimension: int | None = None
     repository_root: Path | None = None
+    warmup: bool = False
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,7 @@ class EvaluationReport:
     dataset_version: str
     metrics: EvaluationMetrics
     tasks: tuple[ObservedTask, ...]
+    cold_start_latency_ms: float | None = None
 
     @classmethod
     def for_tests(
@@ -289,6 +291,15 @@ class EvaluationComparison:
     by_class: dict[str, ComparisonCount]
     critical_regressions: list[str]
     allowed_manifest_drift: list[str]
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class HybridGateResult:
+    passed: bool
+    failures: tuple[str, ...]
 
     def as_payload(self) -> dict[str, Any]:
         return asdict(self)
@@ -334,6 +345,8 @@ def task_from_payload(payload: object, schema_version: str) -> EvaluationTask:
             message = "evaluation task expected_meetings must be a list"
             raise TypeError(message)
         expected_meetings = tuple(str(item) for item in raw_expected_meetings)
+    elif isinstance(raw_expected_meetings, list):
+        expected_meetings = tuple(str(item) for item in raw_expected_meetings)
     else:
         expected_meetings = tuple(
             dict.fromkeys(item.evidence_id.split("/", 1)[0] for item in expected)
@@ -378,25 +391,33 @@ def evaluate_retrieval(
     index_path = Path(index_path)
     repo = IndexRepository(index_path)
     retrieval_config = config or EvaluationRetrievalConfig()
-    strategy = retrieval_config.strategy or LexicalRetrievalStrategy(repo)
+    cold_start_latency_ms = None
+    if retrieval_config.warmup and dataset.tasks:
+        started = perf_counter()
+        retrieve_results(
+            repo,
+            retrieval_config,
+            dataset.tasks[0].query,
+            limit,
+            context,
+        )
+        cold_start_latency_ms = (perf_counter() - started) * 1000
     observed: list[ObservedTask] = []
     for task in dataset.tasks:
         started = perf_counter()
-        if retrieval_config.meeting_strategy is not None:
-            results = retrieval_config.meeting_strategy.search_meetings(
-                task.query,
-                limit,
-                context,
-            )
-        else:
-            hits = strategy.search(task.query, limit)
-            if context:
-                hits = repo.expand_search_hits(hits, context)
-            results = collapse_search_hits(repo, hits, retrieval_config.mode)
+        results = retrieve_results(
+            repo,
+            retrieval_config,
+            task.query,
+            limit,
+            context,
+        )
         latency_ms = (perf_counter() - started) * 1000
         observed.append(observe_task(task, results, latency_ms))
     manifest_parameters: dict[str, Any] = {"limit": limit, "context": context}
     manifest_parameters.update(retrieval_config.parameters)
+    if retrieval_config.warmup:
+        manifest_parameters["warmed_up"] = True
     manifest = build_manifest(
         dataset,
         index_path,
@@ -410,7 +431,24 @@ def evaluate_retrieval(
         dataset_version=dataset.dataset_version,
         metrics=aggregate_metrics(tasks),
         tasks=tasks,
+        cold_start_latency_ms=cold_start_latency_ms,
     )
+
+
+def retrieve_results(
+    repository: IndexRepository,
+    config: EvaluationRetrievalConfig,
+    query: str,
+    limit: int,
+    context: int,
+) -> tuple[MeetingSearchResult, ...]:
+    if config.meeting_strategy is not None:
+        return config.meeting_strategy.search_meetings(query, limit, context)
+    strategy = config.strategy or LexicalRetrievalStrategy(repository)
+    hits = strategy.search(query, limit)
+    if context:
+        hits = repository.expand_search_hits(hits, context)
+    return collapse_search_hits(repository, hits, config.mode)
 
 
 def observe_task(
@@ -549,6 +587,43 @@ def compare_reports(
     )
 
 
+def evaluate_hybrid_gate(
+    baseline: EvaluationReport,
+    candidate: EvaluationReport,
+    comparison: EvaluationComparison,
+    *,
+    warm_p95_limit_ms: float = 300.0,
+) -> HybridGateResult:
+    failures: list[str] = []
+    if comparison.critical_regressions:
+        failures.append(f"critical regressions: {', '.join(comparison.critical_regressions)}")
+    exact_regressions = comparison.by_class.get(
+        "exact_match",
+        ComparisonCount(0, 0, 0),
+    ).regressions
+    if exact_regressions:
+        failures.append(f"exact-query regressions: {exact_regressions}")
+    semantic_counts = [
+        comparison.by_class.get(name, ComparisonCount(0, 0, 0))
+        for name in ("semantic", "paraphrase")
+    ]
+    semantic_improvements = sum(item.improvements for item in semantic_counts)
+    semantic_regressions = sum(item.regressions for item in semantic_counts)
+    if semantic_improvements <= semantic_regressions:
+        failures.append("semantic/paraphrase improvements must exceed regressions")
+    if comparison.improvements <= comparison.regressions:
+        failures.append("overall improvements must exceed regressions")
+    if candidate.metrics.mrr < baseline.metrics.mrr:
+        failures.append("MRR regressed")
+    if candidate.metrics.ndcg < baseline.metrics.ndcg:
+        failures.append("nDCG regressed")
+    if candidate.manifest.retrieval_parameters.get("warmed_up") is not True:
+        failures.append("candidate latency was not measured after warmup")
+    if candidate.metrics.p95_latency_ms > warm_p95_limit_ms:
+        failures.append(f"warm p95 latency exceeds {warm_p95_limit_ms:g} ms")
+    return HybridGateResult(passed=not failures, failures=tuple(failures))
+
+
 def save_report(report: EvaluationReport, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -575,6 +650,11 @@ def load_report(path: Path) -> EvaluationReport:
         dataset_version=str(payload["dataset_version"]),
         metrics=metrics,
         tasks=tasks,
+        cold_start_latency_ms=(
+            float(payload["cold_start_latency_ms"])
+            if payload.get("cold_start_latency_ms") is not None
+            else None
+        ),
     )
 
 

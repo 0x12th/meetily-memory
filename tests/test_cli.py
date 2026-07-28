@@ -798,6 +798,14 @@ def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path:
     )
     assert scan.exit_code == 0
 
+    incomplete_status = runner.invoke(
+        app,
+        ["--index", str(index_path), "semantic", "status", "--json"],
+        env=semantic_env,
+    )
+    assert incomplete_status.exit_code == 0
+    assert json.loads(incomplete_status.stdout)["complete"] is False
+
     semantic_index = runner.invoke(
         app,
         ["--index", str(index_path), "semantic", "index"],
@@ -805,6 +813,14 @@ def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path:
     )
     assert semantic_index.exit_code == 0
     assert "embeddings indexed:" in semantic_index.stdout
+    complete_status = runner.invoke(
+        app,
+        ["--index", str(index_path), "semantic", "status", "--json"],
+        env=semantic_env,
+    )
+    coverage = json.loads(complete_status.stdout)
+    assert coverage["complete"] is True
+    assert coverage["current_chunks"] == coverage["total_chunks"]
 
     semantic_alias = runner.invoke(
         app,

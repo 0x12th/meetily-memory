@@ -6,6 +6,7 @@ from pathlib import Path
 from meetily_memory.evaluation import (
     EvaluationRetrievalConfig,
     compare_reports,
+    evaluate_hybrid_gate,
     evaluate_retrieval,
     load_dataset,
     load_report,
@@ -19,8 +20,10 @@ from meetily_memory.retrieval import (
     HybridRetrievalStrategy,
     LexicalRetrievalStrategy,
     SemanticRetrievalStrategy,
+    TagRetrievalStrategy,
 )
-from meetily_memory.semantic_search import resolve_embedding_provider
+from meetily_memory.semantic_search import resolve_embedding_provider, semantic_index_coverage
+from meetily_memory.tagging import TagRepository
 
 
 def main() -> None:
@@ -60,6 +63,9 @@ def main() -> None:
     )
     parser.add_argument("--embedding-model", help="Ollama embedding model for hybrid evaluation.")
     parser.add_argument("--ollama-url", help="Ollama base URL for hybrid evaluation.")
+    parser.add_argument("--fts-weight", type=float, default=1.0)
+    parser.add_argument("--semantic-weight", type=float, default=1.0)
+    parser.add_argument("--tag-weight", type=float, default=1.0)
     parser.add_argument(
         "--context",
         type=int,
@@ -69,6 +75,7 @@ def main() -> None:
     args = parser.parse_args()
 
     strategy = None
+    meeting_strategy = None
     retrieval_mode = "fts5"
     retrieval_parameters: dict[str, object] = {}
     semantic_provider = None
@@ -81,18 +88,29 @@ def main() -> None:
             ollama_url=args.ollama_url,
         )
         repository = IndexRepository(args.index)
-        strategy = HybridRetrievalStrategy(
+        meeting_strategy = HybridRetrievalStrategy(
+            repository=repository,
             lexical=LexicalRetrievalStrategy(repository),
             semantic=SemanticRetrievalStrategy(repository, provider),
+            tags=TagRetrievalStrategy(TagRepository(repository.state_path)),
+            semantic_provider=provider,
+            fts_weight=args.fts_weight,
+            semantic_weight=args.semantic_weight,
+            tag_weight=args.tag_weight,
         )
         retrieval_mode = "hybrid_rrf"
         retrieval_parameters = {
             "rrf_k": RRF_K,
             "candidate_multiplier": HYBRID_CANDIDATE_MULTIPLIER,
+            "fts_weight": args.fts_weight,
+            "semantic_weight": args.semantic_weight,
+            "tag_weight": args.tag_weight,
         }
         semantic_provider = provider.name
         semantic_model = provider.model
-        semantic_dimension = provider.dims or len(provider.embed([""])[0])
+        semantic_dimension = semantic_index_coverage(args.index, provider).dimensions
+        if semantic_dimension is None:
+            parser.error("No indexed dimensions found for the selected semantic provider/model.")
 
     report = evaluate_retrieval(
         load_dataset(args.dataset),
@@ -101,21 +119,31 @@ def main() -> None:
         context=args.context,
         config=EvaluationRetrievalConfig(
             strategy=strategy,
+            meeting_strategy=meeting_strategy,
             mode=retrieval_mode,
             parameters=retrieval_parameters,
             semantic_provider=semantic_provider,
             semantic_model=semantic_model,
             semantic_dimension=semantic_dimension,
+            warmup=True,
         ),
     )
     save_report(report, args.output)
     payload: dict[str, object] = {"report": report.as_payload()}
     if args.baseline:
-        payload["comparison"] = compare_reports(
-            load_report(args.baseline),
+        baseline = load_report(args.baseline)
+        comparison = compare_reports(
+            baseline,
             report,
             allow_manifest_drift=set(args.allow_drift),
-        ).as_payload()
+        )
+        payload["comparison"] = comparison.as_payload()
+        if args.retrieval == "hybrid":
+            payload["gate"] = evaluate_hybrid_gate(
+                baseline,
+                report,
+                comparison,
+            ).as_payload()
     sys.stdout.write(dumps_json(payload))
     sys.stdout.write("\n")
 

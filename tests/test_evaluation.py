@@ -16,6 +16,7 @@ from meetily_memory.evaluation import (
     ExpectedEvidence,
     ObservedTask,
     compare_reports,
+    evaluate_hybrid_gate,
     evaluate_retrieval,
     load_dataset,
 )
@@ -226,6 +227,30 @@ def test_evaluation_records_explicit_hybrid_strategy(meetily_db: Path, tmp_path:
     assert report.manifest.semantic_dimension == 768
 
 
+def test_evaluation_records_cold_start_before_warm_latency_measurements(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
+    hit = MeetilyMemoryCore(index_path).search_hits("pricing decision", 1)[0]
+
+    report = evaluate_retrieval(
+        dataset,
+        index_path,
+        limit=5,
+        config=EvaluationRetrievalConfig(
+            strategy=FixedEvaluationStrategy((hit,)),
+            warmup=True,
+        ),
+    )
+
+    assert report.cold_start_latency_ms is not None
+    assert report.cold_start_latency_ms >= 0
+    assert report.manifest.retrieval_parameters["warmed_up"] is True
+
+
 @requires_sqlite_vec
 def test_evaluation_script_runs_explicit_hybrid_mode(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
@@ -260,6 +285,8 @@ def test_evaluation_script_runs_explicit_hybrid_mode(meetily_db: Path, tmp_path:
     assert report["manifest"]["retrieval_mode"] == "hybrid_rrf"
     assert report["manifest"]["semantic_provider"] == "hash"
     assert report["manifest"]["semantic_model"] == "local-hash-v1"
+    assert report["manifest"]["retrieval_parameters"]["warmed_up"] is True
+    assert report["cold_start_latency_ms"] >= 0
 
 
 def test_report_comparison_is_paired_by_task_and_class() -> None:
@@ -287,6 +314,47 @@ def test_report_comparison_is_paired_by_task_and_class() -> None:
     assert comparison.transitions == ["risk: failure -> success"]
     assert comparison.by_class["risk"].improvements == 1
     assert comparison.critical_regressions == []
+
+
+def test_hybrid_gate_requires_semantic_wins_without_exact_regressions() -> None:
+    manifest = replace(
+        EvaluationManifest.compatible_for_tests(),
+        retrieval_parameters={"limit": 5, "warmed_up": True},
+    )
+    baseline = EvaluationReport.for_tests(
+        manifest,
+        [
+            ObservedTask.for_tests("exact", "exact_match", success=True, ndcg=1.0),
+            ObservedTask.for_tests("semantic", "semantic", success=False, ndcg=0.0),
+        ],
+    )
+    candidate = EvaluationReport.for_tests(
+        manifest,
+        [
+            ObservedTask.for_tests("exact", "exact_match", success=True, ndcg=1.0),
+            ObservedTask.for_tests("semantic", "semantic", success=True, ndcg=1.0),
+        ],
+    )
+    comparison = compare_reports(baseline, candidate)
+
+    passed = evaluate_hybrid_gate(baseline, candidate, comparison)
+    regressed = EvaluationReport.for_tests(
+        manifest,
+        [
+            ObservedTask.for_tests("exact", "exact_match", success=False, ndcg=0.0),
+            ObservedTask.for_tests("semantic", "semantic", success=True, ndcg=1.0),
+        ],
+    )
+    failed = evaluate_hybrid_gate(
+        baseline,
+        regressed,
+        compare_reports(baseline, regressed),
+    )
+
+    assert passed.passed is True
+    assert passed.failures == ()
+    assert failed.passed is False
+    assert "exact-query regressions: 1" in failed.failures
 
 
 def test_report_comparison_rejects_incompatible_manifests() -> None:
