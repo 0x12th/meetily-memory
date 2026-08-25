@@ -6,21 +6,37 @@ from meetily_memory.context_builder import (
     DEFAULT_CONTEXT_NEIGHBORS,
     MAX_CONTEXT_EVIDENCE,
     ContextBundleBuilder,
-    ContextRenderer,
 )
-from meetily_memory.db.repository import IndexRepository
 from meetily_memory.domain import (
-    CompactSearchHit,
     ContextBundle,
-    MeetingSearchResult,
+    GraphEdge,
+    GraphNode,
+    Meeting,
+    MeetingChunk,
+    Person,
+    PersonMemory,
+    ProjectMemory,
     SearchHit,
+    SearchResults,
+    StructuredEntities,
+    SummaryMemory,
+    TaskStatusResult,
+    TimelineMemory,
+    Topic,
+    TopicAliasResult,
+    TopicGraph,
+    TopicMemory,
 )
 from meetily_memory.local_memory import (
     person_memory,
     project_memory,
+    ranked_excerpt_from_row,
+    structured_entity_kind,
+    structured_signal_from_row,
     summary_memory,
     timeline_signals,
 )
+from meetily_memory.repositories.index import IndexRepository, meeting_from_row, optional_str
 from meetily_memory.retrieval import (
     LexicalRetrievalStrategy,
     LexicalTagMeetingRetrievalStrategy,
@@ -30,24 +46,17 @@ from meetily_memory.retrieval import (
 )
 from meetily_memory.tagging import TagRepository
 
-CORE_V1_VERSION = "meetily-memory.core.v1"
-CORE_V2_VERSION = "meetily-memory.core.v2"
-CORE_V3_VERSION = "meetily-memory.core.v3"
-CONTRACT_VERSION = CORE_V1_VERSION
+
+class MeetingNotFoundError(LookupError):
+    pass
 
 
-@dataclass(frozen=True)
-class CoreResponse:
-    kind: str
-    data: dict[str, Any]
-    contract_version: str = CORE_V1_VERSION
+class EvidenceNotFoundError(LookupError):
+    pass
 
-    def as_payload(self) -> dict[str, Any]:
-        return {
-            "contract_version": self.contract_version,
-            "kind": self.kind,
-            "data": self.data,
-        }
+
+class TaskNotFoundError(LookupError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -74,124 +83,48 @@ class MeetilyMemoryCore:
         retrieval_strategy: RetrievalStrategy | None = None,
         meeting_retrieval_strategy: MeetingRetrievalStrategy | None = None,
     ) -> None:
-        self.repo = IndexRepository(Path(index_path), state_path=state_path)
-        self.retrieval_strategy = retrieval_strategy or LexicalRetrievalStrategy(self.repo)
-        self.tag_repository = TagRepository(self.repo.state_path)
-        self.tag_retrieval_strategy = TagRetrievalStrategy(self.tag_repository)
-        self.meeting_retrieval_strategy = (
-            meeting_retrieval_strategy
-            or LexicalTagMeetingRetrievalStrategy(
-                repository=self.repo,
-                lexical=self.retrieval_strategy,
-                tags=self.tag_retrieval_strategy,
-            )
+        repository = IndexRepository(Path(index_path), state_path=state_path)
+        self._repository = repository
+        lexical = retrieval_strategy or LexicalRetrievalStrategy(repository)
+        tag_repository = TagRepository(repository.state_path)
+        tag_retrieval = TagRetrievalStrategy(tag_repository)
+        self._meeting_retrieval = meeting_retrieval_strategy or LexicalTagMeetingRetrievalStrategy(
+            repository=repository,
+            lexical=lexical,
+            tags=tag_retrieval,
         )
-        self.context_builder = ContextBundleBuilder(self.repo)
-        self.context_renderer = ContextRenderer()
+        self._context_builder = ContextBundleBuilder(repository)
 
     def search(
         self,
         query: str,
         limit: int = 10,
         context: int = 0,
-        *,
-        contract_version: str = CORE_V1_VERSION,
-    ) -> CoreResponse:
-        validate_contract_version(contract_version)
-        if contract_version == CORE_V1_VERSION:
-            rows = self.repo.search(query, limit, context=context)
-            results = serialize_hits((), rows, contract_version)
-        elif contract_version == CORE_V2_VERSION:
-            hits = self.search_hits(query, limit, context)
-            results = serialize_hits(hits, [], contract_version)
-        else:
-            results = [
-                result.as_payload() for result in self.search_meetings(query, limit, context)
-            ]
-        return CoreResponse(
-            "search",
-            {
-                "query": query,
-                "context": context,
-                "results": results,
-            },
-            contract_version,
+    ) -> SearchResults:
+        return SearchResults(
+            query=query,
+            context=context,
+            results=self._meeting_retrieval.search_meetings(query, limit, context),
         )
-
-    def search_meetings(
-        self,
-        query: str,
-        limit: int = 10,
-        context: int = 0,
-    ) -> tuple[MeetingSearchResult, ...]:
-        return self.meeting_retrieval_strategy.search_meetings(query, limit, context)
-
-    def search_hits(self, query: str, limit: int = 10, context: int = 0) -> tuple[SearchHit, ...]:
-        hits = self.retrieval_strategy.search(query, limit)
-        return self.repo.expand_search_hits(hits, context) if context else hits
-
-    def compact_search_hits(
-        self,
-        query: str,
-        limit: int = 10,
-        *,
-        preview_length: int = 240,
-    ) -> tuple[CompactSearchHit, ...]:
-        return tuple(hit.compact(preview_length) for hit in self.search_hits(query, limit))
-
-    def get_search_hit(self, evidence_id: str) -> SearchHit | None:
-        return self.repo.get_search_hit(evidence_id)
 
     def resolve_search_hit(self, evidence_id: str) -> SearchHit:
-        hit = self.get_search_hit(evidence_id)
+        hit = self._repository.get_search_hit(evidence_id)
         if hit is None:
             message = f"Evidence not found: {evidence_id}"
-            raise LookupError(message)
+            raise EvidenceNotFoundError(message)
         return hit
-
-    def context_bundle(
-        self,
-        question: str,
-        limit: int = 8,
-        *,
-        options: ContextRetrievalOptions | None = None,
-    ) -> ContextBundle:
-        retrieval_options = options or ContextRetrievalOptions()
-        return self.context_builder.build(
-            question,
-            limit,
-            meeting_id=retrieval_options.meeting_id,
-            neighbor_count=retrieval_options.neighbor_count,
-            max_evidence=retrieval_options.max_evidence,
-        )
 
     def build_context(
         self,
         question: str,
         limit: int = 8,
         *,
-        contract_version: str = CORE_V1_VERSION,
         context: int = DEFAULT_CONTEXT_NEIGHBORS,
-    ) -> CoreResponse:
-        validate_contract_version(contract_version)
-        if contract_version in {CORE_V2_VERSION, CORE_V3_VERSION}:
-            bundle = self.context_bundle(
-                question,
-                limit,
-                options=ContextRetrievalOptions(neighbor_count=context),
-            )
-            return CoreResponse("context", bundle.as_payload(), contract_version)
-        rows = self.repo.search(question, limit, context=context)[:MAX_CONTEXT_EVIDENCE]
-        evidence = tuple(self.repo.search_hit_from_row(row) for row in rows)
-        bundle = ContextBundle(question=question, evidence=evidence, entities=())
-        return CoreResponse(
-            "context",
-            {
-                "question": question,
-                "markdown": self.context_renderer.render(bundle),
-                "evidence": serialize_hits(evidence, rows, CORE_V1_VERSION),
-            },
-            contract_version,
+    ) -> ContextBundle:
+        return self._build_context_bundle(
+            question,
+            limit,
+            ContextRetrievalOptions(neighbor_count=context),
         )
 
     def build_meeting_context(
@@ -200,105 +133,84 @@ class MeetilyMemoryCore:
         meeting_id: str,
         limit: int = 8,
         *,
-        contract_version: str = CORE_V1_VERSION,
         context: int = DEFAULT_CONTEXT_NEIGHBORS,
-    ) -> CoreResponse:
-        validate_contract_version(contract_version)
-        meeting = self.repo.get_meeting(meeting_id)
+    ) -> ContextBundle:
+        meeting = self._repository.get_meeting(meeting_id)
         if meeting is None:
             message = f"Meeting not found: {meeting_id}"
-            raise ValueError(message)
-        if contract_version in {CORE_V2_VERSION, CORE_V3_VERSION}:
-            bundle = self.context_bundle(
-                question,
-                limit,
-                options=ContextRetrievalOptions(
-                    meeting_id=int(meeting["id"]),
-                    neighbor_count=context,
-                ),
-            )
-            return CoreResponse("meeting_context", bundle.as_payload(), contract_version)
-        rows = self.repo.search(
+            raise MeetingNotFoundError(message)
+        return self._build_context_bundle(
             question,
             limit,
-            meeting_id=int(meeting["id"]),
-            context=context,
-        )[:MAX_CONTEXT_EVIDENCE]
-        evidence = tuple(self.repo.search_hit_from_row(row) for row in rows)
-        bundle = ContextBundle(question=question, evidence=evidence, entities=())
-        return CoreResponse(
-            "meeting_context",
-            {
-                "question": question,
-                "meeting": meeting,
-                "markdown": self.context_renderer.render(bundle),
-                "evidence": serialize_hits(evidence, rows, CORE_V1_VERSION),
-            },
-            contract_version,
+            ContextRetrievalOptions(
+                meeting_id=int(meeting["id"]),
+                neighbor_count=context,
+            ),
         )
 
-    def meetings(self, limit: int = 20, person: str | None = None) -> CoreResponse:
-        return CoreResponse(
-            "meetings",
-            {
-                "person": person,
-                "meetings": self.repo.list_meetings(limit=limit, person=person),
-            },
+    def meetings(self, limit: int = 20, person: str | None = None) -> tuple[Meeting, ...]:
+        return tuple(
+            meeting_from_row(row)
+            for row in self._repository.list_meetings(limit=limit, person=person)
         )
 
-    def latest_meeting(self, person: str | None = None) -> CoreResponse:
-        rows = self.repo.list_meetings(limit=1, person=person)
-        return CoreResponse(
-            "latest_meeting",
-            {
-                "person": person,
-                "meeting": rows[0] if rows else None,
-            },
+    def latest_meeting(self, person: str | None = None) -> Meeting | None:
+        meetings = self.meetings(limit=1, person=person)
+        return meetings[0] if meetings else None
+
+    def get_meeting(self, meeting_id: str) -> Meeting | None:
+        row = self._repository.get_meeting(meeting_id)
+        return meeting_from_row(row) if row is not None else None
+
+    def meeting_chunks(self, meeting_id: int) -> tuple[MeetingChunk, ...]:
+        return tuple(
+            meeting_chunk_from_row(row)
+            for row in self._repository.get_chunks_for_meeting(meeting_id)
         )
 
-    def get_meeting(self, meeting_id: str) -> CoreResponse:
-        return CoreResponse(
-            "meeting",
-            {
-                "meeting": self.repo.get_meeting(meeting_id),
-            },
+    def summary(self) -> SummaryMemory:
+        return summary_memory(self._repository)
+
+    def timeline(self, query: str | None = None, limit: int = 20) -> TimelineMemory:
+        return timeline_signals(self._repository, query, limit)
+
+    def project(self, query: str, limit: int = 10) -> ProjectMemory:
+        return project_memory(self._repository, query, limit)
+
+    def person(self, name: str, limit: int = 10) -> PersonMemory:
+        return person_memory(self._repository, name, limit)
+
+    def topic(self, query: str, limit: int = 10) -> TopicMemory:
+        payload = self._repository.topic_memory(query, limit)
+        return TopicMemory(
+            topic=topic_from_row(payload["topic"]),
+            language=optional_str(payload.get("language")),
+            query_terms=tuple(str(term) for term in payload["query_terms"]),
+            meetings=tuple(ranked_excerpt_from_row(row) for row in payload["meetings"]),
+            evidence=tuple(ranked_excerpt_from_row(row) for row in payload["evidence"]),
+            structured_signals=tuple(
+                structured_signal_from_row(row) for row in payload["structured_signals"]
+            ),
+            related_people=tuple(person_from_row(row) for row in payload["related_people"]),
         )
 
-    def meeting_chunks(self, meeting_id: int) -> CoreResponse:
-        return CoreResponse(
-            "meeting_chunks",
-            {
-                "meeting_id": meeting_id,
-                "chunks": self.repo.get_chunks_for_meeting(meeting_id),
-            },
+    def topics(self, limit: int = 100) -> tuple[Topic, ...]:
+        return tuple(topic_from_row(row) for row in self._repository.list_topics(limit))
+
+    def add_topic_alias(self, query: str, aliases: list[str]) -> TopicAliasResult:
+        payload = self._repository.ensure_topic(query, aliases=aliases)
+        return TopicAliasResult(
+            topic=topic_from_row(payload),
+            added_aliases=tuple(str(alias) for alias in payload["added_aliases"]),
         )
 
-    def summary(self) -> CoreResponse:
-        return CoreResponse("summary", summary_memory(self.repo).as_payload())
-
-    def timeline(self, query: str | None = None, limit: int = 20) -> CoreResponse:
-        return CoreResponse(
-            "timeline",
-            {
-                "query": query,
-                "signals": timeline_signals(self.repo, query, limit),
-            },
+    def graph(self, query: str, limit: int = 50) -> TopicGraph:
+        payload = self._repository.graph_for_topic(query, limit)
+        return TopicGraph(
+            topic=topic_from_row(payload["topic"]),
+            nodes=tuple(graph_node_from_row(row) for row in payload["nodes"]),
+            edges=tuple(graph_edge_from_row(row) for row in payload["edges"]),
         )
-
-    def project(self, query: str, limit: int = 10) -> CoreResponse:
-        return CoreResponse("project", project_memory(self.repo, query, limit).as_payload())
-
-    def person(self, name: str, limit: int = 10) -> CoreResponse:
-        return CoreResponse("person", person_memory(self.repo, name, limit).as_payload())
-
-    def topic(self, query: str, limit: int = 10) -> CoreResponse:
-        return CoreResponse("topic", self.repo.topic_memory(query, limit))
-
-    def add_topic_alias(self, query: str, aliases: list[str]) -> CoreResponse:
-        return CoreResponse("topic_alias", self.repo.ensure_topic(query, aliases=aliases))
-
-    def graph(self, query: str, limit: int = 50) -> CoreResponse:
-        return CoreResponse("graph", self.repo.graph_for_topic(query, limit))
 
     def structured_entities(
         self,
@@ -306,14 +218,13 @@ class MeetilyMemoryCore:
         limit: int = 20,
         *,
         status: str = "all",
-    ) -> CoreResponse:
-        return CoreResponse(
-            "structured_entities",
-            {
-                "entity_kind": kind,
-                "status": status,
-                "entities": self.repo.list_structured_entity_details(kind, limit, status=status),
-            },
+    ) -> StructuredEntities:
+        entity_kind = structured_entity_kind(kind)
+        rows = self._repository.list_structured_entity_details(kind, limit, status=status)
+        return StructuredEntities(
+            entity_kind=entity_kind,
+            status=status,
+            entities=tuple(structured_signal_from_row(row) for row in rows),
         )
 
     def set_task_status(
@@ -322,53 +233,84 @@ class MeetilyMemoryCore:
         status: str,
         *,
         note: str | None = None,
-    ) -> CoreResponse:
-        return CoreResponse(
-            "task_status",
-            self.repo.set_task_status(task_id, status, note=note),
+    ) -> TaskStatusResult:
+        try:
+            row = self._repository.set_task_status(task_id, status, note=note)
+        except ValueError as exc:
+            if str(exc).startswith("Task not found:"):
+                raise TaskNotFoundError(str(exc)) from exc
+            raise
+        return TaskStatusResult(
+            id=int(row["id"]),
+            text=str(row["text"]),
+            status=str(row["status"]),
+            status_note=optional_str(row.get("status_note")),
+            status_source=str(row["status_source"]),
+            status_updated_at=str(row["status_updated_at"]),
+        )
+
+    def _build_context_bundle(
+        self,
+        question: str,
+        limit: int,
+        options: ContextRetrievalOptions,
+    ) -> ContextBundle:
+        return self._context_builder.build(
+            question,
+            limit,
+            meeting_id=options.meeting_id,
+            neighbor_count=options.neighbor_count,
+            max_evidence=options.max_evidence,
         )
 
 
-V1_SEARCH_FIELDS = (
-    "meeting_id",
-    "meeting_external_id",
-    "title",
-    "created_at",
-    "updated_at",
-    "folder_path",
-    "language",
-    "chunk_id",
-    "chunk_external_id",
-    "kind",
-    "ordinal",
-    "text",
-    "speaker",
-    "starts_at_seconds",
-    "ends_at_seconds",
-    "timestamp_label",
-    "rank",
-)
+def meeting_chunk_from_row(row: dict[str, Any]) -> MeetingChunk:
+    return MeetingChunk(
+        id=int(row["id"]),
+        external_id=optional_str(row.get("external_id")),
+        kind=str(row["kind"]),
+        ordinal=int(row["ordinal"]),
+        text=str(row["text"]),
+        speaker=optional_str(row.get("speaker")),
+        starts_at_seconds=optional_float(row.get("starts_at_seconds")),
+        ends_at_seconds=optional_float(row.get("ends_at_seconds")),
+        timestamp_label=optional_str(row.get("timestamp_label")),
+    )
 
 
-def serialize_hits(
-    hits: tuple[SearchHit, ...],
-    rows: list[dict[str, Any]],
-    contract_version: str,
-) -> list[dict[str, object]]:
-    if contract_version == CORE_V2_VERSION:
-        return [hit.as_payload() for hit in hits]
-    return [serialize_v1_search_row(row) for row in rows]
+def topic_from_row(row: dict[str, Any]) -> Topic:
+    return Topic(
+        id=int(row["id"]),
+        title=str(row["title"]),
+        aliases=tuple(str(alias) for alias in row["aliases"]),
+    )
 
 
-def serialize_v1_search_row(row: dict[str, Any]) -> dict[str, object]:
-    payload = {field: row.get(field) for field in V1_SEARCH_FIELDS}
-    for field in ("matched_chunk_id", "is_context"):
-        if field in row:
-            payload[field] = row[field]
-    return payload
+def person_from_row(row: dict[str, Any]) -> Person:
+    return Person(id=int(row["id"]), display_name=str(row["display_name"]))
 
 
-def validate_contract_version(contract_version: str) -> None:
-    if contract_version not in {CORE_V1_VERSION, CORE_V2_VERSION, CORE_V3_VERSION}:
-        message = f"Unsupported core contract version: {contract_version}"
-        raise ValueError(message)
+def graph_node_from_row(row: dict[str, Any]) -> GraphNode:
+    return GraphNode(id=int(row["id"]), type=str(row["type"]), title=str(row["title"]))
+
+
+def graph_edge_from_row(row: dict[str, Any]) -> GraphEdge:
+    return GraphEdge(
+        id=int(row["id"]),
+        from_node_id=int(row["from_node_id"]),
+        relation=str(row["relation"]),
+        to_node_id=int(row["to_node_id"]),
+        confidence=float(row["confidence"]),
+        source_meeting_id=optional_int(row.get("source_meeting_id")),
+        source_chunk_id=optional_int(row.get("source_chunk_id")),
+        extraction_method=str(row["extraction_method"]),
+        created_at=optional_str(row.get("created_at")),
+    )
+
+
+def optional_float(value: object) -> float | None:
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def optional_int(value: object) -> int | None:
+    return int(value) if isinstance(value, (int, float)) else None

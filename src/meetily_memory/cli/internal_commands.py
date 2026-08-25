@@ -15,9 +15,17 @@ from meetily_memory.cli.common import (
     print_meeting_table,
     print_text_block,
 )
-from meetily_memory.cli.renderers import (
-    entity_source,
-    graph_node_title,
+from meetily_memory.cli.renderers import entity_source
+from meetily_memory.core import TaskNotFoundError
+from meetily_memory.serializers import (
+    meeting_payload,
+    person_memory_payload,
+    project_memory_payload,
+    ranked_excerpt_payload,
+    structured_signal_payload,
+    summary_memory_payload,
+    task_status_payload,
+    topic_graph_payload,
 )
 
 app = make_typer("Internal debug commands.")
@@ -28,7 +36,7 @@ def list_meetings(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    rows = core_from_context(ctx).meetings(limit).data["meetings"]
+    rows = [meeting_payload(meeting) for meeting in core_from_context(ctx).meetings(limit)]
     if json_output:
         print_json(rows)
         return
@@ -43,21 +51,20 @@ def last(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     core = core_from_context(ctx)
-    meeting = core.latest_meeting(person=person).data["meeting"]
-    if not meeting:
+    meeting = core.latest_meeting(person=person)
+    if meeting is None:
         raise typer.Exit(1)
     if json_output:
-        print_json(meeting)
+        print_json(meeting_payload(meeting))
         return
-    console.print(meeting_label(meeting))
-    console.print(f"open: mm open {meeting['id']}")
-    if summary and meeting.get("summary_text"):
-        console.print(meeting["summary_text"])
+    console.print(meeting_label(meeting_payload(meeting)))
+    console.print(f"open: mm open {meeting.id}")
+    if summary and meeting.summary_text:
+        console.print(meeting.summary_text)
     if transcript:
-        chunks = core.meeting_chunks(int(meeting["id"])).data["chunks"]
-        for chunk in chunks:
-            if chunk["kind"] == "transcript":
-                console.print(chunk["text"])
+        for chunk in core.meeting_chunks(meeting.id):
+            if chunk.kind == "transcript":
+                console.print(chunk.text)
 
 
 def person(
@@ -66,7 +73,10 @@ def person(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    rows = core_from_context(ctx).meetings(limit=limit, person=name).data["meetings"]
+    rows = [
+        meeting_payload(meeting)
+        for meeting in core_from_context(ctx).meetings(limit=limit, person=name)
+    ]
     if json_output:
         print_json(rows)
         return
@@ -77,20 +87,20 @@ def local_summary(
     ctx: typer.Context,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    memory = core_from_context(ctx).summary().data
+    memory = core_from_context(ctx).summary()
     if json_output:
-        print_json(memory)
+        print_json(summary_memory_payload(memory))
         return
-    stats = memory["stats"]
+    stats = memory.stats
     print_text_block("Local memory summary")
-    print_text_block(f"meetings: {stats['meetings']}")
-    print_text_block(f"chunks: {stats['chunks']}")
-    if memory["latest_meeting"]:
-        print_text_block(f"latest meeting: {meeting_label(memory['latest_meeting'])}")
-    print_text_block(f"decisions: {stats['decisions']}")
-    print_text_block(f"action items: {stats['action_items']}")
-    print_text_block(f"risks: {stats['risks']}")
-    print_text_block(f"open questions: {stats['open_questions']}")
+    print_text_block(f"meetings: {stats.meetings}")
+    print_text_block(f"chunks: {stats.chunks}")
+    if memory.latest_meeting is not None:
+        print_text_block(f"latest meeting: {meeting_label(meeting_payload(memory.latest_meeting))}")
+    print_text_block(f"decisions: {stats.decisions}")
+    print_text_block(f"action items: {stats.action_items}")
+    print_text_block(f"risks: {stats.risks}")
+    print_text_block(f"open questions: {stats.open_questions}")
 
 
 def timeline(
@@ -99,7 +109,8 @@ def timeline(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 20,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    rows = core_from_context(ctx).timeline(query, limit).data["signals"]
+    timeline_result = core_from_context(ctx).timeline(query, limit)
+    rows = [structured_signal_payload(signal) for signal in timeline_result.signals]
     if json_output:
         print_json(rows)
         return
@@ -116,15 +127,15 @@ def project_memory(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    memory = core_from_context(ctx).project(query, limit).data
+    memory = core_from_context(ctx).project(query, limit)
     if json_output:
-        print_json(memory)
+        print_json(project_memory_payload(memory))
         return
     print_text_block(f"Project memory: {query}")
     print_text_block("\nMeetings")
-    print_search_meeting_summaries(memory["meetings"])
+    print_search_meeting_summaries([ranked_excerpt_payload(item) for item in memory.meetings])
     print_text_block("Structured signals")
-    print_entity_bullets(memory["structured_signals"])
+    print_entity_bullets([structured_signal_payload(item) for item in memory.structured_signals])
 
 
 def person_memory(
@@ -133,14 +144,16 @@ def person_memory(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    memory = core_from_context(ctx).person(name, limit).data
+    memory = core_from_context(ctx).person(name, limit)
     if json_output:
-        print_json(memory)
+        print_json(person_memory_payload(memory))
         return
     print_text_block(f"Person memory: {name}")
     print_text_block("\nLatest meetings")
-    print_meeting_summaries(memory["meetings"])
-    print_grouped_entity_bullets(memory["structured_signals"])
+    print_meeting_summaries([meeting_payload(meeting) for meeting in memory.meetings])
+    print_grouped_entity_bullets(
+        [structured_signal_payload(item) for item in memory.structured_signals]
+    )
 
 
 def graph(
@@ -149,15 +162,16 @@ def graph(
     limit: Annotated[int, typer.Option("--limit", "-n")] = 50,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    payload = core_from_context(ctx).graph(query, limit).data
+    graph_result = core_from_context(ctx).graph(query, limit)
     if json_output:
-        print_json(payload)
+        print_json(topic_graph_payload(graph_result))
         return
-    print_text_block(f"Graph: {payload['topic']['title']}")
-    for edge in payload["edges"]:
-        from_node = graph_node_title(payload["nodes"], int(edge["from_node_id"]))
-        to_node = graph_node_title(payload["nodes"], int(edge["to_node_id"]))
-        print_text_block(f"- [[{from_node}]] --{edge['relation']}--> [[{to_node}]]")
+    nodes = {node.id: node.title for node in graph_result.nodes}
+    print_text_block(f"Graph: {graph_result.topic.title}")
+    for edge in graph_result.edges:
+        from_node = nodes.get(edge.from_node_id, str(edge.from_node_id))
+        to_node = nodes.get(edge.to_node_id, str(edge.to_node_id))
+        print_text_block(f"- [[{from_node}]] --{edge.relation}--> [[{to_node}]]")
 
 
 def task_status(
@@ -168,8 +182,10 @@ def task_status(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     try:
-        row = core_from_context(ctx).set_task_status(task_id, status, note=note).data
-    except ValueError as exc:
+        row = task_status_payload(
+            core_from_context(ctx).set_task_status(task_id, status, note=note)
+        )
+    except (TaskNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
         print_json(row)
@@ -228,9 +244,8 @@ def print_structured_entities(
     status: str = "all",
 ) -> None:
     try:
-        rows = (
-            core_from_context(ctx).structured_entities(kind, limit, status=status).data["entities"]
-        )
+        result = core_from_context(ctx).structured_entities(kind, limit, status=status)
+        rows = [structured_signal_payload(entity) for entity in result.entities]
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -252,7 +267,6 @@ def print_structured_entities(
         print_text_block(f"{row['meeting_title']} [{row['meeting_external_id']}]")
         print_text_block(f"Date: {row.get('meeting_date') or ''}")
         print_text_block(f"Source: {source}")
-        print_text_block(f"confidence: {float(row['confidence']):.2f}")
         if kind == "action_items":
             print_text_block(f"status: {row.get('status', 'open')}")
             if row.get("status_note"):

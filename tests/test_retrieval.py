@@ -3,8 +3,13 @@ from pathlib import Path
 
 from meetily_memory import retrieval
 from meetily_memory.context_builder import ContextRenderer
-from meetily_memory.core import CORE_V2_VERSION, CORE_V3_VERSION, MeetilyMemoryCore
-from meetily_memory.domain import ContextBundle, MeetingSearchResult, RetrievalSource, SearchHit
+from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.domain import (
+    ContextBundle,
+    MeetingSearchResult,
+    RetrievalSource,
+    SearchHit,
+)
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import LocalHashEmbeddingProvider, index_semantic_embeddings
@@ -46,7 +51,7 @@ def test_core_delegates_public_search_to_meeting_retrieval_strategy(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    lexical_hit = MeetilyMemoryCore(index_path).search_hits("pricing decision")[0]
+    lexical_hit = IndexRepository(index_path).search_hits("pricing decision")[0]
     result = MeetingSearchResult(
         meeting_id=1,
         meeting=lexical_hit.meeting,
@@ -60,7 +65,7 @@ def test_core_delegates_public_search_to_meeting_retrieval_strategy(
         meeting_retrieval_strategy=FixedMeetingRetrievalStrategy((result,)),
     )
 
-    response = core.search_meetings("query ignored by strategy")
+    response = core.search("query ignored by strategy").results
 
     assert response == (result,)
 
@@ -71,14 +76,13 @@ def test_meeting_retrieval_expands_candidates_until_limit_has_unique_meetings(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    core = MeetilyMemoryCore(index_path)
-    first = core.search_hits("pricing decision", 1)[0]
-    second = core.search_hits("migration risks", 1)[0]
+    first = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
+    second = IndexRepository(index_path).search_hits("migration risks", 1)[0]
     saturated = FixedRetrievalStrategy((*((first,) * 40), second))
     strategy = retrieval.LexicalTagMeetingRetrievalStrategy(
-        repository=core.repo,
+        repository=IndexRepository(index_path),
         lexical=saturated,
-        tags=retrieval.TagRetrievalStrategy(core.tag_repository),
+        tags=retrieval.TagRetrievalStrategy(TagRepository(IndexRepository(index_path).state_path)),
     )
 
     results = strategy.search_meetings("query ignored by strategy", limit=2)
@@ -95,24 +99,21 @@ def test_selected_strategy_drives_only_explicit_v3_search(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    lexical_hit = MeetilyMemoryCore(index_path).search_hits("pricing decision")[0]
+    lexical_hit = IndexRepository(index_path).search_hits("pricing decision")[0]
     core = MeetilyMemoryCore(
         index_path,
         retrieval_strategy=FixedRetrievalStrategy((lexical_hit,)),
     )
 
-    search = core.search("query ignored by strategy", contract_version=CORE_V3_VERSION)
-    bundle = core.context_bundle("migration risks")
-    context = core.build_context(
-        "migration risks",
-        contract_version=CORE_V2_VERSION,
-    )
+    search = core.search("query ignored by strategy")
+    bundle = core.build_context("migration risks")
+    context = core.build_context("migration risks")
 
-    assert search.data["results"][0]["evidence"] == [lexical_hit.as_payload()]
-    assert search.data["results"][0]["match_sources"] == ["fts"]
+    assert search.results[0].evidence == (lexical_hit,)
+    assert search.results[0].match_sources == (RetrievalSource.FTS,)
     assert bundle.evidence[0].excerpt.chunk_external_id == "transcript-2"
     assert bundle.evidence != (lexical_hit,)
-    assert context.data == bundle.as_payload()
+    assert context == bundle
 
 
 def test_tag_retrieval_strategy_keeps_lookup_behind_strategy_boundary(
@@ -137,7 +138,7 @@ def test_context_renderer_uses_context_bundle_without_storage_rows(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    hits = MeetilyMemoryCore(index_path).search_hits("migration risks", limit=1, context=1)
+    hits = IndexRepository(index_path).search_hits("migration risks", limit=1, context=1)
     bundle = ContextBundle(
         question="Who owns migration risks?",
         evidence=hits,
@@ -160,15 +161,14 @@ def test_hybrid_strategy_fuses_ranks_without_polluting_search_hits(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    core = MeetilyMemoryCore(index_path)
-    migration_hit = core.search_hits("migration risks", 1)[0]
-    pricing_hit = core.search_hits("pricing decision", 1)[0]
+    migration_hit = IndexRepository(index_path).search_hits("migration risks", 1)[0]
+    pricing_hit = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
     assert hasattr(retrieval, "HybridRetrievalStrategy")
     strategy = retrieval.HybridRetrievalStrategy(
-        repository=core.repo,
+        repository=IndexRepository(index_path),
         lexical=FixedRetrievalStrategy((migration_hit, pricing_hit)),
         semantic=FixedRetrievalStrategy((pricing_hit, migration_hit)),
-        tags=retrieval.TagRetrievalStrategy(core.tag_repository),
+        tags=retrieval.TagRetrievalStrategy(TagRepository(IndexRepository(index_path).state_path)),
         semantic_provider=LocalHashEmbeddingProvider(),
         require_complete_semantic_index=False,
     )
@@ -185,7 +185,7 @@ def test_hybrid_strategy_fuses_ranks_without_polluting_search_hits(
         retrieval.RetrievalSource.FTS,
         retrieval.RetrievalSource.SEMANTIC,
     )
-    assert "score" not in result.results[0].as_payload()
+    assert not hasattr(result.results[0], "score")
 
 
 def test_hybrid_strategy_uses_tags_as_a_meeting_level_rrf_source(
@@ -194,15 +194,14 @@ def test_hybrid_strategy_uses_tags_as_a_meeting_level_rrf_source(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    core = MeetilyMemoryCore(index_path)
-    migration_hit = core.search_hits("migration risks", 1)[0]
-    pricing_hit = core.search_hits("pricing decision", 1)[0]
-    TagService(core.repo).assign(("1",), ("project-history",))
+    migration_hit = IndexRepository(index_path).search_hits("migration risks", 1)[0]
+    pricing_hit = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
+    TagService(IndexRepository(index_path)).assign(("1",), ("project-history",))
     strategy = retrieval.HybridRetrievalStrategy(
-        repository=core.repo,
+        repository=IndexRepository(index_path),
         lexical=FixedRetrievalStrategy((migration_hit, pricing_hit)),
         semantic=FixedRetrievalStrategy((migration_hit, pricing_hit)),
-        tags=retrieval.TagRetrievalStrategy(core.tag_repository),
+        tags=retrieval.TagRetrievalStrategy(TagRepository(IndexRepository(index_path).state_path)),
         semantic_provider=LocalHashEmbeddingProvider(),
         require_complete_semantic_index=False,
     )
@@ -219,7 +218,11 @@ def test_hybrid_strategy_uses_tags_as_a_meeting_level_rrf_source(
 class FailingRetrievalStrategy:
     calls: int = 0
 
-    def search(self, query: str, limit: int = 10) -> tuple[SearchHit, ...]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> tuple[SearchHit, ...]:
         del query, limit
         self.calls += 1
         message = "semantic unavailable"
@@ -232,14 +235,13 @@ def test_hybrid_strategy_skips_semantic_when_index_is_incomplete(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    core = MeetilyMemoryCore(index_path)
-    lexical_hit = core.search_hits("migration risks", 1)[0]
+    lexical_hit = IndexRepository(index_path).search_hits("migration risks", 1)[0]
     semantic = FailingRetrievalStrategy()
     strategy = retrieval.HybridRetrievalStrategy(
-        repository=core.repo,
+        repository=IndexRepository(index_path),
         lexical=FixedRetrievalStrategy((lexical_hit,)),
         semantic=semantic,
-        tags=retrieval.TagRetrievalStrategy(core.tag_repository),
+        tags=retrieval.TagRetrievalStrategy(TagRepository(IndexRepository(index_path).state_path)),
         semantic_provider=LocalHashEmbeddingProvider(),
     )
 
@@ -259,14 +261,13 @@ def test_hybrid_strategy_falls_back_when_ready_semantic_search_fails(
     MeetilySQLiteScanner(index_path).scan(meetily_db)
     provider = LocalHashEmbeddingProvider()
     index_semantic_embeddings(index_path, embedding_provider=provider)
-    core = MeetilyMemoryCore(index_path)
-    lexical_hit = core.search_hits("migration risks", 1)[0]
+    lexical_hit = IndexRepository(index_path).search_hits("migration risks", 1)[0]
     semantic = FailingRetrievalStrategy()
     strategy = retrieval.HybridRetrievalStrategy(
-        repository=core.repo,
+        repository=IndexRepository(index_path),
         lexical=FixedRetrievalStrategy((lexical_hit,)),
         semantic=semantic,
-        tags=retrieval.TagRetrievalStrategy(core.tag_repository),
+        tags=retrieval.TagRetrievalStrategy(TagRepository(IndexRepository(index_path).state_path)),
         semantic_provider=provider,
     )
 

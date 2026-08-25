@@ -3,7 +3,11 @@ from pathlib import Path
 from typing import Any, cast
 
 from meetily_memory.core import MeetilyMemoryCore
-from meetily_memory.db.repository import IndexRepository
+from meetily_memory.serializers import (
+    meeting_payload,
+    structured_signal_payload,
+    topic_memory_payload,
+)
 
 
 @dataclass(frozen=True)
@@ -44,12 +48,11 @@ def sync_obsidian_vault(
         (root_dir / directory).mkdir(parents=True, exist_ok=True)
 
     core = MeetilyMemoryCore(index_path)
-    repo = core.repo
     files_written = 0
     files_skipped = 0
     people: dict[str, dict[str, Any]] = {}
 
-    written, skipped = sync_obsidian_meetings(root_dir, repo, limit)
+    written, skipped = sync_obsidian_meetings(root_dir, core, limit)
     files_written += written
     files_skipped += skipped
 
@@ -58,7 +61,7 @@ def sync_obsidian_vault(
     files_skipped += skipped
     people.update(topic_people)
 
-    written, skipped, entity_people = sync_obsidian_entities(root_dir, repo, limit)
+    written, skipped, entity_people = sync_obsidian_entities(root_dir, core, limit)
     files_written += written
     files_skipped += skipped
     people.update(entity_people)
@@ -76,12 +79,13 @@ def sync_obsidian_vault(
 
 def sync_obsidian_meetings(
     root_dir: Path,
-    repo: IndexRepository,
+    core: MeetilyMemoryCore,
     limit: int,
 ) -> tuple[int, int]:
     files_written = 0
     files_skipped = 0
-    for meeting in repo.list_meetings(limit=limit):
+    for value in core.meetings(limit=limit):
+        meeting = meeting_payload(value)
         path = root_dir / "Meetings" / f"{safe_note_name(str(meeting['title']))}.md"
         written = write_managed_note(path, render_obsidian_meeting_note(meeting))
         files_written += int(written)
@@ -97,9 +101,9 @@ def sync_obsidian_topics(
     files_written = 0
     files_skipped = 0
     people: dict[str, dict[str, Any]] = {}
-    for topic in core.repo.list_topics(limit=limit):
-        title = str(topic["title"])
-        payload = core.topic(title).data
+    for topic in core.topics(limit=limit):
+        title = topic.title
+        payload = topic_memory_payload(core.topic(title))
         path = root_dir / "Topics" / f"{safe_note_name(title)}.md"
         written = write_managed_note(path, render_obsidian_topic_memory(payload))
         files_written += int(written)
@@ -110,7 +114,7 @@ def sync_obsidian_topics(
 
 def sync_obsidian_entities(
     root_dir: Path,
-    repo: IndexRepository,
+    core: MeetilyMemoryCore,
     limit: int,
 ) -> tuple[int, int, dict[str, dict[str, Any]]]:
     files_written = 0
@@ -122,17 +126,19 @@ def sync_obsidian_entities(
         "risks": "Risks",
         "open_questions": "Questions",
     }
-    for entity in repo.list_all_structured_entity_details(limit=limit):
-        directory = entity_dirs.get(str(entity["kind"]))
-        if directory is None:
-            continue
-        filename = safe_note_name(str(entity["text"])[:80]) or f"{entity['kind']}-{entity['id']}"
-        path = root_dir / directory / f"{filename}.md"
-        written = write_managed_note(path, render_obsidian_entity_note(entity))
-        files_written += int(written)
-        files_skipped += int(not written)
-        for person in payload_people(entity):
-            people[person.casefold()] = {"display_name": person}
+    for kind, directory in entity_dirs.items():
+        result = core.structured_entities(kind, limit)
+        for value in result.entities:
+            entity = structured_signal_payload(value)
+            filename = (
+                safe_note_name(str(entity["text"])[:80]) or f"{entity['kind']}-{entity['id']}"
+            )
+            path = root_dir / directory / f"{filename}.md"
+            written = write_managed_note(path, render_obsidian_entity_note(entity))
+            files_written += int(written)
+            files_skipped += int(not written)
+            for person in payload_people(entity):
+                people[person.casefold()] = {"display_name": person}
     return files_written, files_skipped, people
 
 

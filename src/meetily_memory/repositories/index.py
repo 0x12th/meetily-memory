@@ -8,7 +8,7 @@ from meetily_memory.db.fts import build_fts_query
 from meetily_memory.db.rows import rows_to_dicts
 from meetily_memory.db.schema import index_connection
 from meetily_memory.domain import (
-    MeetingRef,
+    Meeting,
     MemoryEntity,
     SearchHit,
     SourceExcerpt,
@@ -158,7 +158,11 @@ class IndexRepository:
             )
             conn.commit()
 
-    def get_meeting_by_external_id(self, source_id: int, external_id: str) -> dict[str, Any] | None:
+    def get_meeting_by_external_id(
+        self,
+        source_id: int,
+        external_id: str,
+    ) -> dict[str, Any] | None:
         return self.meetings.get_meeting_by_external_id(source_id, external_id)
 
     def upsert_meeting_with_chunks(
@@ -278,7 +282,12 @@ class IndexRepository:
         meeting_id: int | None = None,
         context: int = 0,
     ) -> list[dict[str, Any]]:
-        return self.search_repo.search(query, limit, meeting_id=meeting_id, context=context)
+        return self.search_repo.search(
+            query,
+            limit,
+            meeting_id=meeting_id,
+            context=context,
+        )
 
     def search_hits(
         self,
@@ -288,7 +297,12 @@ class IndexRepository:
         meeting_id: int | None = None,
         context: int = 0,
     ) -> tuple[SearchHit, ...]:
-        rows = self.search(query, limit, meeting_id=meeting_id, context=context)
+        rows = self.search(
+            query,
+            limit,
+            meeting_id=meeting_id,
+            context=context,
+        )
         return tuple(self.search_hit_from_row(row) for row in rows)
 
     def search_hit_from_row(self, row: dict[str, Any]) -> SearchHit:
@@ -299,7 +313,6 @@ class IndexRepository:
             now=utc_now(),
         )
         excerpt = source_excerpt_from_search_row(row)
-        domain_row = {**row, "source_path": source["path"]}
         return SearchHit(
             id=stable_evidence_id(
                 source_uuid,
@@ -309,7 +322,7 @@ class IndexRepository:
                 ordinal=excerpt.ordinal,
                 text=excerpt.text,
             ),
-            meeting=meeting_ref_from_row(domain_row, source_uuid),
+            meeting=meeting_from_row(row),
             excerpt=excerpt,
             is_context=bool(row.get("is_context", False)),
         )
@@ -322,7 +335,7 @@ class IndexRepository:
             for hit in hits
             if (
                 row := self.search_repo.evidence_row(
-                    hit.meeting.source_path,
+                    hit.meeting.id,
                     hit.meeting.external_id,
                     hit.excerpt.chunk_external_id,
                     hit.excerpt.kind,
@@ -377,7 +390,10 @@ class IndexRepository:
     def list_meetings(self, limit: int = 20, person: str | None = None) -> list[dict[str, Any]]:
         return self.meetings.list_meetings(limit, person)
 
-    def get_meeting(self, external_or_internal_id: str) -> dict[str, Any] | None:
+    def get_meeting(
+        self,
+        external_or_internal_id: str,
+    ) -> dict[str, Any] | None:
         return self.meetings.get_meeting(external_or_internal_id)
 
     def meeting_source_identity(
@@ -410,17 +426,33 @@ class IndexRepository:
         indexed_source = self.get_source(str(source["kind"]), str(source["current_path"]))
         if indexed_source is None:
             return None
-        return self.get_meeting_by_external_id(int(indexed_source["id"]), meeting_external_id)
+        return self.get_meeting_by_external_id(
+            int(indexed_source["id"]),
+            meeting_external_id,
+        )
 
     def meeting_ref_by_identity(
         self,
         source_uuid: str,
         meeting_external_id: str,
-    ) -> tuple[int, MeetingRef] | None:
+    ) -> tuple[int, Meeting] | None:
         meeting = self.get_meeting_by_identity(source_uuid, meeting_external_id)
         if meeting is None:
             return None
-        return int(meeting["id"]), meeting_ref_from_row(meeting, source_uuid)
+        return int(meeting["id"]), meeting_from_row(meeting)
+
+    def source_identity_for_meeting(self, meeting_id: int) -> tuple[str, str]:
+        meeting = self.get_meeting(str(meeting_id))
+        if meeting is None:
+            message = f"Meeting not found: {meeting_id}"
+            raise LookupError(message)
+        source = self._source_details(meeting_id)
+        source_uuid = self.user_state.source_uuid(
+            str(source["kind"]),
+            str(source["path"]),
+            now=utc_now(),
+        )
+        return source_uuid, str(meeting["external_id"])
 
     def meeting_transcript_text(self, external_or_internal_id: str) -> str:
         meeting = self.get_meeting(external_or_internal_id)
@@ -522,16 +554,18 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def meeting_ref_from_row(row: dict[str, Any], source_uuid: str) -> MeetingRef:
-    return MeetingRef(
-        source_uuid=source_uuid,
+def meeting_from_row(row: dict[str, Any]) -> Meeting:
+    return Meeting(
+        id=int(row.get("meeting_id") or row["id"]),
         external_id=str(row.get("meeting_external_id") or row["external_id"]),
         title=str(row["title"]),
-        source_path=str(row["source_path"]),
+        started_at=optional_str(row.get("started_at")),
+        ended_at=optional_str(row.get("ended_at")),
         created_at=optional_str(row.get("created_at")),
         updated_at=optional_str(row.get("updated_at")),
-        folder_path=optional_str(row.get("folder_path")),
         language=optional_str(row.get("language")),
+        summary_text=optional_str(row.get("summary_text")),
+        chunk_count=optional_int(row.get("chunk_count")),
     )
 
 
@@ -569,3 +603,7 @@ def optional_str(value: object) -> str | None:
 
 def optional_float(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def optional_int(value: object) -> int | None:
+    return int(value) if isinstance(value, (int, float)) else None

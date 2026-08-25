@@ -14,9 +14,13 @@ from meetily_memory.cli.common import (
     ui_language_from_context,
 )
 from meetily_memory.cli.renderers import print_topic_memory
-from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT
-from meetily_memory.core import CORE_V3_VERSION
+from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, ContextRenderer
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.serializers import (
+    meeting_search_result_payload,
+    topic_alias_payload,
+    topic_memory_payload,
+)
 
 app = make_typer("Search and context commands.")
 
@@ -32,20 +36,12 @@ def search(
     ] = 0,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    results = (
-        core_from_context(ctx)
-        .search(
-            query,
-            limit,
-            context,
-            contract_version=CORE_V3_VERSION,
-        )
-        .data["results"]
-    )
+    search_results = core_from_context(ctx).search(query, limit, context)
+    results = [meeting_search_result_payload(result) for result in search_results.results]
     if json_output:
         print_json(results)
         return
-    print_search_results(cast("list[dict[str, object]]", results))
+    print_search_results(results)
 
 
 def print_search_results(results: list[dict[str, object]]) -> None:
@@ -96,8 +92,8 @@ def context(
         typer.Option("--context", help="Adjacent chunks around each lexical match."),
     ] = 0,
 ) -> None:
-    data = core_from_context(ctx).build_context(question, limit, context=context).data
-    print_text_block(str(data["markdown"]))
+    bundle = core_from_context(ctx).build_context(question, limit, context=context)
+    print_text_block(ContextRenderer().render(bundle))
 
 
 @app.command("t", hidden=True)
@@ -113,13 +109,13 @@ def topic_memory(
 ) -> None:
     core = core_from_context(ctx)
     if alias:
-        topic = core.add_topic_alias(query, alias).data
+        alias_result = core.add_topic_alias(query, alias)
         if json_output:
-            print_json(topic)
+            print_json(topic_alias_payload(alias_result))
             return
-        for added_alias in topic["added_aliases"]:
-            print_text_block(f"alias added: {added_alias} -> {topic['title']}")
-    memory = core.topic(query, limit).data
+        for added_alias in alias_result.added_aliases:
+            print_text_block(f"alias added: {added_alias} -> {alias_result.topic.title}")
+    memory = topic_memory_payload(core.topic(query, limit))
     if json_output:
         print_json(memory)
         return

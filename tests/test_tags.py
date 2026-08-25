@@ -7,8 +7,9 @@ import pytest
 from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
-from meetily_memory.core import CORE_V3_VERSION, MeetilyMemoryCore
+from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.domain import RetrievalSource
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import (
     LocalHashEmbeddingProvider,
@@ -289,27 +290,21 @@ def test_search_returns_meetings_with_real_or_empty_evidence(
     state_path = tmp_path / "state.sqlite"
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     core = MeetilyMemoryCore(index_path, state_path=state_path)
-    service = service_class(core.repo)
+    service = service_class(IndexRepository(index_path, state_path=state_path))
     service.assign(("2",), ("Сбер",))
 
-    tag_only = core.search(
-        "сбер",
-        contract_version=CORE_V3_VERSION,
-    ).data["results"]
-    lexical = core.search(
-        "migration risks",
-        contract_version=CORE_V3_VERSION,
-    ).data["results"]
+    tag_only = core.search("сбер").results
+    lexical = core.search("migration risks").results
 
     assert len(tag_only) == 1
-    assert tag_only[0]["meeting_id"] == 2
-    assert tag_only[0]["rank"] == 1
-    assert tag_only[0]["match_sources"] == ["tag"]
-    assert tag_only[0]["matched_tags"] == ["Сбер"]
-    assert tag_only[0]["evidence"] == []
-    assert len({result["meeting"]["external_id"] for result in lexical}) == len(lexical)
-    assert lexical[0]["match_sources"] == ["fts"]
-    assert 1 <= len(lexical[0]["evidence"]) <= 2
+    assert tag_only[0].meeting_id == 2
+    assert tag_only[0].rank == 1
+    assert tag_only[0].match_sources == (RetrievalSource.TAG,)
+    assert tag_only[0].matched_tags == ("Сбер",)
+    assert tag_only[0].evidence == ()
+    assert len({result.meeting.external_id for result in lexical}) == len(lexical)
+    assert lexical[0].match_sources == (RetrievalSource.FTS,)
+    assert 1 <= len(lexical[0].evidence) <= 2
 
 
 def test_search_orders_exact_tag_before_lexical_before_token_tag(
@@ -324,23 +319,17 @@ def test_search_orders_exact_tag_before_lexical_before_token_tag(
     state_path = tmp_path / "state.sqlite"
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     core = MeetilyMemoryCore(index_path, state_path=state_path)
-    service = service_class(core.repo)
+    service = service_class(IndexRepository(index_path, state_path=state_path))
     service.assign(("2",), ("pricing decision",))
 
-    exact_then_lexical = core.search(
-        "pricing decision",
-        contract_version=CORE_V3_VERSION,
-    ).data["results"]
-    lexical_then_token = core.search(
-        "pricing",
-        contract_version=CORE_V3_VERSION,
-    ).data["results"]
+    exact_then_lexical = core.search("pricing decision").results
+    lexical_then_token = core.search("pricing").results
 
-    assert [result["meeting_id"] for result in exact_then_lexical[:2]] == [2, 1]
-    assert exact_then_lexical[0]["match_sources"] == ["tag"]
-    assert exact_then_lexical[1]["match_sources"] == ["fts"]
-    assert [result["meeting_id"] for result in lexical_then_token[:2]] == [1, 2]
-    assert lexical_then_token[1]["match_sources"] == ["tag"]
+    assert [result.meeting_id for result in exact_then_lexical[:2]] == [2, 1]
+    assert exact_then_lexical[0].match_sources == (RetrievalSource.TAG,)
+    assert exact_then_lexical[1].match_sources == (RetrievalSource.FTS,)
+    assert [result.meeting_id for result in lexical_then_token[:2]] == [1, 2]
+    assert lexical_then_token[1].match_sources == (RetrievalSource.TAG,)
 
 
 def test_cli_search_explains_tag_only_match(meetily_db: Path, tmp_path: Path) -> None:

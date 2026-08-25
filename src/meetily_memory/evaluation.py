@@ -482,21 +482,19 @@ def observe_task(
 
 
 def collapse_search_hits(
-    repository: IndexRepository,
+    _repository: IndexRepository,
     hits: tuple[SearchHit, ...],
     mode: str,
 ) -> tuple[MeetingSearchResult, ...]:
-    grouped: dict[tuple[str, str], list[SearchHit]] = {}
+    grouped: dict[tuple[int, str], list[SearchHit]] = {}
     for hit in hits:
-        key = (hit.meeting.source_uuid, hit.meeting.external_id)
+        key = (hit.meeting.id, hit.meeting.external_id)
         grouped.setdefault(key, []).append(hit)
     source = RetrievalSource.SEMANTIC if mode == "semantic" else RetrievalSource.FTS
     results: list[MeetingSearchResult] = []
     for key, evidence in grouped.items():
-        resolved = repository.meeting_ref_by_identity(*key)
-        if resolved is None:
-            continue
-        meeting_id, meeting = resolved
+        meeting_id = key[0]
+        meeting = evidence[0].meeting
         results.append(
             MeetingSearchResult(
                 meeting_id=meeting_id,

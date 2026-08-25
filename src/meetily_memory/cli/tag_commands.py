@@ -2,7 +2,8 @@ from typing import Annotated
 
 import typer
 
-from meetily_memory.cli.common import core_from_context, make_typer, print_text_block
+from meetily_memory.cli.common import make_typer, print_text_block
+from meetily_memory.db.repository import IndexRepository
 from meetily_memory.tagging import TagMutationResult, TagService
 
 tag_app = make_typer("Manage meeting tags.")
@@ -14,7 +15,7 @@ def add_tags(
     values: Annotated[list[str], typer.Argument()],
 ) -> None:
     meeting_ids, tags = parse_tag_arguments(values)
-    service = TagService(core_from_context(ctx).repo)
+    service = TagService(IndexRepository(ctx.obj["index_path"]))
     try:
         result = service.assign(meeting_ids, tags)
     except ValueError as exc:
@@ -31,7 +32,7 @@ def remove_tags(
     values: Annotated[list[str], typer.Argument()],
 ) -> None:
     meeting_ids, tags = parse_tag_arguments(values)
-    service = TagService(core_from_context(ctx).repo)
+    service = TagService(IndexRepository(ctx.obj["index_path"]))
     try:
         result = service.remove(meeting_ids, tags)
     except ValueError as exc:
@@ -50,7 +51,7 @@ def list_tags(
     ctx: typer.Context,
     meeting_id: Annotated[str | None, typer.Argument()] = None,
 ) -> None:
-    service = TagService(core_from_context(ctx).repo)
+    service = TagService(IndexRepository(ctx.obj["index_path"]))
     if meeting_id is not None:
         try:
             tags = service.list_for_meeting(meeting_id)
@@ -69,7 +70,7 @@ def suggest_tags(
     ctx: typer.Context,
     meeting_id: Annotated[str, typer.Argument()],
 ) -> None:
-    service = TagService(core_from_context(ctx).repo)
+    service = TagService(IndexRepository(ctx.obj["index_path"]))
     try:
         suggestions = service.suggest(meeting_id)
     except ValueError as exc:

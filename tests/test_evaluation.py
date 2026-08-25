@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.domain import SearchHit
 from meetily_memory.evaluation import (
     EvaluationDataset,
@@ -22,9 +21,15 @@ from meetily_memory.evaluation import (
     load_dataset,
 )
 from meetily_memory.json_codec import loads_json
+from meetily_memory.repositories.index import IndexRepository
+from meetily_memory.retrieval import (
+    LexicalRetrievalStrategy,
+    LexicalTagMeetingRetrievalStrategy,
+    TagRetrievalStrategy,
+)
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import LocalHashEmbeddingProvider, index_semantic_embeddings
-from meetily_memory.tagging import TagService
+from meetily_memory.tagging import TagRepository, TagService
 from tests.semantic_helpers import requires_sqlite_vec
 
 
@@ -153,7 +158,7 @@ def test_evaluation_supports_tag_only_meeting_results_and_fingerprints_tag_state
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    core = MeetilyMemoryCore(index_path)
+    repository = IndexRepository(index_path)
     dataset = EvaluationDataset(
         schema_version="meetily-memory.eval.v2",
         dataset_version="2",
@@ -171,14 +176,18 @@ def test_evaluation_supports_tag_only_meeting_results_and_fingerprints_tag_state
         ),
     )
     before = evaluate_retrieval(dataset, index_path, limit=5)
-    TagService(core.repo).assign(("2",), ("private-label",))
+    TagService(IndexRepository(index_path)).assign(("2",), ("private-label",))
 
     report = evaluate_retrieval(
         dataset,
         index_path,
         limit=5,
         config=EvaluationRetrievalConfig(
-            meeting_strategy=core,
+            meeting_strategy=LexicalTagMeetingRetrievalStrategy(
+                repository=repository,
+                lexical=LexicalRetrievalStrategy(repository),
+                tags=TagRetrievalStrategy(TagRepository(repository.state_path)),
+            ),
             mode="fts5_tags",
         ),
     )
@@ -205,7 +214,7 @@ def test_evaluation_records_explicit_hybrid_strategy(meetily_db: Path, tmp_path:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
-    hit = MeetilyMemoryCore(index_path).search_hits("pricing decision", 1)[0]
+    hit = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
 
     report = evaluate_retrieval(
         dataset,
@@ -235,7 +244,7 @@ def test_evaluation_records_cold_start_before_warm_latency_measurements(
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
-    hit = MeetilyMemoryCore(index_path).search_hits("pricing decision", 1)[0]
+    hit = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
 
     report = evaluate_retrieval(
         dataset,

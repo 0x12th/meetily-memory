@@ -34,7 +34,12 @@ class SearchRepository:
                     meeting_id=meeting_id,
                 )
             else:
-                rows = self._search_with_fallback(conn, fts_query, strict_fts_query, limit)
+                rows = self._search_with_fallback(
+                    conn,
+                    fts_query,
+                    strict_fts_query,
+                    limit,
+                )
             if context == 0:
                 return rows
             return self._expand_context(conn, rows, context)
@@ -51,12 +56,22 @@ class SearchRepository:
         rows: list[dict[str, Any]] = []
         if strict_fts_query:
             rows = rows_to_dicts(
-                self._execute_search(conn, strict_fts_query, limit, meeting_id=meeting_id)
+                self._execute_search(
+                    conn,
+                    strict_fts_query,
+                    limit,
+                    meeting_id=meeting_id,
+                )
             )
             if len(rows) >= limit:
                 return rows
         fallback_rows = rows_to_dicts(
-            self._execute_search(conn, fts_query, limit, meeting_id=meeting_id)
+            self._execute_search(
+                conn,
+                fts_query,
+                limit,
+                meeting_id=meeting_id,
+            )
         )
         seen_chunk_ids = {row["chunk_id"] for row in rows}
         for row in fallback_rows:
@@ -156,7 +171,7 @@ class SearchRepository:
 
     def evidence_row(
         self,
-        source_path: str,
+        meeting_id: int,
         meeting_external_id: str,
         chunk_external_id: str | None,
         kind: str,
@@ -185,8 +200,7 @@ class SearchRepository:
                   NULL AS rank
                 FROM chunks c
                 JOIN meetings m ON m.id = c.meeting_id
-                JOIN sources s ON s.id = m.source_id
-                WHERE s.path = ?
+                WHERE m.id = ?
                   AND m.external_id = ?
                   AND (
                     (? IS NOT NULL AND c.external_id = ?)
@@ -195,7 +209,7 @@ class SearchRepository:
                 LIMIT 1
                 """,
                 (
-                    source_path,
+                    meeting_id,
                     meeting_external_id,
                     chunk_external_id,
                     chunk_external_id,

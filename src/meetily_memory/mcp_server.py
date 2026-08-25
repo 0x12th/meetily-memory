@@ -4,7 +4,19 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 from meetily_memory.config.paths import default_index_path
-from meetily_memory.core import CORE_V1_VERSION, MeetilyMemoryCore
+from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.serializers import (
+    context_bundle_payload,
+    envelope,
+    meeting_payload,
+    person_memory_payload,
+    project_memory_payload,
+    search_results_payload,
+    structured_entities_payload,
+    timeline_memory_payload,
+    topic_graph_payload,
+    topic_memory_payload,
+)
 
 MCP_TOOL_NAMES = (
     "search",
@@ -31,73 +43,85 @@ def create_mcp_server(index_path: Path | None = None) -> FastMCP:  # noqa: C901
     def search(
         query: str,
         limit: int = 10,
-        contract_version: str = CORE_V1_VERSION,
     ) -> dict[str, object]:
         """Search local Meetily memory with source-backed results."""
-        return core.search(query, limit, contract_version=contract_version).as_payload()
+        return envelope("search", search_results_payload(core.search(query, limit)))
 
     @server.tool()
     def get_meeting(meeting_id: str) -> dict[str, object]:
         """Get an indexed meeting by internal or external id."""
-        return core.get_meeting(meeting_id).as_payload()
+        meeting = core.get_meeting(meeting_id)
+        return envelope(
+            "meeting",
+            {"meeting": meeting_payload(meeting) if meeting is not None else None},
+        )
 
     @server.tool()
     def build_context(
         question: str,
         limit: int = 8,
-        contract_version: str = CORE_V1_VERSION,
     ) -> dict[str, object]:
-        """Build source-backed Markdown context for an LLM question."""
-        return core.build_context(
-            question,
-            limit,
-            contract_version=contract_version,
-        ).as_payload()
+        """Build source-backed data-only context for an LLM question."""
+        return envelope("context", context_bundle_payload(core.build_context(question, limit)))
 
     @server.tool()
     def get_person(name: str, limit: int = 10) -> dict[str, object]:
         """Get source-backed memory for a person."""
-        return core.person(name, limit).as_payload()
+        return envelope("person", person_memory_payload(core.person(name, limit)))
 
     @server.tool()
     def get_project(query: str, limit: int = 10) -> dict[str, object]:
         """Get source-backed memory for a project or project-like topic."""
-        return core.project(query, limit).as_payload()
+        return envelope("project", project_memory_payload(core.project(query, limit)))
 
     @server.tool()
     def get_topic(query: str, limit: int = 10) -> dict[str, object]:
         """Get source-backed topic memory."""
-        return core.topic(query, limit).as_payload()
+        return envelope("topic", topic_memory_payload(core.topic(query, limit)))
 
     @server.tool()
     def get_related(query: str, limit: int = 50) -> dict[str, object]:
         """Get the local graph projection for a topic."""
-        return core.graph(query, limit).as_payload()
+        return envelope("graph", topic_graph_payload(core.graph(query, limit)))
 
     @server.tool()
     def get_timeline(query: str | None = None, limit: int = 20) -> dict[str, object]:
         """Get source-backed timeline signals, optionally filtered by topic."""
-        return core.timeline(query, limit).as_payload()
+        return envelope("timeline", timeline_memory_payload(core.timeline(query, limit)))
 
     @server.tool()
     def get_decisions(limit: int = 20) -> dict[str, object]:
         """List heuristic decision signals with source evidence."""
-        return core.structured_entities("decisions", limit).as_payload()
+        return envelope(
+            "structured_entities",
+            structured_entities_payload(core.structured_entities("decisions", limit)),
+        )
 
     @server.tool()
     def get_tasks(limit: int = 20, status: str = "open") -> dict[str, object]:
         """List heuristic task signals with source evidence and local status."""
-        return core.structured_entities("action_items", limit, status=status).as_payload()
+        return envelope(
+            "structured_entities",
+            structured_entities_payload(
+                core.structured_entities("action_items", limit, status=status)
+            ),
+        )
 
     @server.tool()
     def get_risks(limit: int = 20) -> dict[str, object]:
         """List heuristic risk signals with source evidence."""
-        return core.structured_entities("risks", limit).as_payload()
+        return envelope(
+            "structured_entities",
+            structured_entities_payload(core.structured_entities("risks", limit)),
+        )
 
     @server.tool()
     def get_questions(limit: int = 20) -> dict[str, object]:
         """List heuristic open-question signals with source evidence."""
-        return core.structured_entities("open_questions", limit).as_payload()
+        return envelope(
+            "structured_entities",
+            structured_entities_payload(core.structured_entities("open_questions", limit)),
+        )
 
     return server
 

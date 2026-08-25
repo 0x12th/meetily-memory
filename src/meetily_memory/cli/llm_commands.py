@@ -6,9 +6,11 @@ import typer
 
 from meetily_memory.cli.common import core_from_context, make_typer, print_json, print_text_block
 from meetily_memory.config.settings import LLMSettings, load_app_settings, update_app_settings
-from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT
+from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, ContextRenderer
+from meetily_memory.core import MeetingNotFoundError
 from meetily_memory.json_codec import dumps_json, loads_json
 from meetily_memory.semantic_search import DEFAULT_OLLAMA_URL
+from meetily_memory.serializers import topic_memory_payload
 
 app = make_typer("Optional LLM answer commands.")
 llm_app = make_typer("Configure optional local LLM providers.")
@@ -98,15 +100,15 @@ def build_ask_prompt(
     retrieval_question = question
     topic_payload: dict[str, object] | None = None
     if topic:
-        topic_payload = core.topic(topic, limit).data
+        topic_payload = topic_memory_payload(core.topic(topic, limit))
         retrieval_question = f"{topic} {question}"
     try:
-        context_payload = (
-            core.build_meeting_context(retrieval_question, meeting, limit).data
+        context_bundle = (
+            core.build_meeting_context(retrieval_question, meeting, limit)
             if meeting
-            else core.build_context(retrieval_question, limit).data
+            else core.build_context(retrieval_question, limit)
         )
-    except ValueError as exc:
+    except MeetingNotFoundError as exc:
         raise typer.BadParameter(str(exc)) from exc
     lines = [
         "Answer the question using only the source-backed context below.",
@@ -120,7 +122,7 @@ def build_ask_prompt(
         lines.append(f"Topic: {topic}")
     if topic_payload:
         lines.extend(["", render_topic_memory_for_prompt(topic_payload)])
-    lines.extend(["", str(context_payload["markdown"])])
+    lines.extend(["", ContextRenderer().render(context_bundle)])
     return "\n".join(lines).rstrip() + "\n"
 
 

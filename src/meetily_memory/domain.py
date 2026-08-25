@@ -1,12 +1,12 @@
 import hashlib
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
 from meetily_memory.json_codec import dumps_json_bytes
 
 MemoryEntityKind = Literal["decision", "task", "risk", "question"]
-COMPACT_SEARCH_HIT_PROJECTION_VERSION = "compact.v1"
+StructuredEntityKind = Literal["decisions", "action_items", "risks", "open_questions"]
 ENTITY_KIND_MAP: dict[str, MemoryEntityKind] = {
     "decisions": "decision",
     "action_items": "task",
@@ -16,18 +16,17 @@ ENTITY_KIND_MAP: dict[str, MemoryEntityKind] = {
 
 
 @dataclass(frozen=True)
-class MeetingRef:
-    source_uuid: str
+class Meeting:
+    id: int
     external_id: str
     title: str
-    source_path: str
+    started_at: str | None
+    ended_at: str | None
     created_at: str | None
     updated_at: str | None
-    folder_path: str | None
     language: str | None
-
-    def as_payload(self) -> dict[str, object]:
-        return asdict(self)
+    summary_text: str | None = None
+    chunk_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -42,42 +41,13 @@ class SourceExcerpt:
     ends_at_seconds: float | None
     timestamp_label: str | None
 
-    def as_payload(self) -> dict[str, object]:
-        return asdict(self)
-
 
 @dataclass(frozen=True)
 class SearchHit:
     id: str
-    meeting: MeetingRef
+    meeting: Meeting
     excerpt: SourceExcerpt
     is_context: bool = False
-
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "meeting": self.meeting.as_payload(),
-            "excerpt": self.excerpt.as_payload(),
-            "is_context": self.is_context,
-        }
-
-    def compact(self, preview_length: int) -> "CompactSearchHit":
-        if preview_length < 1:
-            message = "preview_length must be positive"
-            raise ValueError(message)
-        truncated = len(self.excerpt.text) > preview_length
-        preview = self.excerpt.text[:preview_length].rstrip()
-        if truncated:
-            preview = f"{preview}…"
-        return CompactSearchHit(
-            id=self.id,
-            meeting=self.meeting,
-            preview=preview,
-            truncated=truncated,
-            is_context=self.is_context,
-            preview_length=preview_length,
-            projection_version=COMPACT_SEARCH_HIT_PROJECTION_VERSION,
-        )
 
 
 class RetrievalSource(StrEnum):
@@ -89,43 +59,18 @@ class RetrievalSource(StrEnum):
 @dataclass(frozen=True)
 class MeetingSearchResult:
     meeting_id: int
-    meeting: MeetingRef
+    meeting: Meeting
     rank: int
     match_sources: tuple[RetrievalSource, ...]
     evidence: tuple[SearchHit, ...]
     matched_tags: tuple[str, ...]
 
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "meeting_id": self.meeting_id,
-            "meeting": self.meeting.as_payload(),
-            "rank": self.rank,
-            "match_sources": [source.value for source in self.match_sources],
-            "evidence": [hit.as_payload() for hit in self.evidence],
-            "matched_tags": list(self.matched_tags),
-        }
-
 
 @dataclass(frozen=True)
-class CompactSearchHit:
-    id: str
-    meeting: MeetingRef
-    preview: str
-    truncated: bool
-    is_context: bool
-    preview_length: int
-    projection_version: str
-
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "meeting": self.meeting.as_payload(),
-            "preview": self.preview,
-            "truncated": self.truncated,
-            "is_context": self.is_context,
-            "preview_length": self.preview_length,
-            "projection_version": self.projection_version,
-        }
+class SearchResults:
+    query: str
+    context: int
+    results: tuple[MeetingSearchResult, ...]
 
 
 @dataclass(frozen=True)
@@ -137,16 +82,6 @@ class MemoryEntity:
     extraction_method: str
     authoritative: bool = False
 
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "kind": self.kind,
-            "content": self.content,
-            "source": self.source.as_payload(),
-            "evidence_id": self.evidence_id,
-            "extraction_method": self.extraction_method,
-            "authoritative": self.authoritative,
-        }
-
 
 @dataclass(frozen=True)
 class ContextBundle:
@@ -154,12 +89,163 @@ class ContextBundle:
     evidence: tuple[SearchHit, ...]
     entities: tuple[MemoryEntity, ...]
 
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "question": self.question,
-            "evidence": [hit.as_payload() for hit in self.evidence],
-            "entities": [entity.as_payload() for entity in self.entities],
-        }
+
+@dataclass(frozen=True)
+class MeetingChunk:
+    id: int
+    external_id: str | None
+    kind: str
+    ordinal: int
+    text: str
+    speaker: str | None
+    starts_at_seconds: float | None
+    ends_at_seconds: float | None
+    timestamp_label: str | None
+
+
+@dataclass(frozen=True)
+class MemoryStats:
+    meetings: int
+    chunks: int
+    sources: int
+    decisions: int
+    action_items: int
+    risks: int
+    open_questions: int
+    knowledge_nodes: int
+    knowledge_edges: int
+
+
+@dataclass(frozen=True)
+class SummaryMemory:
+    stats: MemoryStats
+    latest_meeting: Meeting | None
+
+
+@dataclass(frozen=True)
+class RankedExcerpt:
+    meeting_id: int
+    meeting: Meeting
+    excerpt: SourceExcerpt
+    rank: float
+
+
+@dataclass(frozen=True)
+class StructuredSignal:
+    kind: StructuredEntityKind
+    id: int
+    ordinal: int
+    text: str
+    extraction_method: str
+    created_at: str | None
+    updated_at: str | None
+    status: str | None
+    status_note: str | None
+    status_source: str | None
+    status_updated_at: str | None
+    meeting_id: int
+    meeting_external_id: str
+    meeting_title: str
+    meeting_language: str | None
+    meeting_date: str | None
+    chunk_external_id: str | None
+    chunk_kind: str
+    chunk_speaker: str | None
+    chunk_timestamp_label: str | None
+
+
+@dataclass(frozen=True)
+class ProjectMemory:
+    query: str
+    meetings: tuple[RankedExcerpt, ...]
+    structured_signals: tuple[StructuredSignal, ...]
+
+
+@dataclass(frozen=True)
+class PersonMemory:
+    name: str
+    meetings: tuple[Meeting, ...]
+    structured_signals: tuple[StructuredSignal, ...]
+
+
+@dataclass(frozen=True)
+class TimelineMemory:
+    query: str | None
+    signals: tuple[StructuredSignal, ...]
+
+
+@dataclass(frozen=True)
+class Topic:
+    id: int
+    title: str
+    aliases: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Person:
+    id: int
+    display_name: str
+
+
+@dataclass(frozen=True)
+class TopicMemory:
+    topic: Topic
+    language: str | None
+    query_terms: tuple[str, ...]
+    meetings: tuple[RankedExcerpt, ...]
+    evidence: tuple[RankedExcerpt, ...]
+    structured_signals: tuple[StructuredSignal, ...]
+    related_people: tuple[Person, ...]
+
+
+@dataclass(frozen=True)
+class TopicAliasResult:
+    topic: Topic
+    added_aliases: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GraphNode:
+    id: int
+    type: str
+    title: str
+
+
+@dataclass(frozen=True)
+class GraphEdge:
+    id: int
+    from_node_id: int
+    relation: str
+    to_node_id: int
+    confidence: float
+    source_meeting_id: int | None
+    source_chunk_id: int | None
+    extraction_method: str
+    created_at: str | None
+
+
+@dataclass(frozen=True)
+class TopicGraph:
+    topic: Topic
+    nodes: tuple[GraphNode, ...]
+    edges: tuple[GraphEdge, ...]
+
+
+@dataclass(frozen=True)
+class StructuredEntities:
+    entity_kind: StructuredEntityKind
+    status: str
+    entities: tuple[StructuredSignal, ...]
+
+
+@dataclass(frozen=True)
+class TaskStatusResult:
+    id: int
+    text: str
+    status: str
+    status_note: str | None
+    status_source: str
+    status_updated_at: str
 
 
 def stable_evidence_id(  # noqa: PLR0913

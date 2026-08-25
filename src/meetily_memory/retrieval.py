@@ -2,8 +2,12 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Protocol
 
-from meetily_memory.domain import MeetingSearchResult, RetrievalSource, SearchHit
-from meetily_memory.repositories.index import IndexRepository
+from meetily_memory.domain import (
+    MeetingSearchResult,
+    RetrievalSource,
+    SearchHit,
+)
+from meetily_memory.repositories.index import IndexRepository, meeting_from_row
 from meetily_memory.semantic_search import (
     EmbeddingProvider,
     semantic_index_coverage,
@@ -14,7 +18,7 @@ from meetily_memory.tagging import TagMatch, TagRepository
 RRF_K = 60
 HYBRID_CANDIDATE_MULTIPLIER = 4
 MAX_EVIDENCE_PER_SOURCE = 2
-MeetingKey = tuple[str, str]
+MeetingKey = tuple[int, str]
 
 
 class RetrievalStrategy(Protocol):
@@ -100,10 +104,11 @@ class LexicalTagMeetingRetrievalStrategy:
         ordered_keys = tuple(dict.fromkeys((*exact_tag_order, *fts_ranks, *token_tag_order)))
         results: list[MeetingSearchResult] = []
         for key in ordered_keys[:limit]:
-            resolved = self.repository.meeting_ref_by_identity(*key)
-            if resolved is None:
+            meeting_row = self.repository.get_meeting(str(key[0]))
+            if meeting_row is None:
                 continue
-            meeting_id, meeting = resolved
+            meeting_id = key[0]
+            meeting = meeting_from_row(meeting_row)
             evidence = fts_evidence.get(key, ())
             if context and evidence:
                 evidence = self.repository.expand_search_hits(evidence, context)
@@ -129,7 +134,7 @@ class LexicalTagMeetingRetrievalStrategy:
 
 @dataclass(frozen=True)
 class RetrievalCandidateTrace:
-    source_uuid: str
+    meeting_id: int
     meeting_external_id: str
     fts_rank: int | None
     semantic_rank: int | None
@@ -195,7 +200,7 @@ class HybridRetrievalStrategy:
             sorted(
                 (
                     RetrievalCandidateTrace(
-                        source_uuid=key[0],
+                        meeting_id=key[0],
                         meeting_external_id=key[1],
                         fts_rank=fts_ranks.get(key),
                         semantic_rank=semantic_ranks.get(key),
@@ -217,11 +222,12 @@ class HybridRetrievalStrategy:
         selected = traces[:limit]
         results: list[MeetingSearchResult] = []
         for trace in selected:
-            key = (trace.source_uuid, trace.meeting_external_id)
-            resolved = self.repository.meeting_ref_by_identity(*key)
-            if resolved is None:
+            key = (trace.meeting_id, trace.meeting_external_id)
+            meeting_row = self.repository.get_meeting(str(trace.meeting_id))
+            if meeting_row is None:
                 continue
-            meeting_id, meeting = resolved
+            meeting_id = trace.meeting_id
+            meeting = meeting_from_row(meeting_row)
             evidence = unique_hits((*fts_evidence.get(key, ()), *semantic_evidence.get(key, ())))[
                 :MAX_EVIDENCE_PER_SOURCE
             ]
@@ -323,9 +329,13 @@ def tag_candidates(
     token_order: list[MeetingKey] = []
     names: dict[MeetingKey, list[str]] = {}
     for match in tags.search(query):
-        key = (match.source_uuid, match.meeting_external_id)
-        if repository.get_meeting_by_identity(*key) is None:
+        meeting = repository.get_meeting_by_identity(
+            match.source_uuid,
+            match.meeting_external_id,
+        )
+        if meeting is None:
             continue
+        key = (int(meeting["id"]), match.meeting_external_id)
         order = exact_order if match.kind == "exact" else token_order
         if key not in order:
             order.append(key)
@@ -345,7 +355,7 @@ def collapse_hits_by_meeting(
     ranks: dict[MeetingKey, int] = {}
     evidence: dict[MeetingKey, list[SearchHit]] = {}
     for hit in hits:
-        key = (hit.meeting.source_uuid, hit.meeting.external_id)
+        key = (hit.meeting.id, hit.meeting.external_id)
         if key not in ranks:
             ranks[key] = len(ranks) + 1
         values = evidence.setdefault(key, [])

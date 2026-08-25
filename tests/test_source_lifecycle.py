@@ -6,7 +6,8 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
-from meetily_memory.core import CORE_V2_VERSION, MeetilyMemoryCore
+from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import loads_json
 from meetily_memory.tagging import TagService
 
@@ -79,12 +80,10 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     )
     assert init.exit_code == 0
     before = MeetilyMemoryCore(index_path)
-    evidence_id = before.search("migration risks", limit=1, contract_version=CORE_V2_VERSION).data[
-        "results"
-    ][0]["id"]
-    task = before.repo.list_structured_entity_details("action_items")[0]
-    before.set_task_status(task["id"], "done", note="survives move")
-    TagService(before.repo).assign(("1",), ("Сбер",))
+    evidence_id = before.search("migration risks", limit=1).results[0].evidence[0].id
+    task = before.structured_entities("action_items").entities[0]
+    before.set_task_status(task.id, "done", note="survives move")
+    TagService(IndexRepository(index_path)).assign(("1",), ("Сбер",))
     original_uuid = loads_json((data_dir / "settings.json").read_text())["source_uuid"]
 
     rebind = runner.invoke(
@@ -103,20 +102,17 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     assert settings["source_uuid"] == original_uuid
     assert "source_path" not in settings
     after = MeetilyMemoryCore(index_path)
-    assert (
-        after.search("migration risks", limit=1, contract_version=CORE_V2_VERSION).data["results"][
-            0
-        ]["id"]
-        == evidence_id
-    )
+    assert after.search("migration risks", limit=1).results[0].evidence[0].id == evidence_id
     matching_tasks = [
-        row
-        for row in after.repo.list_structured_entity_details("action_items", limit=100)
-        if row["text"] == task["text"]
+        entity
+        for entity in after.structured_entities("action_items", limit=100).entities
+        if entity.text == task.text
     ]
-    assert matching_tasks[0]["status"] == "done"
-    assert matching_tasks[0]["status_note"] == "survives move"
-    assert [tag.display_name for tag in TagService(after.repo).list_for_meeting("1")] == ["Сбер"]
+    assert matching_tasks[0].status == "done"
+    assert matching_tasks[0].status_note == "survives move"
+    assert [
+        tag.display_name for tag in TagService(IndexRepository(index_path)).list_for_meeting("1")
+    ] == ["Сбер"]
     with sqlite3.connect(index_path) as conn:
         sources = conn.execute("SELECT path FROM sources").fetchall()
     assert sources == [(str(moved_db),)]

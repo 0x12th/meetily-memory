@@ -1,36 +1,31 @@
-# Core contracts and persistent user state
+# Core contract and persistent user state
 
-`meetily-memory.core.v1` remains the default response contract for the CLI and MCP server.
-Search and context payloads keep their existing dictionary and Markdown shapes. Internal domain
-types are serialized back through the dedicated v1 adapter, and
-`tests/fixtures/core_v1_contract.json` guards the field-level contract.
+`MeetilyMemoryCore` exposes one immutable, typed contract. `search()` always returns
+meeting-level `SearchResults`: the query and requested neighbor count plus ranked
+`MeetingSearchResult` values with match sources, evidence, and matched tags. Search versions and
+compatibility payloads do not exist. `Meeting` contains product identity and curated meeting
+data; source IDs, paths, fingerprints, and raw storage JSON remain inside the repository layer.
 
-Python consumers can explicitly request `meetily-memory.core.v2` from `search()` and
-`build_context()`. The v2 search result is a `SearchHit` with a stable public evidence ID,
-`MeetingRef`, an untruncated `SourceExcerpt`, and an explicit `is_context` role. The v2 context
-payload is a data-only
-`ContextBundle`; it does not contain Markdown. `MemoryEntity` values use the canonical kinds
-`decision`, `task`, `risk`, and `question`, point directly to their source excerpt, and are
-marked non-authoritative. Extractor confidence remains internal diagnostics and is not part of
-the domain contract or generated Obsidian notes. The heuristic task extractor requires an
-explicit action verb or assignment phrase; generic mentions of a task or what one "can do" are
-not treated as established action items.
+`build_context()` and `build_meeting_context()` return the same data-only `ContextBundle`.
+Markdown is a CLI presentation concern and is rendered by `ContextRenderer`; MCP context never
+contains Markdown. `MemoryEntity` values use the canonical kinds `decision`, `task`, `risk`, and
+`question`, point directly to their source excerpt, and are marked non-authoritative. Extractor
+confidence remains internal diagnostics and is not part of the domain contract or generated
+Obsidian notes. The heuristic task extractor requires an explicit action verb or assignment
+phrase; generic mentions of a task or what one "can do" are not treated as established action
+items.
 
-MCP `search` and `build_context` use `core.v1` unless the caller explicitly passes
-`contract_version="meetily-memory.core.v2"`. They delegate version selection and validation to
-`MeetilyMemoryCore`; the MCP adapter does not implement retrieval, ranking, ID resolution, or
-context assembly.
+All Core operations return domain or operation models rather than transport dictionaries.
+Explicit serializers in `meetily_memory.serializers` are called only by CLI, MCP, and integration
+adapters. MCP keeps the `{kind, data}` envelope and invokes the same canonical search path as
+`mm s`. Optional meeting lookups return `None`; required meeting and evidence resolution raise
+specialized `LookupError` subclasses.
 
 `RetrievalStrategy` accepts only a query and candidate limit and returns ranked `SearchHit`
 values. Meeting scope, neighboring excerpts, bundle limits, and `MemoryEntity` attachment are
-owned by the lexical `ContextBundleBuilder`. Selecting semantic or hybrid retrieval therefore
-changes only explicit v2 Search; it does not claim support for Context.
-
-`CompactSearchHit` is an explicit preview projection. Its `truncated`, `preview_length`,
-`projection_version`, and `is_context` fields are always present. Changing the preview length
-does not change retrieval or the evidence ID. The full `SearchHit` resolves through
-`MeetilyMemoryCore.resolve_search_hit()` with the same ID; a missing ID is an integrity error,
-not an empty successful result.
+owned by `ContextBundleBuilder`. The full `SearchHit` resolves through
+`MeetilyMemoryCore.resolve_search_hit()` with the same stable evidence ID; a missing ID is an
+integrity error, not an empty successful result.
 
 ## User state migration
 

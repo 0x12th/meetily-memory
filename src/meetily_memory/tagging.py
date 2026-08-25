@@ -515,7 +515,7 @@ class TagService:
             for rows in batches:
                 for row in rows:
                     hit = self.index_repository.search_hit_from_row(row)
-                    key = (hit.meeting.source_uuid, hit.meeting.external_id)
+                    key = self.index_repository.source_identity_for_meeting(hit.meeting.id)
                     if key == target_key:
                         continue
                     tags = self.repository.list_for_meeting(*key)
