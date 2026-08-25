@@ -27,9 +27,17 @@ lexical transcript matches and token-level tag matches. Each result includes sou
 when available. `--context N` appends adjacent chunks around matching excerpts; the default
 remains `--context 0`.
 
+Date filters use the meeting timestamp `started_at`, falling back to `created_at`, `updated_at`,
+and then `indexed_at`. `--since Nd` includes meetings from exactly N days ago through now.
+`--from YYYY-MM-DD` includes the start of that date in the local timezone, while
+`--to YYYY-MM-DD` includes the entire local calendar date. `--since` and `--from` cannot be
+combined; `--to` can be used by itself or as an upper bound.
+
 | Command | Public role |
 |---|---|
 | `mm s "migration risk"` | Meeting-level search over explicit tags and indexed transcript text. Returns the meeting, matched tags, source excerpts, and an `mm open` command. |
+| `mm s "product integration" --since 7d` | Searches only the last seven 24-hour periods, including the exact lower boundary and the current moment. |
+| `mm s "product integration" --from 2026-08-17 --to 2026-08-23` | Searches an inclusive range of local calendar dates; the whole final day is included. |
 | `mm s "migration risk" --context 2` | Expands each hit with neighboring chunks before and after the match. Use this when the matching snippet is too short. |
 | `mm open 12` | Opens the meeting folder so the original Meetily record can be inspected. |
 | `mm open 12 --source` | Opens the indexed source file/path. |

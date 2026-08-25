@@ -9,6 +9,7 @@ from meetily_memory.db.rows import rows_to_dicts
 from meetily_memory.db.schema import index_connection
 from meetily_memory.domain import (
     Meeting,
+    MeetingSearchFilters,
     MemoryEntity,
     SearchHit,
     SourceExcerpt,
@@ -162,8 +163,10 @@ class IndexRepository:
         self,
         source_id: int,
         external_id: str,
+        *,
+        filters: MeetingSearchFilters | None = None,
     ) -> dict[str, Any] | None:
-        return self.meetings.get_meeting_by_external_id(source_id, external_id)
+        return self.meetings.get_meeting_by_external_id(source_id, external_id, filters=filters)
 
     def upsert_meeting_with_chunks(
         self,
@@ -281,12 +284,14 @@ class IndexRepository:
         *,
         meeting_id: int | None = None,
         context: int = 0,
+        filters: MeetingSearchFilters | None = None,
     ) -> list[dict[str, Any]]:
         return self.search_repo.search(
             query,
             limit,
             meeting_id=meeting_id,
             context=context,
+            filters=filters,
         )
 
     def search_hits(
@@ -296,12 +301,14 @@ class IndexRepository:
         *,
         meeting_id: int | None = None,
         context: int = 0,
+        filters: MeetingSearchFilters | None = None,
     ) -> tuple[SearchHit, ...]:
         rows = self.search(
             query,
             limit,
             meeting_id=meeting_id,
             context=context,
+            filters=filters,
         )
         return tuple(self.search_hit_from_row(row) for row in rows)
 
@@ -393,8 +400,10 @@ class IndexRepository:
     def get_meeting(
         self,
         external_or_internal_id: str,
+        *,
+        filters: MeetingSearchFilters | None = None,
     ) -> dict[str, Any] | None:
-        return self.meetings.get_meeting(external_or_internal_id)
+        return self.meetings.get_meeting(external_or_internal_id, filters=filters)
 
     def meeting_source_identity(
         self,
@@ -419,6 +428,8 @@ class IndexRepository:
         self,
         source_uuid: str,
         meeting_external_id: str,
+        *,
+        filters: MeetingSearchFilters | None = None,
     ) -> dict[str, Any] | None:
         source = self.user_state.get_source(source_uuid)
         if source is None:
@@ -429,6 +440,7 @@ class IndexRepository:
         return self.get_meeting_by_external_id(
             int(indexed_source["id"]),
             meeting_external_id,
+            filters=filters,
         )
 
     def meeting_ref_by_identity(

@@ -7,9 +7,11 @@ from typing import Any
 from meetily_memory.db.fts import NO_MATCH_FTS_QUERY, build_fts_query
 from meetily_memory.db.rows import last_insert_id, row_to_dict, rows_to_dicts
 from meetily_memory.db.schema import index_connection
+from meetily_memory.domain import MeetingSearchFilters
 from meetily_memory.meeting_structure import ENTITY_KINDS
 from meetily_memory.memory.entities import ENTITY_COUNT_SQL, ENTITY_DELETE_SQL, ENTITY_SELECT_SQL
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, ScanRunStats
+from meetily_memory.repositories.search import meeting_time_predicate
 
 SyncKnowledge = Callable[[sqlite3.Connection, int, str], None]
 DeleteKnowledge = Callable[[sqlite3.Connection, int], None]
@@ -63,11 +65,19 @@ class MeetingsRepository:
             ).fetchone()
             return row_to_dict(row)
 
-    def get_meeting_by_external_id(self, source_id: int, external_id: str) -> dict[str, Any] | None:
+    def get_meeting_by_external_id(
+        self,
+        source_id: int,
+        external_id: str,
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> dict[str, Any] | None:
+        time_sql, time_params = meeting_time_predicate(filters)
         with index_connection(self.index_path) as conn:
+            sql = f"SELECT * FROM meetings m WHERE source_id = ? AND external_id = ? AND {time_sql}"
             row = conn.execute(
-                "SELECT * FROM meetings WHERE source_id = ? AND external_id = ?",
-                (source_id, external_id),
+                sql,
+                (source_id, external_id, *time_params),
             ).fetchone()
             return row_to_dict(row)
 
@@ -314,17 +324,23 @@ class MeetingsRepository:
             rows = conn.execute(sql, params).fetchall()
             return rows_to_dicts(rows)
 
-    def get_meeting(self, external_or_internal_id: str) -> dict[str, Any] | None:
+    def get_meeting(
+        self,
+        external_or_internal_id: str,
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> dict[str, Any] | None:
+        time_sql, time_params = meeting_time_predicate(filters)
         with index_connection(self.index_path) as conn:
             if external_or_internal_id.isdigit():
                 row = conn.execute(
-                    "SELECT * FROM meetings WHERE id = ?",
-                    (int(external_or_internal_id),),
+                    f"SELECT * FROM meetings m WHERE id = ? AND {time_sql}",
+                    (int(external_or_internal_id), *time_params),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT * FROM meetings WHERE external_id = ?",
-                    (external_or_internal_id,),
+                    f"SELECT * FROM meetings m WHERE external_id = ? AND {time_sql}",
+                    (external_or_internal_id, *time_params),
                 ).fetchone()
             return row_to_dict(row)
 

@@ -62,7 +62,13 @@ mm doctor
 ```bash
 mm s "owner_worker_id"
 mm s "what did we decide about migration?"
+mm s "product integration" --since 7d
+mm s "product integration" --from 2026-08-17 --to 2026-08-23
 ```
+
+`--since Nd` searches from the current moment minus N days through now. Calendar filters use
+local dates: `--from` includes the start date and `--to` includes the entire final day.
+`--since` and `--from` are mutually exclusive.
 
 Use `--context N` when a matching excerpt needs adjacent transcript chunks:
 

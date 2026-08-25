@@ -1,5 +1,6 @@
 import hashlib
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -71,6 +72,12 @@ class SearchResults:
     query: str
     context: int
     results: tuple[MeetingSearchResult, ...]
+
+
+@dataclass(frozen=True)
+class MeetingSearchFilters:
+    from_utc: datetime | None = None
+    to_utc: datetime | None = None
 
 
 @dataclass(frozen=True)

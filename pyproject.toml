@@ -90,7 +90,11 @@ ignore = [
 ]
 "src/meetily_memory/repositories/meetings.py" = [
   "ANN401",
+  "S608",
   "SLF001",
+]
+"src/meetily_memory/repositories/search.py" = [
+  "S608",
 ]
 "src/meetily_memory/semantic_search.py" = [
   "S608",

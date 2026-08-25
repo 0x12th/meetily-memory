@@ -20,7 +20,9 @@ from sqlite_vec import serialize_float32
 from meetily_memory.config.paths import app_config_path, semantic_config_path
 from meetily_memory.config.settings import SemanticSettings, load_app_settings, update_app_settings
 from meetily_memory.db.schema import index_connection
+from meetily_memory.domain import MeetingSearchFilters
 from meetily_memory.json_codec import loads_json
+from meetily_memory.repositories.search import meeting_time_predicate
 
 EMBEDDING_DIMENSIONS = 128
 Row = dict[str, object]
@@ -154,6 +156,7 @@ def semantic_search(
     limit: int = 10,
     *,
     embedding_provider: EmbeddingProvider | None = None,
+    filters: MeetingSearchFilters | None = None,
 ) -> list[Row]:
     provider = embedding_provider or resolve_embedding_provider()
     query_embedding = provider.embed([query])[0]
@@ -165,13 +168,20 @@ def semantic_search(
         if count_indexed_embeddings(conn, provider, dimensions) == 0:
             message = "Semantic index is empty. Run: mm semantic index"
             raise RuntimeError(message)
+        time_sql, time_params = meeting_time_predicate(filters, alias="m_filter")
         semantic_sql = f"""
             WITH matches AS (
-              SELECT rowid AS chunk_id, distance
+              SELECT {vector_table}.rowid AS chunk_id, distance
               FROM {vector_table}
               WHERE embedding MATCH ?
+                AND k = ?
+                AND {vector_table}.rowid IN (
+                  SELECT c_filter.id
+                  FROM chunks c_filter
+                  JOIN meetings m_filter ON m_filter.id = c_filter.meeting_id
+                  WHERE {time_sql}
+                )
               ORDER BY distance
-              LIMIT ?
             )
             SELECT
               m.id AS meeting_id,
@@ -209,6 +219,7 @@ def semantic_search(
             (
                 serialize_float32(query_embedding),
                 limit,
+                *time_params,
                 provider.name,
                 provider.model,
                 dimensions,

@@ -1,8 +1,10 @@
 import json
 import re
 import sqlite3
+from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 import typer
@@ -10,10 +12,57 @@ from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
 from meetily_memory.cli.common import open_path
+from meetily_memory.cli.search_commands import parse_search_filters
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import loads_json
 from meetily_memory.tagging import TagRepository
 from tests.semantic_helpers import requires_sqlite_vec
+
+
+def test_parse_search_filters_builds_since_window_from_injected_clock() -> None:
+    now = datetime(2026, 8, 25, 12, 30, tzinfo=UTC)
+
+    filters = parse_search_filters(since="7d", now=lambda: now)
+
+    assert filters.from_utc == datetime(2026, 8, 18, 12, 30, tzinfo=UTC)
+    assert filters.to_utc == now
+
+
+def test_parse_search_filters_converts_inclusive_local_dates_to_utc() -> None:
+    filters = parse_search_filters(
+        from_date="2024-02-29",
+        to_date="2024-02-29",
+        local_timezone=ZoneInfo("Europe/Moscow"),
+    )
+
+    assert filters.from_utc == datetime(2024, 2, 28, 21, tzinfo=UTC)
+    assert filters.to_utc == datetime(2024, 2, 29, 21, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("since", "from_date", "to_date", "message"),
+    [
+        ("0d", None, None, "positive number of days"),
+        ("1w", None, None, "positive number of days"),
+        (None, "2026-02-29", None, "Invalid --from date"),
+        (None, None, "tomorrow", "Invalid --to date"),
+        ("7d", "2026-08-01", None, "mutually exclusive"),
+        (
+            None,
+            "2026-08-23",
+            "2026-08-17",
+            "must not be earlier",
+        ),
+    ],
+)
+def test_parse_search_filters_rejects_invalid_ranges(
+    since: str | None,
+    from_date: str | None,
+    to_date: str | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_search_filters(since=since, from_date=from_date, to_date=to_date)
 
 
 def test_cli_help_uses_plain_click_format() -> None:
@@ -67,6 +116,15 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert open_help.exit_code == 0
     assert "--source" in open_help.stdout
     assert "--folder" not in open_help.stdout
+
+    search_help = runner.invoke(app, ["s", "--help"])
+    assert search_help.exit_code == 0
+    assert "--since" in search_help.stdout
+    assert "positive number of days" in search_help.stdout
+    assert "--from" in search_help.stdout
+    assert "inclusive local date" in search_help.stdout
+    assert "--to" in search_help.stdout
+    assert "entire local date" in search_help.stdout
 
     obsidian_init_help = runner.invoke(app, ["obsidian", "init", "--help"])
     assert obsidian_init_help.exit_code == 0
@@ -270,6 +328,76 @@ def test_cli_search_can_include_neighboring_context(meetily_db: Path, tmp_path: 
     assert "Open question: who owns partner review?" in search.stdout
     assert "context" in search.stdout
     assert "open: mm open 1" in search.stdout
+
+
+def test_cli_search_filters_text_and_json_results_by_inclusive_dates(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+    scan_twice(runner, index_path, meetily_db)
+
+    text = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "s",
+            "migration risks",
+            "--from",
+            "2026-07-02",
+            "--to",
+            "2026-07-02",
+        ],
+    )
+    json_result = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "s",
+            "migration risks",
+            "--from",
+            "2026-07-02",
+            "--to",
+            "2026-07-02",
+            "--json",
+        ],
+    )
+    excluded = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "s",
+            "migration risks",
+            "--to",
+            "2026-07-01",
+        ],
+    )
+
+    assert text.exit_code == 0
+    assert json_result.exit_code == 0
+    assert excluded.exit_code == 0
+    assert "Dobrynya Follow-up" in text.stdout
+    assert [result["meeting"]["title"] for result in loads_json(json_result.stdout)] == [
+        "Dobrynya Follow-up"
+    ]
+    assert excluded.stdout == ""
+
+
+def test_cli_search_rejects_invalid_filters_before_opening_database(tmp_path: Path) -> None:
+    missing_index = tmp_path / "missing" / "index.sqlite"
+
+    result = CliRunner().invoke(
+        app,
+        ["--index", str(missing_index), "s", "query", "--since", "0d"],
+    )
+
+    assert result.exit_code == 2
+    assert "positive number of days" in result.output
+    assert not missing_index.exists()
 
 
 def test_cli_topic_shows_structured_memory_with_source_evidence(

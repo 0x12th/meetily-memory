@@ -1,6 +1,7 @@
 import importlib
 import importlib.util
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ from typer.testing import CliRunner
 from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
-from meetily_memory.domain import RetrievalSource
+from meetily_memory.domain import MeetingSearchFilters, RetrievalSource
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import (
     LocalHashEmbeddingProvider,
@@ -305,6 +306,29 @@ def test_search_returns_meetings_with_real_or_empty_evidence(
     assert len({result.meeting.external_id for result in lexical}) == len(lexical)
     assert lexical[0].match_sources == (RetrievalSource.FTS,)
     assert 1 <= len(lexical[0].evidence) <= 2
+
+
+def test_tag_only_search_uses_the_same_date_filter(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    state_path = tmp_path / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    repository = IndexRepository(index_path, state_path=state_path)
+    TagService(repository).assign(("1", "2"), ("product integration",))
+    filters = MeetingSearchFilters(
+        from_utc=datetime(2026, 7, 2, tzinfo=UTC),
+        to_utc=datetime(2026, 7, 3, tzinfo=UTC),
+    )
+
+    results = MeetilyMemoryCore(index_path, state_path=state_path).search(
+        "product integration",
+        filters=filters,
+    )
+
+    assert [result.meeting.external_id for result in results.results] == ["meeting-2"]
+    assert results.results[0].match_sources == (RetrievalSource.TAG,)
 
 
 def test_search_orders_exact_tag_before_lexical_before_token_tag(

@@ -13,6 +13,7 @@ from meetily_memory.domain import (
     GraphNode,
     Meeting,
     MeetingChunk,
+    MeetingSearchFilters,
     Person,
     PersonMemory,
     ProjectMemory,
@@ -100,11 +101,13 @@ class MeetilyMemoryCore:
         query: str,
         limit: int = 10,
         context: int = 0,
+        *,
+        filters: MeetingSearchFilters | None = None,
     ) -> SearchResults:
         return SearchResults(
             query=query,
             context=context,
-            results=self._meeting_retrieval.search_meetings(query, limit, context),
+            results=self._meeting_retrieval.search_meetings(query, limit, context, filters=filters),
         )
 
     def resolve_search_hit(self, evidence_id: str) -> SearchHit:

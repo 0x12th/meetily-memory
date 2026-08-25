@@ -1,3 +1,5 @@
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Annotated, cast
 
@@ -16,6 +18,7 @@ from meetily_memory.cli.common import (
 from meetily_memory.cli.renderers import print_topic_memory
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, ContextRenderer
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.domain import MeetingSearchFilters
 from meetily_memory.serializers import (
     meeting_search_result_payload,
     topic_alias_payload,
@@ -23,6 +26,51 @@ from meetily_memory.serializers import (
 )
 
 app = make_typer("Search and context commands.")
+
+
+def parse_search_filters(
+    *,
+    since: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    local_timezone: tzinfo | None = None,
+) -> MeetingSearchFilters:
+    if since is not None and from_date is not None:
+        message = "--since and --from are mutually exclusive"
+        raise ValueError(message)
+
+    timezone = local_timezone or datetime.now().astimezone().tzinfo or UTC
+    from_utc: datetime | None = None
+    to_utc: datetime | None = None
+    if since is not None:
+        if not since.endswith("d") or not since[:-1].isdigit() or int(since[:-1]) <= 0:
+            message = "--since must be a positive number of days, for example 7d"
+            raise ValueError(message)
+        current = now().astimezone(UTC)
+        from_utc = current - timedelta(days=int(since[:-1]))
+        to_utc = current
+    if from_date is not None:
+        from_utc = local_date_boundary(from_date, "--from", timezone).astimezone(UTC)
+    if to_date is not None:
+        end_date = local_date_boundary(to_date, "--to", timezone) + timedelta(days=1)
+        to_utc = end_date.astimezone(UTC)
+    if from_utc is not None and to_utc is not None and from_utc >= to_utc:
+        message = "--to must not be earlier than --from or --since"
+        raise ValueError(message)
+    return MeetingSearchFilters(from_utc=from_utc, to_utc=to_utc)
+
+
+def local_date_boundary(value: str, option: str, timezone: tzinfo) -> datetime:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        message = f"Invalid {option} date: {value}. Expected YYYY-MM-DD"
+        raise ValueError(message) from exc
+    if parsed.isoformat() != value:
+        message = f"Invalid {option} date: {value}. Expected YYYY-MM-DD"
+        raise ValueError(message)
+    return datetime.combine(parsed, datetime.min.time(), timezone)
 
 
 @app.command("s")
@@ -34,9 +82,25 @@ def search(
         int,
         typer.Option("--context", "-C", min=0, help="Include N chunks before and after each hit."),
     ] = 0,
+    since: Annotated[
+        str | None,
+        typer.Option("--since", help="From now minus a positive number of days, e.g. 7d."),
+    ] = None,
+    from_date: Annotated[
+        str | None,
+        typer.Option("--from", help="inclusive local date (YYYY-MM-DD)."),
+    ] = None,
+    to_date: Annotated[
+        str | None,
+        typer.Option("--to", help="Include the entire local date (YYYY-MM-DD)."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    search_results = core_from_context(ctx).search(query, limit, context)
+    try:
+        filters = parse_search_filters(since=since, from_date=from_date, to_date=to_date)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    search_results = core_from_context(ctx).search(query, limit, context, filters=filters)
     results = [meeting_search_result_payload(result) for result in search_results.results]
     if json_output:
         print_json(results)

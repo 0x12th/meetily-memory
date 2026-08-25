@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from meetily_memory.domain import SearchHit
+from meetily_memory.domain import MeetingSearchFilters, SearchHit
 from meetily_memory.evaluation import (
     EvaluationDataset,
     EvaluationManifest,
@@ -44,8 +44,9 @@ class FixedEvaluationStrategy:
         *,
         meeting_id: int | None = None,
         context: int = 0,
+        filters: MeetingSearchFilters | None = None,
     ) -> tuple[SearchHit, ...]:
-        del query, meeting_id, context
+        del query, meeting_id, context, filters
         return self.hits[:limit]
 
 

@@ -1,10 +1,35 @@
 import sqlite3
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
 from meetily_memory.db.fts import build_fts_query, build_strict_fts_query
 from meetily_memory.db.rows import rows_to_dicts
 from meetily_memory.db.schema import index_connection
+from meetily_memory.domain import MeetingSearchFilters
+
+MEETING_TIME_EXPRESSION = (
+    "COALESCE({alias}.started_at, {alias}.created_at, {alias}.updated_at, {alias}.indexed_at)"
+)
+
+
+def meeting_time_predicate(
+    filters: MeetingSearchFilters | None,
+    *,
+    alias: str = "m",
+) -> tuple[str, list[object]]:
+    if filters is None:
+        return "1 = 1", []
+    expression = MEETING_TIME_EXPRESSION.format(alias=alias)
+    clauses: list[str] = []
+    params: list[object] = []
+    if filters.from_utc is not None:
+        clauses.append(f"datetime({expression}) >= datetime(?)")
+        params.append(filters.from_utc.astimezone(UTC).isoformat())
+    if filters.to_utc is not None:
+        clauses.append(f"datetime({expression}) < datetime(?)")
+        params.append(filters.to_utc.astimezone(UTC).isoformat())
+    return " AND ".join(clauses) if clauses else "1 = 1", params
 
 
 class SearchRepository:
@@ -18,6 +43,7 @@ class SearchRepository:
         *,
         meeting_id: int | None = None,
         context: int = 0,
+        filters: MeetingSearchFilters | None = None,
     ) -> list[dict[str, Any]]:
         fts_query = build_fts_query(query)
         if not fts_query:
@@ -32,6 +58,7 @@ class SearchRepository:
                     strict_fts_query,
                     limit,
                     meeting_id=meeting_id,
+                    filters=filters,
                 )
             else:
                 rows = self._search_with_fallback(
@@ -39,12 +66,13 @@ class SearchRepository:
                     fts_query,
                     strict_fts_query,
                     limit,
+                    filters=filters,
                 )
             if context == 0:
                 return rows
             return self._expand_context(conn, rows, context)
 
-    def _search_with_fallback(
+    def _search_with_fallback(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
         fts_query: str,
@@ -52,6 +80,7 @@ class SearchRepository:
         limit: int,
         *,
         meeting_id: int | None = None,
+        filters: MeetingSearchFilters | None = None,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         if strict_fts_query:
@@ -61,6 +90,7 @@ class SearchRepository:
                     strict_fts_query,
                     limit,
                     meeting_id=meeting_id,
+                    filters=filters,
                 )
             )
             if len(rows) >= limit:
@@ -71,6 +101,7 @@ class SearchRepository:
                 fts_query,
                 limit,
                 meeting_id=meeting_id,
+                filters=filters,
             )
         )
         seen_chunk_ids = {row["chunk_id"] for row in rows}
@@ -90,10 +121,12 @@ class SearchRepository:
         limit: int,
         *,
         meeting_id: int | None = None,
+        filters: MeetingSearchFilters | None = None,
     ) -> list[Any]:
-        params = (fts_query, meeting_id, meeting_id, limit)
+        time_sql, time_params = meeting_time_predicate(filters)
+        params = (fts_query, meeting_id, meeting_id, *time_params, limit)
         return conn.execute(
-            """
+            f"""
             SELECT
               m.id AS meeting_id,
               m.external_id AS meeting_external_id,
@@ -117,6 +150,7 @@ class SearchRepository:
             JOIN meetings m ON m.id = c.meeting_id
             WHERE chunks_fts MATCH ?
               AND (? IS NULL OR m.id = ?)
+              AND {time_sql}
             ORDER BY f.rank
             LIMIT ?
             """,

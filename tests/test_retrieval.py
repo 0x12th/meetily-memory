@@ -1,4 +1,6 @@
+import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from meetily_memory import retrieval
@@ -6,6 +8,7 @@ from meetily_memory.context_builder import ContextRenderer
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.domain import (
     ContextBundle,
+    MeetingSearchFilters,
     MeetingSearchResult,
     RetrievalSource,
     SearchHit,
@@ -26,8 +29,10 @@ class FixedRetrievalStrategy:
         self,
         query: str,
         limit: int = 10,
+        *,
+        filters: MeetingSearchFilters | None = None,
     ) -> tuple[SearchHit, ...]:
-        del query
+        del query, filters
         return self.hits[:limit]
 
 
@@ -40,8 +45,10 @@ class FixedMeetingRetrievalStrategy:
         query: str,
         limit: int = 10,
         context: int = 0,
+        *,
+        filters: MeetingSearchFilters | None = None,
     ) -> tuple[MeetingSearchResult, ...]:
-        del query, context
+        del query, context, filters
         return self.results[:limit]
 
 
@@ -91,6 +98,33 @@ def test_meeting_retrieval_expands_candidates_until_limit_has_unique_meetings(
         "meeting-1",
         "meeting-2",
     ]
+
+
+def test_fts_date_filter_is_applied_before_candidate_limit(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    with sqlite3.connect(index_path) as conn:
+        chunk_id = conn.execute(
+            "SELECT id FROM chunks WHERE meeting_id = 1 ORDER BY ordinal LIMIT 1"
+        ).fetchone()[0]
+        dominant_text = "migration risks " * 20
+        conn.execute("UPDATE chunks SET text = ? WHERE id = ?", (dominant_text, chunk_id))
+        conn.execute("UPDATE chunks_fts SET text = ? WHERE chunk_id = ?", (dominant_text, chunk_id))
+        conn.commit()
+    core = MeetilyMemoryCore(index_path)
+    filters = MeetingSearchFilters(
+        from_utc=datetime(2026, 7, 2, tzinfo=UTC),
+        to_utc=datetime(2026, 7, 3, tzinfo=UTC),
+    )
+
+    unfiltered = core.search("migration risks", limit=1).results
+    filtered = core.search("migration risks", limit=1, filters=filters).results
+
+    assert unfiltered[0].meeting.external_id == "meeting-1"
+    assert filtered[0].meeting.external_id == "meeting-2"
 
 
 def test_selected_strategy_drives_only_explicit_v3_search(
@@ -222,8 +256,10 @@ class FailingRetrievalStrategy:
         self,
         query: str,
         limit: int = 10,
+        *,
+        filters: MeetingSearchFilters | None = None,
     ) -> tuple[SearchHit, ...]:
-        del query, limit
+        del query, limit, filters
         self.calls += 1
         message = "semantic unavailable"
         raise RuntimeError(message)
@@ -291,6 +327,16 @@ def test_semantic_strategy_returns_domain_search_hits(
     strategy = retrieval.SemanticRetrievalStrategy(IndexRepository(index_path), provider)
 
     hits = strategy.search("migration risks", 3)
+    filtered = strategy.search(
+        "pricing decision",
+        1,
+        filters=MeetingSearchFilters(
+            from_utc=datetime(2026, 7, 2, tzinfo=UTC),
+            to_utc=datetime(2026, 7, 3, tzinfo=UTC),
+        ),
+    )
 
     assert hits
     assert all(isinstance(hit, SearchHit) for hit in hits)
+    assert filtered
+    assert {hit.meeting.external_id for hit in filtered} == {"meeting-2"}
