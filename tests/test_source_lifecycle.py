@@ -1,15 +1,34 @@
 import json
+import multiprocessing
 import shutil
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Protocol
 
+import pytest
 from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import loads_json
+from meetily_memory.refresh_lock import RefreshLock
+from meetily_memory.repositories.meetings import MeetingsRepository
+from meetily_memory.repositories.records import ChunkRecord, MeetingRecord
 from meetily_memory.tagging import TagService
+
+
+class EventLike(Protocol):
+    def set(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> bool: ...
+
+
+def hold_refresh_lock(index_path: Path, ready: EventLike, release: EventLike) -> None:
+    with RefreshLock(index_path):
+        ready.set()
+        release.wait(timeout=10)
 
 
 def test_legacy_source_path_migrates_idempotently_to_selected_uuid(
@@ -210,3 +229,180 @@ def test_rebind_accepts_a_partial_copy_with_one_matching_meeting(
 
     assert rebind.exit_code == 0
     assert "matching meetings: 1" in rebind.stdout
+
+
+def test_refresh_lock_blocks_a_second_writer_and_is_released_on_process_exit(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    data_dir = tmp_path / "data"
+    index_path = data_dir / "index.sqlite"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(target=hold_refresh_lock, args=(index_path, ready, release))
+    process.start()
+    assert ready.wait(timeout=10)
+
+    runner = CliRunner()
+    autosync = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "refresh",
+            "--source",
+            str(meetily_db),
+            "--autosync-run",
+        ],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+    blocked = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+
+    assert autosync.exit_code == 0
+    assert "autosync skipped" in autosync.output.lower()
+    assert f"pid {process.pid}" in autosync.output.lower()
+    assert blocked.exit_code != 0
+    assert "refresh is already running" in blocked.output.lower()
+    assert f"pid {process.pid}" in blocked.output.lower()
+    assert "acquired at" in blocked.output.lower()
+    assert not index_path.exists()
+
+    process.terminate()
+    process.join(timeout=10)
+    assert process.exitcode is not None
+    assert process.exitcode != 0
+    assert (data_dir / "refresh.lock").exists()
+
+    recovered = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+
+    assert recovered.exit_code == 0
+    with sqlite3.connect(index_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM meetings").fetchone()[0] == 2
+
+
+def test_failed_refresh_records_phase_preserves_last_update_and_recovers(
+    meetily_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    index_path = data_dir / "index.sqlite"
+    settings_path = data_dir / "settings.json"
+    env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+    first = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env=env,
+    )
+    assert first.exit_code == 0
+    settings = loads_json(settings_path.read_text())
+    settings["last_update_at"] = "2020-01-01T00:00:00Z"
+    settings_path.write_text(json.dumps(settings) + "\n", encoding="utf-8")
+
+    original_upsert = MeetingsRepository.upsert_meeting_with_chunks
+    calls = 0
+
+    def fail_after_first_meeting(
+        self: MeetingsRepository,
+        meeting: MeetingRecord,
+        chunks: Iterable[ChunkRecord],
+        *,
+        force: bool = False,
+    ) -> tuple[int, bool, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            error_message = "credential=secret transcript=private"
+            raise RuntimeError(error_message)
+        return original_upsert(self, meeting, chunks, force=force)
+
+    monkeypatch.setattr(MeetingsRepository, "upsert_meeting_with_chunks", fail_after_first_meeting)
+    failed = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env=env,
+    )
+
+    assert failed.exit_code != 0
+    assert loads_json(settings_path.read_text())["last_update_at"] == "2020-01-01T00:00:00Z"
+    with sqlite3.connect(index_path) as conn:
+        conn.row_factory = sqlite3.Row
+        failed_run = dict(
+            conn.execute("SELECT * FROM scan_runs ORDER BY id DESC LIMIT 1").fetchone()
+        )
+    assert failed_run["status"] == "failed"
+    assert failed_run["phase"] == "source_scan"
+    assert failed_run["finished_at"] is not None
+    assert "RuntimeError" in failed_run["error_message"]
+    assert "secret" not in failed_run["error_message"]
+    assert failed_run["meetings_seen"] == 2
+
+    status = runner.invoke(app, ["--index", str(index_path), "status", "--json"], env=env)
+    status_payload = loads_json(status.stdout)
+    assert status_payload["last_completed_run"]["status"] == "completed"
+    assert status_payload["last_failed_run"]["id"] == failed_run["id"]
+
+    monkeypatch.setattr(MeetingsRepository, "upsert_meeting_with_chunks", original_upsert)
+    recovered = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env=env,
+    )
+
+    assert recovered.exit_code == 0
+    assert loads_json(settings_path.read_text())["last_update_at"] != "2020-01-01T00:00:00Z"
+    with sqlite3.connect(index_path) as conn:
+        latest_status = conn.execute(
+            "SELECT status FROM scan_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+    assert latest_status == "completed"
+    recovered_status = runner.invoke(app, ["--index", str(index_path), "doctor", "--json"], env=env)
+    recovered_payload = loads_json(recovered_status.stdout)
+    assert recovered_payload["last_completed_run"]["status"] == "completed"
+    assert recovered_payload["last_failed_run"] is None
+
+
+def test_status_marks_an_abandoned_running_scan_as_failed(meetily_db: Path, tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    index_path = data_dir / "index.sqlite"
+    env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
+    runner = CliRunner()
+    refresh = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env=env,
+    )
+    assert refresh.exit_code == 0
+    with sqlite3.connect(index_path) as conn:
+        source_id = conn.execute("SELECT id FROM sources LIMIT 1").fetchone()[0]
+        cursor = conn.execute(
+            """
+            INSERT INTO scan_runs (source_id, started_at, status, phase)
+            VALUES (?, '2020-01-01T00:00:00Z', 'running', 'source_scan')
+            """,
+            (source_id,),
+        )
+        abandoned_run_id = cursor.lastrowid
+        conn.commit()
+
+    status = runner.invoke(app, ["--index", str(index_path), "status", "--json"], env=env)
+
+    assert status.exit_code == 0
+    payload = loads_json(status.stdout)
+    assert payload["last_failed_run"]["id"] == abandoned_run_id
+    assert payload["last_failed_run"]["phase"] == "source_scan"
+    with sqlite3.connect(index_path) as conn:
+        abandoned = conn.execute(
+            "SELECT status, finished_at, error_message FROM scan_runs WHERE id = ?",
+            (abandoned_run_id,),
+        ).fetchone()
+    assert abandoned[0] == "failed"
+    assert abandoned[1] is not None
+    assert abandoned[2] == "Previous refresh ended before completion."

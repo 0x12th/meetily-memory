@@ -15,6 +15,7 @@ from meetily_memory.structure_analyzer import StructureAnalyzer
 
 @dataclass
 class ScanResult:
+    run_id: int = 0
     source_id: int = 0
     meetings_seen: int = 0
     meetings_inserted: int = 0
@@ -32,40 +33,58 @@ class MeetilySQLiteScanner:
         self.repo = IndexRepository(Path(index_path), state_path=state_path)
         self.structure_analyzer = StructureAnalyzer(self.repo)
 
-    def scan(self, source_path: Path, *, force: bool = False, analyze: bool = True) -> ScanResult:
+    def scan(
+        self,
+        source_path: Path,
+        *,
+        force: bool = False,
+        analyze: bool = True,
+        finalize: bool = True,
+    ) -> ScanResult:
         source_path = Path(source_path)
         started_at = utc_now()
         with readonly_sqlite_connection(source_path) as conn:
             validate_meetily_schema(conn)
             result = ScanResult()
-            source_id = self.repo.upsert_source(
+            source_id, run_id = self.repo.begin_source_scan(
                 self.source_kind,
                 str(source_path),
-                now=started_at,
+                started_at,
             )
             result.source_id = source_id
+            result.run_id = run_id
 
-            for upstream in self._read_meetings(conn):
-                result.meetings_seen += 1
-                meeting, chunks = normalize_meeting(source_id, source_path, upstream, utc_now())
-                result.chunks_seen += len(chunks)
-                existing = self.repo.get_meeting_by_external_id(source_id, meeting.external_id)
-                meeting_id, updated, inserted_chunks = self.repo.upsert_meeting_with_chunks(
-                    meeting,
-                    chunks,
-                    force=force,
+            try:
+                for upstream in self._read_meetings(conn):
+                    result.meetings_seen += 1
+                    meeting, chunks = normalize_meeting(source_id, source_path, upstream, utc_now())
+                    result.chunks_seen += len(chunks)
+                    existing = self.repo.get_meeting_by_external_id(source_id, meeting.external_id)
+                    meeting_id, updated, inserted_chunks = self.repo.upsert_meeting_with_chunks(
+                        meeting,
+                        chunks,
+                        force=force,
+                    )
+                    if analyze and (existing is None or updated):
+                        self.structure_analyzer.analyze_meeting(meeting_id)
+                        result.meetings_analyzed += 1
+                    result.chunks_inserted += inserted_chunks
+                    if existing is None:
+                        result.meetings_inserted += 1
+                    elif updated:
+                        result.meetings_updated += 1
+                        result.chunks_updated += inserted_chunks
+            except Exception as exc:
+                self.repo.fail_scan_run(
+                    result.run_id,
+                    utc_now(),
+                    "source_scan",
+                    result,
+                    type(exc).__name__,
                 )
-                if analyze and (existing is None or updated):
-                    self.structure_analyzer.analyze_meeting(meeting_id)
-                    result.meetings_analyzed += 1
-                result.chunks_inserted += inserted_chunks
-                if existing is None:
-                    result.meetings_inserted += 1
-                elif updated:
-                    result.meetings_updated += 1
-                    result.chunks_updated += inserted_chunks
-
-            self.repo.record_scan_run(source_id, started_at, utc_now(), result)
+                raise
+            if finalize:
+                self.repo.complete_scan_run(result.run_id, utc_now(), result)
             return result
 
     def _read_meetings(self, conn: Any) -> Iterator[dict[str, Any]]:

@@ -1,7 +1,7 @@
 import sqlite3
 from collections.abc import Callable
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 STRUCTURED_ENTITIES_SQL = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -240,7 +240,9 @@ CREATE TABLE IF NOT EXISTS scan_runs (
   chunks_seen INTEGER DEFAULT 0,
   chunks_inserted INTEGER DEFAULT 0,
   chunks_updated INTEGER DEFAULT 0,
-  errors_json TEXT
+  errors_json TEXT,
+  phase TEXT NOT NULL DEFAULT 'source_scan',
+  error_message TEXT
 );
 
 CREATE TABLE IF NOT EXISTS plugin_state (
@@ -290,6 +292,14 @@ def migrate_to_v4(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS user_state_migration_ready")
 
 
+def migrate_to_v5(conn: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(scan_runs)").fetchall()}
+    if "phase" not in columns:
+        conn.execute("ALTER TABLE scan_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'source_scan'")
+    if "error_message" not in columns:
+        conn.execute("ALTER TABLE scan_runs ADD COLUMN error_message TEXT")
+
+
 def migrate_entity_table_to_required_chunk(conn: sqlite3.Connection, table: str) -> None:
     legacy_table = f"{table}_v3"
     conn.execute(f"ALTER TABLE {table} RENAME TO {legacy_table}")
@@ -333,4 +343,5 @@ MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: migrate_to_v2,
     3: migrate_to_v3,
     4: migrate_to_v4,
+    5: migrate_to_v5,
 }

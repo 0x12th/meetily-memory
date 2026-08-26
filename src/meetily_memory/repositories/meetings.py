@@ -8,6 +8,7 @@ from meetily_memory.db.fts import NO_MATCH_FTS_QUERY, build_fts_query
 from meetily_memory.db.rows import last_insert_id, row_to_dict, rows_to_dicts
 from meetily_memory.db.schema import index_connection
 from meetily_memory.domain import MeetingSearchFilters
+from meetily_memory.json_codec import dumps_json
 from meetily_memory.meeting_structure import ENTITY_KINDS
 from meetily_memory.memory.entities import ENTITY_COUNT_SQL, ENTITY_DELETE_SQL, ENTITY_SELECT_SQL
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, ScanRunStats
@@ -30,32 +31,45 @@ class MeetingsRepository:
         self.index_path = context.index_path
 
     def upsert_source(self, kind: str, path: str, now: str, label: str | None = None) -> int:
-        existing = self.get_source(kind, path)
         with index_connection(self.index_path) as conn:
-            if existing:
-                conn.execute(
-                    """
-                    UPDATE sources
-                    SET last_seen_at = ?, updated_at = ?, label = ?
-                    WHERE id = ?
-                    """,
-                    (now, now, label or existing["label"], existing["id"]),
-                )
-                conn.commit()
-                return int(existing["id"])
-
-            cursor = conn.execute(
-                """
-                INSERT INTO sources (
-                  kind, path, label, external_app, external_version,
-                  last_seen_at, created_at, updated_at
-                )
-                VALUES (?, ?, ?, 'Meetily', NULL, ?, ?, ?)
-                """,
-                (kind, path, label, now, now, now),
-            )
+            source_id = self._upsert_source(conn, kind, path, now, label)
             conn.commit()
-            return last_insert_id(cursor)
+            return source_id
+
+    def _upsert_source(
+        self,
+        conn: sqlite3.Connection,
+        kind: str,
+        path: str,
+        now: str,
+        label: str | None = None,
+    ) -> int:
+        existing = conn.execute(
+            "SELECT * FROM sources WHERE kind = ? AND path = ?",
+            (kind, path),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE sources
+                SET last_seen_at = ?, updated_at = ?, label = ?
+                WHERE id = ?
+                """,
+                (now, now, label or existing["label"], existing["id"]),
+            )
+            return int(existing["id"])
+
+        cursor = conn.execute(
+            """
+            INSERT INTO sources (
+              kind, path, label, external_app, external_version,
+              last_seen_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 'Meetily', NULL, ?, ?, ?)
+            """,
+            (kind, path, label, now, now, now),
+        )
+        return last_insert_id(cursor)
 
     def get_source(self, kind: str, path: str) -> dict[str, Any] | None:
         with index_connection(self.index_path) as conn:
@@ -358,26 +372,65 @@ class MeetingsRepository:
             ).fetchone()
             return str(row["language"]) if row else None
 
-    def record_scan_run(
+    def begin_source_scan(self, kind: str, path: str, started_at: str) -> tuple[int, int]:
+        with index_connection(self.index_path) as conn:
+            source_id = self._upsert_source(conn, kind, path, started_at)
+            self._fail_running_scan_runs(conn, started_at)
+            cursor = conn.execute(
+                """
+                INSERT INTO scan_runs (source_id, started_at, status, phase)
+                VALUES (?, ?, 'running', 'source_scan')
+                """,
+                (source_id, started_at),
+            )
+            conn.commit()
+            return source_id, last_insert_id(cursor)
+
+    def fail_abandoned_scan_runs(self, finished_at: str) -> None:
+        with index_connection(self.index_path) as conn:
+            self._fail_running_scan_runs(conn, finished_at)
+            conn.commit()
+
+    def _fail_running_scan_runs(self, conn: sqlite3.Connection, finished_at: str) -> None:
+        interrupted_message = "Previous refresh ended before completion."
+        conn.execute(
+            """
+            UPDATE scan_runs
+            SET finished_at = ?, status = 'failed', error_message = ?, errors_json = ?
+            WHERE status = 'running'
+            """,
+            (
+                finished_at,
+                interrupted_message,
+                dumps_json({"message": interrupted_message}),
+            ),
+        )
+
+    def update_scan_run_phase(self, run_id: int, phase: str) -> None:
+        with index_connection(self.index_path) as conn:
+            conn.execute(
+                "UPDATE scan_runs SET phase = ? WHERE id = ? AND status = 'running'",
+                (phase, run_id),
+            )
+            conn.commit()
+
+    def complete_scan_run(
         self,
-        source_id: int,
-        started_at: str,
+        run_id: int,
         finished_at: str,
         result: ScanRunStats,
     ) -> None:
         with index_connection(self.index_path) as conn:
             conn.execute(
                 """
-                INSERT INTO scan_runs (
-                  source_id, started_at, finished_at, status, meetings_seen,
-                  meetings_inserted, meetings_updated, chunks_seen,
-                  chunks_inserted, chunks_updated, errors_json
-                )
-                VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?, NULL)
+                UPDATE scan_runs
+                SET finished_at = ?, status = 'completed', phase = 'completed',
+                    meetings_seen = ?, meetings_inserted = ?, meetings_updated = ?,
+                    chunks_seen = ?, chunks_inserted = ?, chunks_updated = ?,
+                    errors_json = NULL, error_message = NULL
+                WHERE id = ? AND status = 'running'
                 """,
                 (
-                    source_id,
-                    started_at,
                     finished_at,
                     result.meetings_seen,
                     result.meetings_inserted,
@@ -385,9 +438,66 @@ class MeetingsRepository:
                     result.chunks_seen,
                     result.chunks_inserted,
                     result.chunks_updated,
+                    run_id,
                 ),
             )
             conn.commit()
+
+    def fail_scan_run(
+        self,
+        run_id: int,
+        finished_at: str,
+        phase: str,
+        result: ScanRunStats,
+        error_type: str,
+    ) -> None:
+        message = f"{error_type} during {phase}."
+        with index_connection(self.index_path) as conn:
+            conn.execute(
+                """
+                UPDATE scan_runs
+                SET finished_at = ?, status = 'failed', phase = ?,
+                    meetings_seen = ?, meetings_inserted = ?, meetings_updated = ?,
+                    chunks_seen = ?, chunks_inserted = ?, chunks_updated = ?,
+                    errors_json = ?, error_message = ?
+                WHERE id = ?
+                """,
+                (
+                    finished_at,
+                    phase,
+                    result.meetings_seen,
+                    result.meetings_inserted,
+                    result.meetings_updated,
+                    result.chunks_seen,
+                    result.chunks_inserted,
+                    result.chunks_updated,
+                    dumps_json({"phase": phase, "message": message}),
+                    message,
+                    run_id,
+                ),
+            )
+            conn.commit()
+
+    def scan_run_diagnostics(self) -> dict[str, dict[str, Any] | None]:
+        with index_connection(self.index_path) as conn:
+            completed = conn.execute(
+                "SELECT * FROM scan_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            failed = conn.execute(
+                "SELECT * FROM scan_runs WHERE status = 'failed' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        completed_payload = row_to_dict(completed)
+        failed_payload = row_to_dict(failed)
+        if (
+            failed_payload
+            and completed_payload
+            and int(failed_payload["id"]) < int(completed_payload["id"])
+        ):
+            failed_payload = None
+        return {
+            "last_completed_run": completed_payload,
+            "last_failed_run": failed_payload,
+        }
 
     def stats(self) -> dict[str, int]:
         with index_connection(self.index_path) as conn:

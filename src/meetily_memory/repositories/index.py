@@ -480,14 +480,31 @@ class IndexRepository:
     def dominant_meeting_language(self) -> str | None:
         return self.meetings.dominant_meeting_language()
 
-    def record_scan_run(
+    def begin_source_scan(self, kind: str, path: str, started_at: str) -> tuple[int, int]:
+        self.user_state.get_or_create_source(kind, path, now=started_at)
+        return self.meetings.begin_source_scan(kind, path, started_at)
+
+    def fail_abandoned_scan_runs(self, finished_at: str) -> None:
+        self.meetings.fail_abandoned_scan_runs(finished_at)
+
+    def update_scan_run_phase(self, run_id: int, phase: str) -> None:
+        self.meetings.update_scan_run_phase(run_id, phase)
+
+    def complete_scan_run(self, run_id: int, finished_at: str, result: ScanRunStats) -> None:
+        self.meetings.complete_scan_run(run_id, finished_at, result)
+
+    def fail_scan_run(
         self,
-        source_id: int,
-        started_at: str,
+        run_id: int,
         finished_at: str,
+        phase: str,
         result: ScanRunStats,
+        error_type: str,
     ) -> None:
-        self.meetings.record_scan_run(source_id, started_at, finished_at, result)
+        self.meetings.fail_scan_run(run_id, finished_at, phase, result, error_type)
+
+    def scan_run_diagnostics(self) -> dict[str, dict[str, Any] | None]:
+        return self.meetings.scan_run_diagnostics()
 
     def stats(self) -> dict[str, int]:
         return self.meetings.stats()

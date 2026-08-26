@@ -215,6 +215,7 @@ def install_launchd_plist(
     <string>--index</string>
     <string>{index_path}</string>
     <string>{AUTOSYNC_COMMAND}</string>
+    <string>--autosync-run</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -303,13 +304,17 @@ def install_systemd_user_units(
     data_dir.mkdir(parents=True, exist_ok=True)
     executable = autosync_executable()
     minutes = max(interval_minutes, 1)
+    exec_start = (
+        f"{systemd_quote(executable)} --index {systemd_quote(index_path)} "
+        f"{AUTOSYNC_COMMAND} --autosync-run"
+    )
     service = f"""[Unit]
 Description=Meetily Memory automatic refresh
 
 [Service]
 Type=oneshot
 Environment=MEETILY_MEMORY_DATA_DIR={systemd_quote(data_dir)}
-ExecStart={systemd_quote(executable)} --index {systemd_quote(index_path)} {AUTOSYNC_COMMAND}
+ExecStart={exec_start}
 """
     timer = f"""[Unit]
 Description=Run Meetily Memory automatic refresh

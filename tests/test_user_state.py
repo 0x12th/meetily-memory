@@ -1,7 +1,12 @@
 import sqlite3
 from pathlib import Path
 
-from meetily_memory.db.migrations import migrate_to_v1, migrate_to_v2, migrate_to_v3
+from meetily_memory.db.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    migrate_to_v1,
+    migrate_to_v2,
+    migrate_to_v3,
+)
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.user_state import USER_STATE_SCHEMA, UserStateRepository
@@ -22,7 +27,7 @@ def test_legacy_task_status_migrates_to_persistent_state_before_index_schema(
     assert tasks[0]["status_note"] == "verified by user"
     assert report == {"migrated": 1, "orphaned": 0}
     with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
         assert (
             conn.execute(
                 """

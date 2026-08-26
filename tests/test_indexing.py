@@ -71,6 +71,41 @@ def test_index_schema_runs_explicit_migrations_from_v1(tmp_path: Path) -> None:
             assert conn.execute(sql).fetchone()[0] == 0
 
 
+def test_index_schema_adds_scan_lifecycle_columns_to_v4_database(tmp_path: Path) -> None:
+    index_path = tmp_path / "index.sqlite"
+    with sqlite3.connect(index_path) as conn:
+        for version in range(1, 5):
+            MIGRATIONS[version](conn)
+        conn.execute("DROP TABLE scan_runs")
+        conn.execute(
+            """
+            CREATE TABLE scan_runs (
+              id INTEGER PRIMARY KEY,
+              source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL,
+              started_at TEXT NOT NULL,
+              finished_at TEXT,
+              status TEXT NOT NULL,
+              meetings_seen INTEGER DEFAULT 0,
+              meetings_inserted INTEGER DEFAULT 0,
+              meetings_updated INTEGER DEFAULT 0,
+              chunks_seen INTEGER DEFAULT 0,
+              chunks_inserted INTEGER DEFAULT 0,
+              chunks_updated INTEGER DEFAULT 0,
+              errors_json TEXT
+            )
+            """
+        )
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+
+    IndexRepository(index_path)
+
+    with sqlite3.connect(index_path) as conn:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(scan_runs)")}
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+    assert {"phase", "error_message"} <= columns
+
+
 def test_index_repository_upgrades_v1_database_to_current_tables(tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     with sqlite3.connect(index_path) as conn:

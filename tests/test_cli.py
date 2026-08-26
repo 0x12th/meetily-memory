@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from meetily_memory.cli.app import app
 from meetily_memory.cli.common import open_path
 from meetily_memory.cli.search_commands import parse_search_filters
+from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import loads_json
 from meetily_memory.tagging import TagRepository
@@ -849,8 +850,8 @@ def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
 
     assert status.exit_code == 0
     assert f"index path: {index_path}" in status.stdout
-    assert "schema version: 4" in status.stdout
-    assert "current schema version: 4" in status.stdout
+    assert f"schema version: {CURRENT_SCHEMA_VERSION}" in status.stdout
+    assert f"current schema version: {CURRENT_SCHEMA_VERSION}" in status.stdout
     assert "orphaned tag assignments: 0" in status.stdout
 
 
