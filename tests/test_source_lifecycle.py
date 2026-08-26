@@ -16,6 +16,7 @@ from meetily_memory.json_codec import loads_json
 from meetily_memory.refresh_lock import RefreshLock
 from meetily_memory.repositories.meetings import MeetingsRepository
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord
+from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.tagging import TagService
 
 
@@ -406,3 +407,111 @@ def test_status_marks_an_abandoned_running_scan_as_failed(meetily_db: Path, tmp_
     assert abandoned[0] == "failed"
     assert abandoned[1] is not None
     assert abandoned[2] == "Previous refresh ended before completion."
+
+
+def test_successful_scan_reconciles_deleted_meeting_and_restores_its_tag(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    scanner = MeetilySQLiteScanner(index_path)
+    scanner.scan(meetily_db)
+    repo = IndexRepository(index_path)
+    deleted_meeting = repo.get_meeting("meeting-2")
+    assert deleted_meeting is not None
+    deleted_meeting_id = int(deleted_meeting["id"])
+    tag_service = TagService(repo)
+    tag_service.assign((str(deleted_meeting_id),), ("Сбер",))
+    with sqlite3.connect(index_path) as conn:
+        deleted_chunk_ids = {
+            int(row[0])
+            for row in conn.execute(
+                """
+                SELECT id
+                FROM chunks
+                WHERE meeting_id = ?
+                """,
+                (deleted_meeting_id,),
+            )
+        }
+    with sqlite3.connect(meetily_db) as conn:
+        source_meeting = conn.execute("SELECT * FROM meetings WHERE id = 'meeting-2'").fetchone()
+        assert source_meeting is not None
+        conn.execute("DELETE FROM meetings WHERE id = 'meeting-2'")
+        conn.commit()
+
+    scanner.scan(meetily_db)
+
+    core = MeetilyMemoryCore(index_path)
+    assert {meeting.external_id for meeting in core.meetings()} == {"meeting-1"}
+    assert core.search("migration risks").results == ()
+    assert core.search("Сбер").results == ()
+    assert core.get_meeting("meeting-2") is None
+    assert tag_service.orphaned_assignment_count() == 1
+    assert len(tag_service.repository.list_assignments()) == 1
+    with sqlite3.connect(index_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM chunks_fts WHERE meeting_id = ?", (deleted_meeting_id,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM knowledge_edges WHERE source_meeting_id = ?",
+                (deleted_meeting_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        stale_keys = {f"meeting:{deleted_meeting_id}"} | {
+            f"chunk:{chunk_id}" for chunk_id in deleted_chunk_ids
+        }
+        assert not stale_keys.intersection(
+            str(row[0]) for row in conn.execute("SELECT stable_key FROM knowledge_nodes")
+        )
+
+    with sqlite3.connect(meetily_db) as conn:
+        placeholders = ", ".join("?" for _ in source_meeting)
+        conn.execute(
+            f"INSERT INTO meetings VALUES ({placeholders})",  # noqa: S608
+            source_meeting,
+        )
+        conn.commit()
+    scanner.scan(meetily_db)
+
+    restored = repo.get_meeting("meeting-2")
+    assert restored is not None
+    assert [tag.display_name for tag in tag_service.list_for_meeting(str(restored["id"]))] == [
+        "Сбер"
+    ]
+    assert tag_service.orphaned_assignment_count() == 0
+
+
+def test_failed_source_read_does_not_reconcile_missing_meetings(
+    meetily_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    scanner = MeetilySQLiteScanner(index_path)
+    scanner.scan(meetily_db)
+    with sqlite3.connect(meetily_db) as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'meeting-2'")
+        conn.commit()
+    original_read = MeetilySQLiteScanner._read_meetings  # noqa: SLF001
+    error_message = "interrupted source read"
+
+    def interrupted_read(
+        self: MeetilySQLiteScanner, conn: sqlite3.Connection
+    ) -> Iterable[dict[str, object]]:
+        yield from original_read(self, conn)
+        raise RuntimeError(error_message)
+
+    monkeypatch.setattr(MeetilySQLiteScanner, "_read_meetings", interrupted_read)
+
+    with pytest.raises(RuntimeError, match="interrupted source read"):
+        scanner.scan(meetily_db)
+
+    repo = IndexRepository(index_path)
+    assert {str(row["external_id"]) for row in repo.list_meetings()} == {
+        "meeting-1",
+        "meeting-2",
+    }
+    assert repo.search("migration risks")[0]["meeting_external_id"] == "meeting-2"

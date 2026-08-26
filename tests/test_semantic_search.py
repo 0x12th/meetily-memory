@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -151,6 +152,65 @@ def test_semantic_index_cleans_orphaned_vector_rows(meetily_db: Path, tmp_path: 
 
     assert indexed == 0
     assert orphaned == 0
+
+
+@requires_sqlite_vec
+def test_source_reconciliation_removes_embedding_metadata_and_vector_rows(
+    meetily_db: Path, tmp_path: Path
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    scanner = MeetilySQLiteScanner(index_path)
+    scanner.scan(meetily_db)
+    provider = StubEmbeddingProvider()
+    index_semantic_embeddings(index_path, embedding_provider=provider)
+    vector_table = vector_table_name(provider, 3)
+    with index_connection(index_path) as conn:
+        deleted_chunk_ids = {
+            int(row["id"])
+            for row in conn.execute(
+                """
+                SELECT c.id
+                FROM chunks c
+                JOIN meetings m ON m.id = c.meeting_id
+                WHERE m.external_id = 'meeting-2'
+                """
+            )
+        }
+    with sqlite3.connect(meetily_db) as conn:
+        conn.execute("DELETE FROM meetings WHERE id = 'meeting-2'")
+        conn.commit()
+
+    scanner.scan(meetily_db)
+
+    coverage = semantic_index_coverage(index_path, provider)
+    assert coverage.complete is True
+    assert coverage.current_chunks == coverage.total_chunks
+    assert coverage.vector_rows == coverage.total_chunks
+    remaining_results = semantic_search(
+        index_path,
+        "pricing launch",
+        5,
+        embedding_provider=provider,
+    )
+    assert remaining_results
+    assert {row["meeting_external_id"] for row in remaining_results} == {"meeting-1"}
+    with index_connection(index_path) as conn:
+        load_sqlite_vec(conn)
+        placeholders = ",".join("?" for _ in deleted_chunk_ids)
+        assert (
+            conn.execute(
+                f"SELECT COUNT(*) FROM chunk_embeddings WHERE chunk_id IN ({placeholders})",  # noqa: S608
+                tuple(deleted_chunk_ids),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                f"SELECT COUNT(*) FROM {vector_table} WHERE rowid IN ({placeholders})",  # noqa: S608
+                tuple(deleted_chunk_ids),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @requires_sqlite_vec

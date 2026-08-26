@@ -13,6 +13,7 @@ from meetily_memory.meeting_structure import ENTITY_KINDS
 from meetily_memory.memory.entities import ENTITY_COUNT_SQL, ENTITY_DELETE_SQL, ENTITY_SELECT_SQL
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, ScanRunStats
 from meetily_memory.repositories.search import meeting_time_predicate
+from meetily_memory.semantic_search import assert_safe_identifier, load_sqlite_vec
 
 SyncKnowledge = Callable[[sqlite3.Connection, int, str], None]
 DeleteKnowledge = Callable[[sqlite3.Connection, int], None]
@@ -199,13 +200,55 @@ class MeetingsRepository:
             conn.commit()
             return meeting_id, updated, inserted_chunks
 
+    def reconcile_source_meetings(self, source_id: int, external_ids: set[str]) -> int:
+        with index_connection(self.index_path) as conn:
+            rows = conn.execute(
+                "SELECT id, external_id FROM meetings WHERE source_id = ?",
+                (source_id,),
+            ).fetchall()
+            meeting_ids = [
+                int(row["id"]) for row in rows if str(row["external_id"]) not in external_ids
+            ]
+            for meeting_id in meeting_ids:
+                self.delete_meeting_children(conn, meeting_id)
+                conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+            conn.commit()
+            return len(meeting_ids)
+
     def delete_meeting_children(self, conn: sqlite3.Connection, meeting_id: int) -> None:
+        self.delete_meeting_vectors(conn, meeting_id)
         self.context.delete_meeting_knowledge(conn, meeting_id)
         self.delete_structured_entities(conn, meeting_id)
         conn.execute("DELETE FROM chunks_fts WHERE meeting_id = ?", (meeting_id,))
         conn.execute("DELETE FROM meeting_people WHERE meeting_id = ?", (meeting_id,))
         conn.execute("DELETE FROM chunks WHERE meeting_id = ?", (meeting_id,))
         conn.execute("DELETE FROM artifacts WHERE meeting_id = ?", (meeting_id,))
+
+    def delete_meeting_vectors(self, conn: sqlite3.Connection, meeting_id: int) -> None:
+        vector_tables = [
+            str(row["name"])
+            for row in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name GLOB 'chunk_embeddings_vec_*'
+                  AND sql LIKE 'CREATE VIRTUAL TABLE%USING vec0%'
+                """
+            ).fetchall()
+        ]
+        if not vector_tables:
+            return
+        load_sqlite_vec(conn)
+        for table in vector_tables:
+            safe_table = assert_safe_identifier(table)
+            conn.execute(
+                f"""
+                DELETE FROM {safe_table}
+                WHERE rowid IN (SELECT id FROM chunks WHERE meeting_id = ?)
+                """,
+                (meeting_id,),
+            )
 
     def delete_structured_entities(self, conn: sqlite3.Connection, meeting_id: int) -> None:
         for sql in ENTITY_DELETE_SQL.values():

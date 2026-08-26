@@ -177,6 +177,9 @@ class IndexRepository:
     ) -> tuple[int, bool, int]:
         return self.meetings.upsert_meeting_with_chunks(meeting, chunks, force=force)
 
+    def reconcile_source_meetings(self, source_id: int, external_ids: set[str]) -> int:
+        return self.meetings.reconcile_source_meetings(source_id, external_ids)
+
     def _delete_structured_entities(self, conn: sqlite3.Connection, meeting_id: int) -> None:
         self.meetings.delete_structured_entities(conn, meeting_id)
 

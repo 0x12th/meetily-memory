@@ -53,6 +53,7 @@ class MeetilySQLiteScanner:
             )
             result.source_id = source_id
             result.run_id = run_id
+            seen_external_ids: set[str] = set()
 
             try:
                 for upstream in self._read_meetings(conn):
@@ -74,6 +75,8 @@ class MeetilySQLiteScanner:
                     elif updated:
                         result.meetings_updated += 1
                         result.chunks_updated += inserted_chunks
+                    seen_external_ids.add(meeting.external_id)
+                self.repo.reconcile_source_meetings(source_id, seen_external_ids)
             except Exception as exc:
                 self.repo.fail_scan_run(
                     result.run_id,
