@@ -1,5 +1,17 @@
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
+from pathlib import Path
+
+from meetily_memory.db.migration_identity import (
+    MIGRATION_REPORT_SCHEMA_VERSION,
+    LegacyTaskState,
+    canonical_database_path,
+    legacy_state_migration_key,
+    main_database_path,
+    read_legacy_task_states,
+    verified_migration_report,
+)
 
 CURRENT_SCHEMA_VERSION = 5
 
@@ -135,8 +147,6 @@ ON topic_aliases(normalized_alias);
 """
 
 BASE_SCHEMA_SQL = """
-PRAGMA foreign_keys=ON;
-
 CREATE TABLE IF NOT EXISTS sources (
   id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL,
@@ -261,48 +271,237 @@ CREATE INDEX IF NOT EXISTS idx_people_normalized_name ON people(normalized_name)
 """
 
 
-def migrate_to_v1(conn: sqlite3.Connection) -> None:
-    conn.executescript(BASE_SCHEMA_SQL)
+def execute_sql_statements(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a static SQL script without sqlite3's implicit executescript commit."""
+    statement = ""
+    for line in script.splitlines():
+        statement = f"{statement}{line}\n"
+        if not sqlite3.complete_statement(statement):
+            continue
+        if statement.strip():
+            conn.execute(statement)
+        statement = ""
+    if statement.strip():
+        msg = "SQL migration contains an incomplete statement."
+        raise ValueError(msg)
 
 
-def migrate_to_v2(conn: sqlite3.Connection) -> None:
-    conn.executescript(STRUCTURED_ENTITIES_SQL)
+def _migration_checkpoint(_name: str) -> None:
+    # A narrow no-op seam lets tests interrupt real public repository upgrades.
+    return
 
 
-def migrate_to_v3(conn: sqlite3.Connection) -> None:
-    conn.executescript(KNOWLEDGE_SCHEMA_SQL)
+def _require_migration_predecessor(current_version: int, target_version: int) -> None:
+    if current_version != target_version - 1:
+        msg = (
+            f"Cannot migrate index schema from version {current_version} "
+            f"directly to version {target_version}."
+        )
+        raise RuntimeError(msg)
 
 
-def migrate_to_v4(conn: sqlite3.Connection) -> None:
-    legacy_status_count = conn.execute("SELECT COUNT(*) FROM task_status_overrides").fetchone()[0]
-    migration_ready = conn.execute(
+def _run_atomic_migration(
+    conn: sqlite3.Connection,
+    target_version: int,
+    migration: Callable[[sqlite3.Connection], None],
+) -> None:
+    if conn.in_transaction:
+        msg = f"Index migration to version {target_version} requires a clean connection."
+        raise RuntimeError(msg)
+
+    conn.execute("PRAGMA foreign_keys=ON")
+    if int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+        msg = "Index migrations require SQLite foreign-key enforcement."
+        raise RuntimeError(msg)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if current_version >= target_version:
+            conn.commit()
+            return
+        _require_migration_predecessor(current_version, target_version)
+        migration(conn)
+        _migration_checkpoint(f"v{target_version}:before_user_version")
+        conn.execute(f"PRAGMA user_version = {target_version}")
+        _migration_checkpoint(f"v{target_version}:after_user_version")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _migrate_to_v1(conn: sqlite3.Connection) -> None:
+    execute_sql_statements(conn, BASE_SCHEMA_SQL)
+
+
+def _migrate_to_v2(conn: sqlite3.Connection) -> None:
+    execute_sql_statements(conn, STRUCTURED_ENTITIES_SQL)
+
+
+def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+    execute_sql_statements(conn, KNOWLEDGE_SCHEMA_SQL)
+
+
+def _migrate_to_v4(conn: sqlite3.Connection) -> None:
+    _require_verified_state_transfer(conn)
+
+    conn.execute("DROP TABLE task_status_overrides")
+    _migration_checkpoint("v4:task_status_overrides:dropped")
+    for table in ("decisions", "action_items", "risks", "open_questions"):
+        migrate_entity_table_to_required_chunk(conn, table)
+    conn.execute("DROP TABLE IF EXISTS user_state_migration_ready")
+    _migration_checkpoint("v4:user_state_migration_ready:dropped")
+
+
+def _migrate_to_v5(conn: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(scan_runs)").fetchall()}
+    if "phase" not in columns:
+        conn.execute("ALTER TABLE scan_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'source_scan'")
+        _migration_checkpoint("v5:scan_runs:phase_added")
+    if "error_message" not in columns:
+        conn.execute("ALTER TABLE scan_runs ADD COLUMN error_message TEXT")
+        _migration_checkpoint("v5:scan_runs:error_message_added")
+
+
+def _require_verified_state_transfer(conn: sqlite3.Connection) -> None:
+    rows = read_legacy_task_states(conn)
+    legacy_status_count = int(
+        conn.execute("SELECT COUNT(*) FROM task_status_overrides").fetchone()[0]
+    )
+    if len(rows) != legacy_status_count:
+        msg = "Not every legacy task status is represented in the v4 transfer snapshot."
+        raise RuntimeError(msg)
+
+    marker_exists = conn.execute(
         """
         SELECT 1
         FROM sqlite_master
         WHERE type = 'table' AND name = 'user_state_migration_ready'
         """
     ).fetchone()
-    if legacy_status_count and migration_ready is None:
-        message = "User state must be migrated before upgrading the disposable index to v4."
-        raise RuntimeError(message)
+    if marker_exists is None:
+        if legacy_status_count == 0:
+            return
+        msg = "User state must be migrated before upgrading the disposable index to v4."
+        raise RuntimeError(msg)
 
-    conn.execute("DROP TABLE task_status_overrides")
-    for table in ("decisions", "action_items", "risks", "open_questions"):
-        migrate_entity_table_to_required_chunk(conn, table)
-    conn.execute("DROP TABLE IF EXISTS user_state_migration_ready")
+    try:
+        markers = conn.execute(
+            """
+            SELECT
+              migration_key, report_id, index_path, state_path,
+              state_schema_version, expected, migrated, orphaned
+            FROM user_state_migration_ready
+            """
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        msg = "The legacy user-state transfer marker is not verifiable."
+        raise RuntimeError(msg) from exc
+
+    if len(markers) != 1:
+        msg = "The legacy user-state transfer marker must contain exactly one row."
+        raise RuntimeError(msg)
+    marker = markers[0]
+    migration_key = str(marker[0])
+    report_id = int(marker[1])
+    index_path = str(marker[2])
+    state_path = str(marker[3])
+    state_schema_version = int(marker[4])
+    expected = int(marker[5])
+    migrated = int(marker[6])
+    orphaned = int(marker[7])
+    actual_index_path = main_database_path(conn)
+    actual_migration_key = legacy_state_migration_key(actual_index_path, rows)
+    if (
+        not migration_key
+        or report_id <= 0
+        or index_path != actual_index_path
+        or state_path != canonical_database_path(state_path)
+        or state_path == actual_index_path
+        or state_schema_version != MIGRATION_REPORT_SCHEMA_VERSION
+        or migration_key != actual_migration_key
+        or expected != legacy_status_count
+        or expected != migrated + orphaned
+    ):
+        msg = "The legacy user-state transfer marker does not match the locked legacy rows."
+        raise RuntimeError(msg)
+
+    _require_durable_state_report(
+        state_path=state_path,
+        state_schema_version=state_schema_version,
+        migration_key=migration_key,
+        report_id=report_id,
+        index_path=index_path,
+        rows=rows,
+        migrated=migrated,
+        orphaned=orphaned,
+    )
+
+
+def _require_durable_state_report(  # noqa: PLR0913
+    *,
+    state_path: str,
+    state_schema_version: int,
+    migration_key: str,
+    report_id: int,
+    index_path: str,
+    rows: list[LegacyTaskState],
+    migrated: int,
+    orphaned: int,
+) -> None:
+    path = Path(state_path)
+    if not path.is_file():
+        msg = "The persistent state database for the legacy transfer is missing."
+        raise RuntimeError(msg)
+    state_uri = f"{path.as_uri()}?mode=ro"
+    try:
+        with closing(sqlite3.connect(state_uri, uri=True)) as state_conn:
+            actual_version = int(state_conn.execute("PRAGMA user_version").fetchone()[0])
+            report = verified_migration_report(
+                state_conn,
+                migration_key,
+                index_path,
+                rows,
+            )
+    except sqlite3.Error as exc:
+        msg = "The persistent legacy migration report could not be read."
+        raise RuntimeError(msg) from exc
+    if (
+        actual_version != state_schema_version
+        or report is None
+        or report.report_id != report_id
+        or report.migrated != migrated
+        or report.orphaned != orphaned
+    ):
+        msg = "The persistent legacy migration report does not match the index marker."
+        raise RuntimeError(msg)
+
+
+def migrate_to_v1(conn: sqlite3.Connection) -> None:
+    _run_atomic_migration(conn, 1, _migrate_to_v1)
+
+
+def migrate_to_v2(conn: sqlite3.Connection) -> None:
+    _run_atomic_migration(conn, 2, _migrate_to_v2)
+
+
+def migrate_to_v3(conn: sqlite3.Connection) -> None:
+    _run_atomic_migration(conn, 3, _migrate_to_v3)
+
+
+def migrate_to_v4(conn: sqlite3.Connection) -> None:
+    _run_atomic_migration(conn, 4, _migrate_to_v4)
 
 
 def migrate_to_v5(conn: sqlite3.Connection) -> None:
-    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(scan_runs)").fetchall()}
-    if "phase" not in columns:
-        conn.execute("ALTER TABLE scan_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'source_scan'")
-    if "error_message" not in columns:
-        conn.execute("ALTER TABLE scan_runs ADD COLUMN error_message TEXT")
+    _run_atomic_migration(conn, 5, _migrate_to_v5)
 
 
 def migrate_entity_table_to_required_chunk(conn: sqlite3.Connection, table: str) -> None:
     legacy_table = f"{table}_v3"
     conn.execute(f"ALTER TABLE {table} RENAME TO {legacy_table}")
+    _migration_checkpoint(f"v4:{table}:renamed")
     conn.execute(
         f"""
         CREATE TABLE {table} (
@@ -321,6 +520,7 @@ def migrate_entity_table_to_required_chunk(conn: sqlite3.Connection, table: str)
         )
         """
     )
+    _migration_checkpoint(f"v4:{table}:created")
     conn.execute(
         f"""
         INSERT INTO {table} (
@@ -334,8 +534,11 @@ def migrate_entity_table_to_required_chunk(conn: sqlite3.Connection, table: str)
         WHERE source_chunk_id IS NOT NULL
         """
     )
+    _migration_checkpoint(f"v4:{table}:copied")
     conn.execute(f"DROP TABLE {legacy_table}")
+    _migration_checkpoint(f"v4:{table}:legacy_dropped")
     conn.execute(f"CREATE INDEX idx_{table}_meeting ON {table}(meeting_id, ordinal)")
+    _migration_checkpoint(f"v4:{table}:index_created")
 
 
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {

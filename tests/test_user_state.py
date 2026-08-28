@@ -9,7 +9,11 @@ from meetily_memory.db.migrations import (
 )
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
-from meetily_memory.user_state import USER_STATE_SCHEMA, UserStateRepository
+from meetily_memory.user_state import (
+    CURRENT_USER_STATE_SCHEMA_VERSION,
+    USER_STATE_SCHEMA,
+    UserStateRepository,
+)
 
 
 def test_legacy_task_status_migrates_to_persistent_state_before_index_schema(
@@ -83,7 +87,7 @@ def test_source_uuid_survives_explicit_path_update(tmp_path: Path) -> None:
     )
 
 
-def test_user_state_v1_migrates_to_tag_schema_v2_idempotently(tmp_path: Path) -> None:
+def test_user_state_v1_migrates_to_current_schema_idempotently(tmp_path: Path) -> None:
     state_path = tmp_path / "state.sqlite"
     with sqlite3.connect(state_path) as conn:
         conn.executescript(USER_STATE_SCHEMA)
@@ -94,14 +98,20 @@ def test_user_state_v1_migrates_to_tag_schema_v2_idempotently(tmp_path: Path) ->
     UserStateRepository(state_path)
 
     with sqlite3.connect(state_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_USER_STATE_SCHEMA_VERSION
+        )
         tables = {
             str(row[0])
             for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert {"tags", "meeting_tags"} <= tables
+        assert {"tags", "meeting_tags", "migration_report_items"} <= tables
+        report_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(migration_reports)")
+        }
+        assert "migration_key" in report_columns
         meeting_tag_columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(meeting_tags)").fetchall()
         }

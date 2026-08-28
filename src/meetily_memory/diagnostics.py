@@ -199,7 +199,7 @@ STATE_COLUMNS_V1 = {
     },
     "migration_reports": {"id", "index_path", "migrated", "orphaned", "created_at"},
 }
-CURRENT_STATE_COLUMNS = STATE_COLUMNS_V1 | {
+STATE_COLUMNS_V2 = STATE_COLUMNS_V1 | {
     "tags": {"id", "normalized_name", "display_name", "created_at"},
     "meeting_tags": {
         "source_uuid",
@@ -209,8 +209,21 @@ CURRENT_STATE_COLUMNS = STATE_COLUMNS_V1 | {
         "created_at",
     },
 }
+CURRENT_STATE_COLUMNS = {
+    **STATE_COLUMNS_V2,
+    "migration_reports": STATE_COLUMNS_V1["migration_reports"] | {"migration_key"},
+    "migration_report_items": {
+        "report_id",
+        "legacy_action_item_id",
+        "task_state_id",
+        "legacy_intent_digest",
+        "task_identity_digest",
+        "outcome",
+    },
+}
 STATE_COLUMNS_BY_VERSION = {
     1: STATE_COLUMNS_V1,
+    2: STATE_COLUMNS_V2,
     CURRENT_USER_STATE_SCHEMA_VERSION: CURRENT_STATE_COLUMNS,
 }
 

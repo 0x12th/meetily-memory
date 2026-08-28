@@ -19,15 +19,15 @@ def index_connection(index_path: Path) -> Generator[sqlite3.Connection, None, No
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version > CURRENT_SCHEMA_VERSION:
         message = (
             f"Unsupported index schema version {version}; "
             f"this binary supports {CURRENT_SCHEMA_VERSION}."
         )
         raise RuntimeError(message)
+
+    # All formats through v5 are compatible in-place. The first incompatible future
+    # format must introduce a tested side-by-side rebuild instead of extending this loop.
     for next_version in range(version + 1, CURRENT_SCHEMA_VERSION + 1):
-        migration = MIGRATIONS[next_version]
-        migration(conn)
-        conn.execute(f"PRAGMA user_version = {next_version}")
-        conn.commit()
+        MIGRATIONS[next_version](conn)
