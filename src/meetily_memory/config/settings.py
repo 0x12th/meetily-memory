@@ -1,9 +1,22 @@
+import fcntl
+import os
+import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from meetily_memory.config.paths import app_config_path
 from meetily_memory.json_codec import dumps_json, loads_json
+
+
+class _SyncableTextFile(Protocol):
+    def write(self, value: str, /) -> int: ...
+
+    def flush(self) -> None: ...
+
+    def fileno(self) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -55,12 +68,82 @@ class AppSettings:
 
 
 def load_app_settings(path: Path | None = None) -> AppSettings:
-    path = path or app_config_path()
-    if not path.exists():
-        return AppSettings()
-    payload = loads_json(path.read_text())
+    settings_path = path or app_config_path()
+    return _app_settings_from_payload(_load_settings_payload(settings_path))
+
+
+def save_app_settings(settings: AppSettings, path: Path | None = None) -> Path:
+    settings_path = path or app_config_path()
+    with _settings_lock(settings_path):
+        current_payload = _load_settings_payload(settings_path)
+        _save_app_settings_unlocked(settings, settings_path, current_payload)
+    return settings_path
+
+
+def update_app_settings(
+    *,
+    settings_path: Path | None = None,
+    expected_obsidian: ObsidianSettings | None = None,
+    obsidian_last_sync_at: str | None = None,
+    **changes: object,
+) -> AppSettings:
+    path = settings_path or app_config_path()
+    with _settings_lock(path):
+        current_payload = _load_settings_payload(path)
+        settings = _app_settings_from_payload(current_payload)
+        updated = AppSettings(
+            source_path=string_change(changes, "source_path", settings.source_path),
+            source_uuid=string_change(changes, "source_uuid", settings.source_uuid),
+            ui_language=normalize_ui_language(
+                string_change(changes, "ui_language", settings.ui_language)
+            ),
+            autosync_enabled=bool_change(
+                changes,
+                "autosync_enabled",
+                current=settings.autosync_enabled,
+            ),
+            last_update_at=string_change(changes, "last_update_at", settings.last_update_at),
+            obsidian=obsidian_change(
+                changes.get("obsidian"),
+                settings.obsidian,
+                expected_for_sync=expected_obsidian,
+                last_sync_at=obsidian_last_sync_at,
+            ),
+            semantic=semantic_change(changes.get("semantic"), settings.semantic),
+        )
+        _save_app_settings_unlocked(updated, path, current_payload)
+    return updated
+
+
+@contextmanager
+def _settings_lock(path: Path) -> Generator[None, None, None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _load_settings_payload(path: Path) -> dict[str, Any]:
+    try:
+        raw_payload = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    try:
+        payload = loads_json(raw_payload)
+    except ValueError as exc:
+        message = f"Invalid settings file {path}: malformed JSON."
+        raise ValueError(message) from exc
     if not isinstance(payload, dict):
-        return AppSettings()
+        message = f"Invalid settings file {path}: expected a JSON object."
+        raise ValueError(message)  # noqa: TRY004
+    return payload
+
+
+def _app_settings_from_payload(payload: dict[str, Any]) -> AppSettings:
     obsidian_payload = payload.get("obsidian")
     semantic_payload = payload.get("semantic")
     obsidian = obsidian_from_payload(obsidian_payload if isinstance(obsidian_payload, dict) else {})
@@ -76,32 +159,70 @@ def load_app_settings(path: Path | None = None) -> AppSettings:
     )
 
 
-def save_app_settings(settings: AppSettings, path: Path | None = None) -> Path:
-    path = path or app_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dumps_json(settings.as_payload()) + "\n", encoding="utf-8")
-    return path
+def _save_app_settings_unlocked(
+    settings: AppSettings,
+    path: Path,
+    current_payload: dict[str, Any],
+) -> None:
+    payload = _merge_settings_payload(current_payload, settings.as_payload())
+    _atomic_write_settings(path, payload)
 
 
-def update_app_settings(*, settings_path: Path | None = None, **changes: object) -> AppSettings:
-    settings = load_app_settings(settings_path)
-    updated = AppSettings(
-        source_path=string_change(changes, "source_path", settings.source_path),
-        source_uuid=string_change(changes, "source_uuid", settings.source_uuid),
-        ui_language=normalize_ui_language(
-            string_change(changes, "ui_language", settings.ui_language)
-        ),
-        autosync_enabled=bool_change(
-            changes,
-            "autosync_enabled",
-            current=settings.autosync_enabled,
-        ),
-        last_update_at=string_change(changes, "last_update_at", settings.last_update_at),
-        obsidian=obsidian_change(changes.get("obsidian"), settings.obsidian),
-        semantic=semantic_change(changes.get("semantic"), settings.semantic),
-    )
-    save_app_settings(updated, settings_path)
-    return updated
+def _merge_settings_payload(
+    current_payload: dict[str, Any],
+    settings_payload: dict[str, Any],
+) -> dict[str, Any]:
+    merged_payload = dict(current_payload)
+    for key, value in settings_payload.items():
+        if key in ("obsidian", "semantic") and isinstance(value, dict):
+            current_section = current_payload.get(key)
+            merged_section = dict(current_section) if isinstance(current_section, dict) else {}
+            merged_section.update(value)
+            merged_payload[key] = merged_section
+        else:
+            merged_payload[key] = value
+    if "source_path" not in settings_payload:
+        merged_payload.pop("source_path", None)
+    return merged_payload
+
+
+def _atomic_write_settings(path: Path, payload: dict[str, Any]) -> None:
+    contents = dumps_json(payload) + "\n"
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            _write_and_sync(temp_file, contents)
+        os.replace(temp_path, path)  # noqa: PTH105
+        _fsync_directory(path.parent)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _write_and_sync(file: _SyncableTextFile, contents: str) -> None:
+    file.write(contents)
+    file.flush()
+    os.fsync(file.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        with suppress(OSError):
+            os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def obsidian_from_payload(payload: dict[str, Any]) -> ObsidianSettings:
@@ -121,7 +242,30 @@ def semantic_from_payload(payload: dict[str, Any]) -> SemanticSettings:
     )
 
 
-def obsidian_change(value: object, current: ObsidianSettings) -> ObsidianSettings:
+def obsidian_change(
+    value: object,
+    current: ObsidianSettings,
+    *,
+    expected_for_sync: ObsidianSettings | None = None,
+    last_sync_at: str | None = None,
+) -> ObsidianSettings:
+    if last_sync_at is not None:
+        if isinstance(value, ObsidianSettings):
+            message = "Cannot replace Obsidian settings and record a sync in one update."
+            raise ValueError(message)
+        if expected_for_sync is None:
+            message = "Recording an Obsidian sync requires the configuration that was synced."
+            raise ValueError(message)
+        current_target = (current.vault_path, current.folder)
+        expected_target = (expected_for_sync.vault_path, expected_for_sync.folder)
+        if current_target != expected_target:
+            return current
+        return ObsidianSettings(
+            vault_path=current.vault_path,
+            folder=current.folder,
+            sync_after_update=current.sync_after_update,
+            last_sync_at=last_sync_at,
+        )
     if isinstance(value, ObsidianSettings):
         return value
     return current

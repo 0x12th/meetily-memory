@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from datetime import UTC, datetime
+from locale import getlocale
 from pathlib import Path
 from typing import Annotated
 
@@ -14,19 +15,23 @@ from meetily_memory.cli.common import (
     make_typer,
     print_json,
     print_text_block,
-    resolve_ui_language,
     sqlite_has_fts5,
 )
 from meetily_memory.config.paths import discover_meetily_db
 from meetily_memory.config.settings import (
     AppSettings,
-    ObsidianSettings,
     load_app_settings,
+    normalize_ui_language,
     update_app_settings,
 )
 from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import index_connection
+from meetily_memory.diagnostics import (
+    DatabaseDiagnostic,
+    inspect_local_databases,
+    inspect_source_database,
+)
 from meetily_memory.integrations import sync_obsidian_vault
 from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
 from meetily_memory.scanner.meetily_sqlite import (
@@ -35,7 +40,6 @@ from meetily_memory.scanner.meetily_sqlite import (
     inspect_meetily_schema,
     meeting_external_ids,
 )
-from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
 from meetily_memory.tagging import TagService
 
 app = make_typer("Local Meetily history lifecycle commands.")
@@ -127,23 +131,44 @@ def print_update_payload(payload: dict[str, object]) -> None:
 def print_scan_diagnostics(diagnostics: dict[str, dict[str, object] | None]) -> None:
     completed = diagnostics["last_completed_run"]
     failed = diagnostics["last_failed_run"]
+    running = diagnostics["last_running_run"]
     if completed:
         print_text_block(f"last completed run: #{completed['id']} at {completed['finished_at']}")
     if failed:
         print_text_block(
             f"last failed run: #{failed['id']} during {failed['phase']} ({failed['error_message']})"
         )
+    if running:
+        started_at = running.get("started_at") or "unknown"
+        phase = running.get("phase") or "unknown"
+        print_text_block(f"running run: #{running['id']} since {started_at} during {phase}")
 
 
-def current_scan_diagnostics(
-    index_path: Path, repo: IndexRepository
-) -> dict[str, dict[str, object] | None]:
-    try:
-        with RefreshLock(index_path):
-            repo.fail_abandoned_scan_runs(utc_now_iso())
-    except RefreshLockBusyError:
-        pass
-    return repo.scan_run_diagnostics()
+def print_database_diagnostic(label: str, diagnostic: DatabaseDiagnostic) -> None:
+    print_text_block(f"{label} database: {diagnostic.status_label()}")
+    if diagnostic.error:
+        print_text_block(f"{label} database error: {diagnostic.error}")
+
+
+def diagnostic_source_path(
+    settings: AppSettings,
+    persisted_source_path: Path | None,
+) -> Path | None:
+    if persisted_source_path is not None:
+        return persisted_source_path
+    if settings.source_path:
+        return Path(settings.source_path).expanduser()
+    return None
+
+
+def resolve_diagnostic_ui_language(settings: AppSettings, indexed_language: str | None) -> str:
+    if settings.ui_language:
+        return settings.ui_language
+    normalized_indexed_language = normalize_ui_language(indexed_language)
+    if normalized_indexed_language:
+        return normalized_indexed_language
+    system_language = normalize_ui_language(getlocale()[0])
+    return system_language or "en"
 
 
 @app.command()
@@ -215,19 +240,21 @@ def status(
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
     index_path = ctx.obj["index_path"]
-    repo = IndexRepository(index_path)
-    settings = migrated_source_settings(index_path, ctx.obj["settings_path"])
+    settings = load_app_settings(ctx.obj["settings_path"])
+    diagnostics = inspect_local_databases(index_path, settings.source_uuid)
     autosync_status = autosync_runtime_status(ctx.obj["settings_path"], index_path)
-    selected_source = (
-        repo.user_state.get_source(settings.source_uuid) if settings.source_uuid else None
-    )
-    source_path = str(selected_source["current_path"]) if selected_source else None
-    stats = repo.stats()
-    scan_diagnostics = current_scan_diagnostics(index_path, repo)
+    configured_source = diagnostic_source_path(settings, diagnostics.configured_source_path)
+    source_path = str(configured_source) if configured_source else None
+    stats = diagnostics.stats
+    scan_diagnostics = diagnostics.scan_runs
     obsidian_configured = bool(settings.obsidian.vault_path)
-    resolved_ui_language = resolve_ui_language(index_path, ctx.obj["settings_path"])
+    resolved_ui_language = resolve_diagnostic_ui_language(
+        settings, diagnostics.dominant_meeting_language
+    )
     payload = {
         "index_path": str(index_path),
+        "index_database": diagnostics.index_database.as_payload(),
+        "state_database": diagnostics.state_database.as_payload(),
         "source_path": source_path,
         "ui_language": settings.ui_language,
         "resolved_ui_language": resolved_ui_language,
@@ -244,6 +271,8 @@ def status(
         print_json(payload)
         return
     print_text_block(f"index path: {index_path}")
+    print_database_diagnostic("index", diagnostics.index_database)
+    print_database_diagnostic("state", diagnostics.state_database)
     print_text_block(f"source path: {source_path or 'not configured'}")
     configured_label = "configured" if settings.ui_language else "auto"
     print_text_block(f"language: {resolved_ui_language} ({configured_label})")
@@ -422,15 +451,16 @@ def run_refresh(
     settings_path: Path,
     source_path: Path,
 ) -> tuple[dict[str, object], bool]:
+    repo = IndexRepository(index_path)
+    repo.fail_abandoned_scan_runs(utc_now_iso())
     settings = load_app_settings(settings_path)
     payload, result = scan_update(
         index_path,
         source_path,
         finalize=False,
     )
-    repo = IndexRepository(index_path)
     phase = "source_scan"
-    obsidian_settings = settings.obsidian
+    obsidian_synced_at: str | None = None
     try:
         phase = "finalizing"
         repo.update_scan_run_phase(result.run_id, phase)
@@ -446,22 +476,18 @@ def run_refresh(
                 Path(settings.obsidian.vault_path),
                 settings.obsidian.folder,
             )
-            obsidian_settings = ObsidianSettings(
-                vault_path=settings.obsidian.vault_path,
-                folder=settings.obsidian.folder,
-                sync_after_update=settings.obsidian.sync_after_update,
-                last_sync_at=utc_now_iso(),
-            )
+            obsidian_synced_at = utc_now_iso()
             obsidian_synced = True
         phase = "finalizing"
         repo.update_scan_run_phase(result.run_id, phase)
         repo.complete_scan_run(result.run_id, utc_now_iso(), result)
         update_app_settings(
             settings_path=settings_path,
+            expected_obsidian=settings.obsidian if obsidian_synced_at else None,
+            obsidian_last_sync_at=obsidian_synced_at,
             source_uuid=source_uuid,
             source_path=None,
             last_update_at=utc_now_iso(),
-            obsidian=obsidian_settings,
         )
     except Exception as exc:
         repo.fail_scan_run(
@@ -581,22 +607,23 @@ def doctor(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     index_path = ctx.obj["index_path"]
-    repo = IndexRepository(index_path)
-    source_path = source or discover_meetily_db()
-    source_readable = can_open_readonly_sqlite(source_path) if source_path else False
-    source_schema_valid = False
-    source_schema_error = None
-    if source_path and source_readable:
-        source_schema_valid, source_schema_error = inspect_meetily_schema(source_path)
+    settings = load_app_settings(ctx.obj["settings_path"])
+    diagnostics = inspect_local_databases(index_path, settings.source_uuid)
+    configured_source = diagnostic_source_path(settings, diagnostics.configured_source_path)
+    source_path = source.expanduser() if source else configured_source or discover_meetily_db()
+    source_diagnostic = inspect_source_database(source_path)
     fts5 = sqlite_has_fts5()
-    stats = repo.stats()
-    scan_diagnostics = current_scan_diagnostics(index_path, repo)
+    stats = diagnostics.stats
+    scan_diagnostics = diagnostics.scan_runs
     payload = {
         "index_path": str(index_path),
+        "index_database": diagnostics.index_database.as_payload(),
+        "state_database": diagnostics.state_database.as_payload(),
         "source_path": str(source_path) if source_path else None,
-        "source_readable": source_readable,
-        "source_schema_valid": source_schema_valid,
-        "source_schema_error": source_schema_error,
+        "source_readable": source_diagnostic.readable,
+        "source_schema_valid": source_diagnostic.schema_valid,
+        "source_schema_error": source_diagnostic.schema_error,
+        "source_read_error": source_diagnostic.read_error,
         "fts5": fts5,
         **scan_diagnostics,
         **stats,
@@ -605,11 +632,15 @@ def doctor(
         print_json(payload)
         return
     console.print(f"index path: {index_path}")
+    print_database_diagnostic("index", diagnostics.index_database)
+    print_database_diagnostic("state", diagnostics.state_database)
     console.print(f"source path: {source_path or 'not found'}")
-    console.print(f"source readable: {'yes' if source_readable else 'no'}")
-    console.print(f"source schema: {'valid' if source_schema_valid else 'invalid'}")
-    if source_schema_error:
-        console.print(f"source schema error: {source_schema_error}")
+    console.print(f"source readable: {'yes' if source_diagnostic.readable else 'no'}")
+    console.print(f"source schema: {'valid' if source_diagnostic.schema_valid else 'invalid'}")
+    if source_diagnostic.read_error:
+        console.print(f"source read error: {source_diagnostic.read_error}")
+    if source_diagnostic.schema_error:
+        console.print(f"source schema error: {source_diagnostic.schema_error}")
     console.print(f"fts5: {'yes' if fts5 else 'no'}")
     console.print(f"meetings: {stats['meetings']}")
     console.print(f"chunks: {stats['chunks']}")

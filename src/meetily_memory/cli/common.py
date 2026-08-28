@@ -19,7 +19,7 @@ from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import dumps_json
 
 PACKAGE_NAME = "meetily-memory"
-console = Console()
+console = Console(markup=False)
 
 ENTITY_COMMANDS = {
     "decisions": "decisions",

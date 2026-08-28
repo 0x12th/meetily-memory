@@ -71,13 +71,11 @@ def obsidian_sync(
         Path(settings.obsidian.vault_path),
         settings.obsidian.folder,
     )
-    updated_obsidian = ObsidianSettings(
-        vault_path=settings.obsidian.vault_path,
-        folder=settings.obsidian.folder,
-        sync_after_update=settings.obsidian.sync_after_update,
-        last_sync_at=utc_now_iso(),
+    update_app_settings(
+        settings_path=ctx.obj["settings_path"],
+        expected_obsidian=settings.obsidian,
+        obsidian_last_sync_at=utc_now_iso(),
     )
-    update_app_settings(settings_path=ctx.obj["settings_path"], obsidian=updated_obsidian)
     if json_output:
         print_json(result.as_payload())
         return

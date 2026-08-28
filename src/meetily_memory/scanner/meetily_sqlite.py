@@ -12,6 +12,8 @@ from meetily_memory.repositories.records import ChunkRecord, MeetingRecord
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
 from meetily_memory.structure_analyzer import StructureAnalyzer
 
+MEETING_NORMALIZATION_VERSION = 2
+
 
 @dataclass
 class ScanResult:
@@ -190,15 +192,16 @@ def normalize_meeting(
     summary_text = extract_summary_text(upstream.get("summary_process"))
     language = extract_language(upstream.get("summary_process"))
 
-    for index, transcript in enumerate(upstream["transcripts"]):
+    for transcript in upstream["transcripts"]:
         text = normalize_text(transcript.get("transcript") or "")
         if not text:
             continue
+        ordinal = len(chunks)
         chunks.append(
             ChunkRecord(
                 external_id=transcript.get("id"),
                 kind="transcript",
-                ordinal=index,
+                ordinal=ordinal,
                 text=text,
                 speaker=clean_optional(transcript.get("speaker")),
                 starts_at_seconds=transcript.get("audio_start_time"),
@@ -210,14 +213,14 @@ def normalize_meeting(
             )
         )
 
-    next_ordinal = len(chunks)
     if summary_text:
         summary_payload = upstream.get("summary_process") or {}
+        ordinal = len(chunks)
         chunks.append(
             ChunkRecord(
                 external_id=f"summary:{upstream['id']}",
                 kind="summary",
-                ordinal=next_ordinal,
+                ordinal=ordinal,
                 text=summary_text,
                 speaker=None,
                 starts_at_seconds=None,
@@ -228,16 +231,16 @@ def normalize_meeting(
                 raw_metadata_json=dumps_json(summary_payload),
             )
         )
-        next_ordinal += 1
 
     notes = upstream.get("notes")
     notes_text = normalize_text((notes or {}).get("notes_markdown") or "")
     if notes_text:
+        ordinal = len(chunks)
         chunks.append(
             ChunkRecord(
                 external_id=f"note:{upstream['id']}",
                 kind="note",
-                ordinal=next_ordinal,
+                ordinal=ordinal,
                 text=notes_text,
                 speaker=None,
                 starts_at_seconds=None,
@@ -250,6 +253,7 @@ def normalize_meeting(
         )
 
     meeting_fingerprint_payload = {
+        "normalization_version": MEETING_NORMALIZATION_VERSION,
         "meeting": {
             "id": upstream.get("id"),
             "title": upstream.get("title"),
@@ -309,8 +313,10 @@ def extract_language(summary_process: dict[str, Any] | None) -> str | None:
         metadata = loads_json(summary_process["metadata"])
     except ValueError:
         return None
+    if not isinstance(metadata, dict):
+        return None
     language = metadata.get("language")
-    return language if isinstance(language, str) else None
+    return language if isinstance(language, str) and language.strip() else None
 
 
 def normalize_text(value: str) -> str:

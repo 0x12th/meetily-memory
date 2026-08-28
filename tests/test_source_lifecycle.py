@@ -33,27 +33,34 @@ def hold_refresh_lock(index_path: Path, ready: EventLike, release: EventLike) ->
         release.wait(timeout=10)
 
 
-def test_legacy_source_path_migrates_idempotently_to_selected_uuid(
+def test_legacy_source_path_is_read_only_in_status_and_migrates_on_refresh(
     meetily_db: Path, tmp_path: Path
 ) -> None:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     index_path = data_dir / "index.sqlite"
     settings_path = data_dir / "settings.json"
-    settings_path.write_text(json.dumps({"source_path": str(meetily_db)}) + "\n")
+    legacy_settings = {"source_path": str(meetily_db)}
+    settings_path.write_text(json.dumps(legacy_settings) + "\n")
     runner = CliRunner()
     env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
 
     first = runner.invoke(app, ["--index", str(index_path), "status", "--json"], env=env)
-    first_settings = loads_json(settings_path.read_text())
     second = runner.invoke(app, ["--index", str(index_path), "status", "--json"], env=env)
-    second_settings = loads_json(settings_path.read_text())
 
     assert first.exit_code == 0
     assert second.exit_code == 0
-    assert first_settings["source_uuid"] == second_settings["source_uuid"]
-    assert "source_path" not in first_settings
+    assert loads_json(settings_path.read_text()) == legacy_settings
     assert json.loads(second.stdout)["source_path"] == str(meetily_db)
+    assert not index_path.exists()
+    assert not (data_dir / "state.sqlite").exists()
+
+    refresh = runner.invoke(app, ["--index", str(index_path), "refresh"], env=env)
+    migrated_settings = loads_json(settings_path.read_text())
+
+    assert refresh.exit_code == 0
+    assert migrated_settings["source_uuid"]
+    assert "source_path" not in migrated_settings
     with sqlite3.connect(data_dir / "state.sqlite") as conn:
         assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 1
 
@@ -372,7 +379,9 @@ def test_failed_refresh_records_phase_preserves_last_update_and_recovers(
     assert recovered_payload["last_failed_run"] is None
 
 
-def test_status_marks_an_abandoned_running_scan_as_failed(meetily_db: Path, tmp_path: Path) -> None:
+def test_status_observes_running_scan_and_refresh_marks_it_failed(
+    meetily_db: Path, tmp_path: Path
+) -> None:
     data_dir = tmp_path / "data"
     index_path = data_dir / "index.sqlite"
     env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
@@ -399,8 +408,22 @@ def test_status_marks_an_abandoned_running_scan_as_failed(meetily_db: Path, tmp_
 
     assert status.exit_code == 0
     payload = loads_json(status.stdout)
-    assert payload["last_failed_run"]["id"] == abandoned_run_id
-    assert payload["last_failed_run"]["phase"] == "source_scan"
+    assert payload["last_failed_run"] is None
+    assert payload["last_running_run"]["id"] == abandoned_run_id
+    with sqlite3.connect(index_path) as conn:
+        observed = conn.execute(
+            "SELECT status, finished_at, error_message FROM scan_runs WHERE id = ?",
+            (abandoned_run_id,),
+        ).fetchone()
+    assert observed == ("running", None, None)
+
+    recovered = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env=env,
+    )
+
+    assert recovered.exit_code == 0
     with sqlite3.connect(index_path) as conn:
         abandoned = conn.execute(
             "SELECT status, finished_at, error_message FROM scan_runs WHERE id = ?",
