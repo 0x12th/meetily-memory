@@ -13,11 +13,14 @@ from typer.testing import CliRunner
 from meetily_memory.cli.app import app
 from meetily_memory.cli.common import open_path
 from meetily_memory.cli.search_commands import parse_search_filters
+from meetily_memory.config.settings import (
+    ObsidianSettings,
+    load_app_settings,
+)
 from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import loads_json
 from meetily_memory.tagging import TagRepository
-from tests.semantic_helpers import requires_sqlite_vec
 
 
 def test_parse_search_filters_builds_since_window_from_injected_clock() -> None:
@@ -98,14 +101,9 @@ def test_cli_help_uses_plain_click_format() -> None:
         assert re.search(rf"\n  {re.escape(command)}(?:\s{{2,}}|\n)", help_result.stdout)
     for command in (
         "scan",
-        "analyze",
         "c",
         "t",
         "topic",
-        "sem",
-        "semantic",
-        "ask",
-        "llm",
         "obsidian",
         "config",
         "db",
@@ -137,12 +135,8 @@ def test_cli_help_uses_plain_click_format() -> None:
     ("command", "expected"),
     [
         (("scan",), "--source"),
-        (("analyze",), "MEETING_ID"),
         (("c",), "QUESTION"),
         (("t",), "QUERY"),
-        (("sem",), "QUERY"),
-        (("semantic",), "search"),
-        (("llm",), "init"),
         (("obsidian",), "sync"),
         (("config",), "source"),
         (("db",), "status"),
@@ -286,12 +280,6 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     )
     assert exact_context.exit_code == 0
     assert "Evidence role: neighboring context" not in exact_context.stdout
-
-    analyze = runner.invoke(app, ["--index", str(index_path), "analyze", "meeting-2"])
-    assert analyze.exit_code == 0
-    assert "meetings analyzed: 1" in analyze.stdout
-    assert "action items:" in analyze.stdout
-    assert "risks:" in analyze.stdout
 
     doctor = runner.invoke(
         app,
@@ -627,86 +615,6 @@ def insert_kafka_meeting(conn: sqlite3.Connection, tmp_path: Path) -> None:
     )
 
 
-@requires_sqlite_vec
-def test_cli_semantic_search_requires_explicit_index(meetily_db: Path, tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    runner = CliRunner()
-
-    scan = runner.invoke(
-        app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
-    )
-    assert scan.exit_code == 0
-
-    semantic = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "semantic",
-            "search",
-            "migration risks",
-            "--provider",
-            "hash",
-        ],
-    )
-    assert semantic.exit_code != 0
-    assert "Semantic index is empty. Run: mm semantic index" in semantic.output
-
-    index = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "semantic",
-            "index",
-            "--provider",
-            "hash",
-        ],
-    )
-    assert index.exit_code == 0
-    assert "embeddings indexed:" in index.stdout
-
-    semantic = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "semantic",
-            "search",
-            "migration risks",
-            "--provider",
-            "hash",
-        ],
-    )
-    assert semantic.exit_code == 0
-    assert "Dobrynya Follow-up" in semantic.stdout
-    assert "semantic distance:" in semantic.stdout
-    assert "embedding: hash/local-hash-v1/128d" in semantic.stdout
-    assert "open: mm open 2" in semantic.stdout
-
-    semantic_json = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "semantic",
-            "search",
-            "migration risks",
-            "--provider",
-            "hash",
-            "--json",
-        ],
-    )
-    assert semantic_json.exit_code == 0
-    payload = json.loads(semantic_json.stdout)
-    assert payload[0]["meeting_external_id"] == "meeting-2"
-    assert payload[0]["embedding_provider"] == "hash"
-    assert payload[0]["embedding_model"] == "local-hash-v1"
-    assert payload[0]["embedding_dimensions"] == 128
-    assert isinstance(payload[0]["distance"], float)
-
-
 def test_cli_open_selects_meeting_folder_by_default(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
@@ -732,7 +640,7 @@ def test_cli_open_selects_meeting_folder_by_default(meetily_db: Path, tmp_path: 
     assert source_path.stdout.strip() == str(meetily_db)
 
 
-def test_cli_scan_can_skip_structured_analysis(meetily_db: Path, tmp_path: Path) -> None:
+def test_cli_refresh_skips_unproven_structured_analysis(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
 
@@ -750,45 +658,10 @@ def test_cli_scan_can_skip_structured_analysis(meetily_db: Path, tmp_path: Path)
 
     refresh = runner.invoke(
         app,
-        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
-    )
-    assert refresh.exit_code == 0
-    assert "meetings seen: 2" in refresh.stdout
-    assert "meetings analyzed:" in refresh.stdout
-
-
-@requires_sqlite_vec
-def test_cli_refresh_runs_configured_semantic_without_autosync(
-    meetily_db: Path, tmp_path: Path
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    data_dir = tmp_path / "data"
-    env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
-    runner = CliRunner()
-
-    init = runner.invoke(
-        app,
-        ["--index", str(index_path), "init", "--source", str(meetily_db), "--no-autosync"],
-        env=env,
-    )
-    assert init.exit_code == 0
-
-    semantic_init = runner.invoke(
-        app,
-        ["semantic", "init", "--provider", "hash", "--model", "local-hash-v1"],
-        env=env,
-    )
-    assert semantic_init.exit_code == 0
-
-    refresh = runner.invoke(
-        app,
         ["--index", str(index_path), "refresh", "--source", str(meetily_db), "--json"],
-        env=env,
     )
-
     assert refresh.exit_code == 0
-    payload = loads_json(refresh.stdout)
-    assert payload["embeddings_indexed"] > 0
+    assert loads_json(refresh.stdout)["meetings_analyzed"] == 0
 
 
 def test_cli_doctor_reports_meetily_schema_status(tmp_path: Path) -> None:
@@ -882,115 +755,6 @@ def test_cli_db_status_reports_orphaned_tag_assignments(tmp_path: Path) -> None:
     assert json.loads(json_status.stdout)["orphaned_tag_assignments"] == 1
 
 
-@requires_sqlite_vec
-def test_cli_semantic_setup_persists_provider_config(meetily_db: Path, tmp_path: Path) -> None:
-    data_dir = tmp_path / "data"
-    semantic_env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
-    index_path = tmp_path / "index.sqlite"
-    runner = CliRunner()
-
-    setup = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "semantic",
-            "init",
-            "--provider",
-            "hash",
-            "--model",
-            "local-hash-v1",
-        ],
-        env=semantic_env,
-    )
-    assert setup.exit_code == 0
-    assert "semantic provider: hash" in setup.stdout
-
-    config_path = data_dir / "settings.json"
-    config = loads_json(config_path.read_text())
-    assert config["semantic"]["provider"] == "hash"
-    assert config["semantic"]["model"] == "local-hash-v1"
-    assert config["semantic"]["ollama_url"] is None
-
-    shown = runner.invoke(
-        app,
-        ["--index", str(index_path), "semantic", "init", "--show"],
-        env=semantic_env,
-    )
-    assert shown.exit_code == 0
-    assert "semantic provider: hash" in shown.stdout
-    assert "model: local-hash-v1" in shown.stdout
-
-    scan = runner.invoke(
-        app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
-    )
-    assert scan.exit_code == 0
-
-    incomplete_status = runner.invoke(
-        app,
-        ["--index", str(index_path), "semantic", "status", "--json"],
-        env=semantic_env,
-    )
-    assert incomplete_status.exit_code == 0
-    assert json.loads(incomplete_status.stdout)["complete"] is False
-
-    semantic_index = runner.invoke(
-        app,
-        ["--index", str(index_path), "semantic", "index"],
-        env=semantic_env,
-    )
-    assert semantic_index.exit_code == 0
-    assert "embeddings indexed:" in semantic_index.stdout
-    complete_status = runner.invoke(
-        app,
-        ["--index", str(index_path), "semantic", "status", "--json"],
-        env=semantic_env,
-    )
-    coverage = json.loads(complete_status.stdout)
-    assert coverage["complete"] is True
-    assert coverage["current_chunks"] == coverage["total_chunks"]
-
-    semantic_alias = runner.invoke(
-        app,
-        ["--index", str(index_path), "sem", "migration risks"],
-        env=semantic_env,
-    )
-    assert semantic_alias.exit_code == 0
-    assert "Dobrynya Follow-up" in semantic_alias.stdout
-    assert "embedding: hash/local-hash-v1/128d" in semantic_alias.stdout
-
-    switch = runner.invoke(
-        app,
-        ["--index", str(index_path), "semantic", "init", "--provider", "ollama"],
-        env=semantic_env,
-    )
-    assert switch.exit_code == 0
-    assert "semantic provider: ollama" in switch.stdout
-    assert "model: nomic-embed-text" in switch.stdout
-
-    config = loads_json(config_path.read_text())
-    assert config["semantic"]["provider"] == "ollama"
-    assert config["semantic"]["model"] == "nomic-embed-text"
-    assert config["semantic"]["ollama_url"] == "http://localhost:11434"
-
-
-def test_cli_semantic_init_is_real_subcommand() -> None:
-    runner = CliRunner()
-
-    semantic_help = runner.invoke(app, ["semantic", "--help"])
-    assert semantic_help.exit_code == 0
-    assert "Commands:" in semantic_help.stdout
-    assert "init" in semantic_help.stdout
-    assert "setup" not in semantic_help.stdout
-
-    init_help = runner.invoke(app, ["semantic", "init", "--help"])
-    assert init_help.exit_code == 0
-    assert "Usage: root semantic init" in init_help.stdout
-    assert "--provider" in init_help.stdout
-    assert "--show" in init_help.stdout
-
-
 def test_cli_mcp_serve_is_real_subcommand() -> None:
     runner = CliRunner()
 
@@ -1002,7 +766,9 @@ def test_cli_mcp_serve_is_real_subcommand() -> None:
     serve_help = runner.invoke(app, ["mcp", "serve", "--help"])
     assert serve_help.exit_code == 0
     assert "Usage: root mcp serve" in serve_help.stdout
-    assert "--transport" in serve_help.stdout
+    assert "--transport" not in serve_help.stdout
+    assert "streamable-http" not in serve_help.stdout
+    assert "sse" not in serve_help.stdout.casefold()
 
 
 def test_cli_removed_public_commands_are_not_available() -> None:
@@ -1024,13 +790,18 @@ def test_cli_removed_public_commands_are_not_available() -> None:
         "risks",
         "questions",
         "task-status",
+        "analyze",
+        "sem",
+        "semantic",
+        "ask",
+        "llm",
     )
     for command in removed_commands:
         result = runner.invoke(app, [command, "--help"])
         assert result.exit_code != 0
 
 
-def test_cli_init_status_ask_and_obsidian_sync(meetily_db: Path, tmp_path: Path) -> None:
+def test_cli_init_status_and_obsidian_sync(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     data_dir = tmp_path / "data"
     vault_dir = tmp_path / "vault"
@@ -1051,47 +822,7 @@ def test_cli_init_status_ask_and_obsidian_sync(meetily_db: Path, tmp_path: Path)
     assert f"index path: {index_path}" in status.stdout
     assert f"source path: {meetily_db}" in status.stdout
     assert "autosync: disabled" in status.stdout
-    assert "llm: not configured" in status.stdout
     assert "obsidian: not configured" in status.stdout
-
-    llm = runner.invoke(app, ["llm", "init", "--provider", "manual"], env=env)
-    assert llm.exit_code == 0
-    assert "llm provider: manual" in llm.stdout
-
-    ask = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "ask",
-            "--topic",
-            "migration",
-            "what is still open?",
-        ],
-        env=env,
-    )
-    assert ask.exit_code == 0
-    assert "# Manual LLM Prompt" in ask.stdout
-    assert "# Topic Memory" in ask.stdout
-    assert "what is still open?" in ask.stdout
-    assert "Source: meeting-2 / transcript-2" in ask.stdout
-
-    scoped_ask = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "ask",
-            "--meeting",
-            "meeting-2",
-            "pricing decision",
-        ],
-        env=env,
-    )
-    assert scoped_ask.exit_code == 0
-    assert "Meeting: meeting-2" in scoped_ask.stdout
-    assert "No relevant excerpts found." in scoped_ask.stdout
-    assert "Launch Planning" not in scoped_ask.stdout
 
     obsidian_init = runner.invoke(
         app,
@@ -1121,11 +852,84 @@ def test_cli_init_status_ask_and_obsidian_sync(meetily_db: Path, tmp_path: Path)
     )
     assert obsidian_sync.exit_code == 0
     assert "obsidian files synced:" in obsidian_sync.stdout
-    assert (vault_dir / "Meetily Memory" / "Topics" / "migration.md").exists()
     assert (vault_dir / "Meetily Memory" / "Meetings" / "Dobrynya Follow-up.md").exists()
     assert "<!-- meetily-memory:managed -->" in (
-        vault_dir / "Meetily Memory" / "Topics" / "migration.md"
+        vault_dir / "Meetily Memory" / "Meetings" / "Dobrynya Follow-up.md"
     ).read_text(encoding="utf-8")
+
+
+def test_cli_obsidian_uses_workspace_settings_scope(meetily_db: Path, tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    index_path = workspace / "index.sqlite"
+    workspace_settings = workspace / "settings.json"
+    global_data_dir = tmp_path / "global"
+    global_settings = global_data_dir / "settings.json"
+    workspace_vault = tmp_path / "workspace-vault"
+    global_vault = tmp_path / "global-vault"
+    runner = CliRunner()
+
+    global_configured = runner.invoke(
+        app,
+        ["obsidian", "init", "--vault", str(global_vault)],
+        env={"MEETILY_MEMORY_DATA_DIR": str(global_data_dir)},
+    )
+    assert global_configured.exit_code == 0
+
+    init = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "init",
+            "--source",
+            str(meetily_db),
+            "--no-autosync",
+        ],
+    )
+    assert init.exit_code == 0
+    configured = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "obsidian",
+            "init",
+            "--vault",
+            str(workspace_vault),
+            "--sync-after-refresh",
+        ],
+    )
+    assert configured.exit_code == 0
+
+    synced = runner.invoke(
+        app,
+        ["--index", str(index_path), "obsidian", "sync"],
+    )
+    assert synced.exit_code == 0
+    assert "obsidian files removed: 0" in synced.stdout
+    status = runner.invoke(
+        app,
+        ["--index", str(index_path), "obsidian", "status"],
+    )
+    assert status.exit_code == 0
+    assert f"vault: {workspace_vault}" in status.stdout
+    assert "last sync: never" not in status.stdout
+    meeting_note = workspace_vault / "Meetily Memory" / "Meetings" / "Launch Planning.md"
+    meeting_note.unlink()
+    refresh = runner.invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+    )
+    assert refresh.exit_code == 0
+    assert "obsidian sync: yes" in refresh.stdout
+
+    workspace_config = load_app_settings(workspace_settings)
+    global_config = load_app_settings(global_settings)
+    assert workspace_config.obsidian.vault_path == str(workspace_vault)
+    assert workspace_config.obsidian.last_sync_at is not None
+    assert global_config.obsidian == ObsidianSettings(vault_path=str(global_vault))
+    assert meeting_note.exists()
+    assert not global_vault.exists()
 
 
 def test_cli_v5_topic_graph_alias_and_task_status_memory(meetily_db: Path, tmp_path: Path) -> None:

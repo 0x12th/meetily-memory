@@ -54,11 +54,10 @@ uv run scripts/evaluate-retrieval.py \
   --allow-drift semantic_dimension
 ```
 
-Use `mm semantic status` to verify that every current chunk has matching metadata and a vector
-row for the selected provider, model, and dimensions. The evaluation runner rejects an incomplete
-or stale semantic index instead of allowing the regression gate to certify an FTS-plus-tags
-fallback as hybrid. Runtime hybrid retrieval still falls back when semantic query execution
-fails.
+The semantic CLI has been removed from the product. Offline runners verify that every current
+chunk has matching metadata and a vector row for the selected provider, model, and dimensions.
+They reject an incomplete or stale semantic index instead of allowing the regression gate to
+certify an FTS-plus-tags fallback as hybrid.
 
 Hybrid evaluation never creates embeddings during a query. It records the provider, model,
 dimension, RRF constant, candidate multiplier, FTS/semantic/tag weights, and warmup in the
@@ -68,11 +67,31 @@ baseline is supplied, the runner includes the regression-gate result in its JSON
 successful single comparison does not change standard search or expose hybrid controls in the
 public CLI.
 
+For the frozen multilingual offline spike, first pull the two local candidates and then run one
+command:
+
+```bash
+ollama pull qwen3-embedding:0.6b
+ollama pull bge-m3
+uv run scripts/evaluate-semantic-search.py \
+  .docs/eval/tasks.v2.json \
+  --index .docs/eval/index.sqlite \
+  --output-dir .docs/eval/semantic-offline-YYYYMMDD
+```
+
+This runner keeps each incompatible embedding configuration in a separate copied index. It uses
+the Qwen model-card query instruction and no document instruction; BGE-M3 uses identity transforms
+for both explicit roles because its model card says query instructions are not required. Candidate
+manifests include the Ollama model digest, dimensions, both role instructions, chunk fingerprint,
+strict semantic-index fingerprint, full embedding refresh time, and vector-index size. The fixed
+RRF weights are not tuned on the evaluated queries. The runner refuses to overwrite reports and
+always labels this old-dataset run as an offline spike rather than the real-failure product gate.
+
 Reports are immutable: the runner refuses to overwrite an existing output path. Automatic
 comparison is rejected when the dataset, corpus, tag-state fingerprint, index schema, retrieval
-mode or parameters, or semantic provider/model/dimension differ. Code commits and dirty-tree
-state remain recorded for traceability but do not by themselves make two retrieval runs
-incompatible.
+mode or parameters, semantic provider/model/dimension/digest, role instructions, semantic-index
+fingerprint, or chunk fingerprint differ. Code commits and dirty-tree state remain recorded for
+traceability but do not by themselves make two retrieval runs incompatible.
 
 An intentional migration can be analyzed with an explicit drift field, for example
 `--allow-drift index_schema_version`. The comparison records the allowed mismatch; this mode is

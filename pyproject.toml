@@ -1,6 +1,6 @@
 [project]
 name = "meetily-memory"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local-first Meetily history index and CLI"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -10,13 +10,15 @@ dependencies = [
   "orjson>=3.10.0",
   "platformdirs>=4.3.0",
   "rich>=13.9.0",
-  "sqlite-vec>=0.1.9,<0.2.0",
   "typer>=0.12.0",
 ]
 
 [project.optional-dependencies]
+semantic = [
+  "sqlite-vec>=0.1.9,<0.2.0",
+]
 mcp = [
-  "mcp[cli]>=1.27,<2",
+  "mcp>=1.27,<2",
 ]
 
 [project.scripts]
@@ -25,11 +27,12 @@ mm = "meetily_memory.cli.app:main"
 
 [dependency-groups]
 dev = [
-  "mcp[cli]>=1.27,<2",
+  "mcp>=1.27,<2",
   "pre-commit>=4.0.0",
   "pyinstaller>=6.11.0",
   "pytest>=8.3.0",
   "ruff>=0.8.0",
+  "sqlite-vec>=0.1.9,<0.2.0",
   "ty>=0.0.1a21",
 ]
 

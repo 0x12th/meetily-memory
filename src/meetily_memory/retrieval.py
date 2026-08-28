@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import sqlite3
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from meetily_memory.domain import (
     MeetingSearchFilters,
@@ -9,12 +11,10 @@ from meetily_memory.domain import (
     SearchHit,
 )
 from meetily_memory.repositories.index import IndexRepository, meeting_from_row
-from meetily_memory.semantic_search import (
-    EmbeddingProvider,
-    semantic_index_coverage,
-    semantic_search,
-)
-from meetily_memory.tagging import TagMatch, TagRepository
+
+if TYPE_CHECKING:
+    from meetily_memory.semantic_search import EmbeddingProvider
+    from meetily_memory.tagging import TagMatch, TagRepository
 
 RRF_K = 60
 HYBRID_CANDIDATE_MULTIPLIER = 4
@@ -69,6 +69,8 @@ class SemanticRetrievalStrategy:
         *,
         filters: MeetingSearchFilters | None = None,
     ) -> tuple[SearchHit, ...]:
+        from meetily_memory.semantic_search import semantic_search  # noqa: PLC0415
+
         rows = semantic_search(
             self.repository.index_path,
             query,
@@ -285,6 +287,8 @@ class HybridRetrievalStrategy:
         str,
     ]:
         if self.require_complete_semantic_index:
+            from meetily_memory.semantic_search import semantic_index_coverage  # noqa: PLC0415
+
             try:
                 coverage = semantic_index_coverage(
                     self.repository.index_path,

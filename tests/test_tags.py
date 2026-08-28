@@ -26,7 +26,8 @@ class TargetBiasedEmbeddingProvider:
     model = "target-biased-v1"
     dims: int | None = 2
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], *, role: str) -> list[list[float]]:
+        assert role in {"query", "document"}
         return [[0.0, 1.0] if text == "other semantic topic" else [1.0, 0.0] for text in texts]
 
 
@@ -474,8 +475,8 @@ class ExplodingEmbeddingProvider:
     model = "never"
     dims: int | None = 128
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        del texts
+    def embed(self, texts: list[str], *, role: str) -> list[list[float]]:
+        del texts, role
         message = "must not run"
         raise AssertionError(message)
 
@@ -485,8 +486,8 @@ class UnavailableHashProvider:
     model = "local-hash-v1"
     dims: int | None = 128
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        del texts
+    def embed(self, texts: list[str], *, role: str) -> list[list[float]]:
+        del texts, role
         message = "provider unavailable"
         raise RuntimeError(message)
 

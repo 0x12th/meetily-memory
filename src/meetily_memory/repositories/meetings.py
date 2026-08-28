@@ -13,7 +13,6 @@ from meetily_memory.meeting_structure import ENTITY_KINDS
 from meetily_memory.memory.entities import ENTITY_COUNT_SQL, ENTITY_DELETE_SQL, ENTITY_SELECT_SQL
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, ScanRunStats
 from meetily_memory.repositories.search import meeting_time_predicate
-from meetily_memory.semantic_search import assert_safe_identifier, load_sqlite_vec
 
 SyncKnowledge = Callable[[sqlite3.Connection, int, str], None]
 DeleteKnowledge = Callable[[sqlite3.Connection, int], None]
@@ -239,6 +238,11 @@ class MeetingsRepository:
         ]
         if not vector_tables:
             return
+        from meetily_memory.semantic_search import (  # noqa: PLC0415
+            assert_safe_identifier,
+            load_sqlite_vec,
+        )
+
         load_sqlite_vec(conn)
         for table in vector_tables:
             safe_table = assert_safe_identifier(table)

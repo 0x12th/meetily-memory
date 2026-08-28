@@ -34,7 +34,8 @@ class StubEmbeddingProvider:
     model = "3d"
     dims: int | None = None
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], *, role: str) -> list[list[float]]:
+        assert role in {"query", "document"}
         embeddings = []
         for text in texts:
             normalized = text.casefold()
@@ -55,7 +56,8 @@ class RecordingBatchEmbeddingProvider:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], *, role: str) -> list[list[float]]:
+        assert role == "document"
         self.calls.append(texts)
         return [[1.0, 0.0, 0.0] for _ in texts]
 
@@ -286,7 +288,7 @@ def test_assert_safe_identifier_rejects_dynamic_sql_names() -> None:
 def test_local_hash_provider_remains_explicit_baseline() -> None:
     provider = LocalHashEmbeddingProvider()
 
-    embeddings = provider.embed(["migration risks", "pricing decision"])
+    embeddings = provider.embed(["migration risks", "pricing decision"], role="document")
 
     assert provider.name == "hash"
     assert provider.model == "local-hash-v1"
@@ -351,7 +353,7 @@ def test_load_semantic_config_reads_legacy_config_json(
     assert config.ollama_model == "local-hash-v1"
 
 
-def test_ollama_embedding_provider_uses_current_embed_endpoint() -> None:
+def test_ollama_embedding_provider_uses_explicit_query_and_document_roles() -> None:
     RecordingOllamaHandler.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), RecordingOllamaHandler)
     thread = threading.Thread(target=server.serve_forever)
@@ -359,25 +361,26 @@ def test_ollama_embedding_provider_uses_current_embed_endpoint() -> None:
     try:
         provider = OllamaEmbeddingProvider(
             base_url=f"http://127.0.0.1:{server.server_port}/",
-            model="nomic-embed-text",
+            model="qwen3-embedding:0.6b",
             timeout_seconds=1.5,
         )
 
-        embeddings = provider.embed(["first", "second"])
+        query_embeddings = provider.embed(["first", "second"], role="query")
+        document_embeddings = provider.embed(["first", "second"], role="document")
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
 
     assert provider.name == "ollama"
-    assert provider.model == "nomic-embed-text"
+    assert provider.model == "qwen3-embedding:0.6b"
     assert provider.dims is None
-    assert embeddings[0] == [
+    assert query_embeddings[0] == [
         0.2672612419124244,
         0.5345224838248488,
         0.8017837257372731,
     ]
-    assert embeddings[1] == [
+    assert document_embeddings[1] == [
         0.4558423058385518,
         0.5698028822981898,
         0.6837634587578276,
@@ -387,8 +390,39 @@ def test_ollama_embedding_provider_uses_current_embed_endpoint() -> None:
             "path": "/api/embed",
             "content_type": "application/json",
             "body": {
-                "model": "nomic-embed-text",
+                "model": "qwen3-embedding:0.6b",
+                "input": [
+                    "Instruct: Given a search query about personal meeting history, "
+                    "retrieve relevant meeting passages that answer the query\nQuery:first",
+                    "Instruct: Given a search query about personal meeting history, "
+                    "retrieve relevant meeting passages that answer the query\nQuery:second",
+                ],
+            },
+        },
+        {
+            "path": "/api/embed",
+            "content_type": "application/json",
+            "body": {
+                "model": "qwen3-embedding:0.6b",
                 "input": ["first", "second"],
             },
-        }
+        },
     ]
+
+
+def test_embedding_configuration_changes_vector_table_identity() -> None:
+    plain = OllamaEmbeddingProvider(model="bge-m3")
+    instructed = OllamaEmbeddingProvider(
+        model="bge-m3",
+        query_instruction="query: {text}",
+    )
+
+    assert plain.query_instruction is None
+    assert plain.document_instruction is None
+    assert vector_table_name(plain, 1024) != vector_table_name(instructed, 1024)
+
+
+def test_uninstructed_provider_keeps_legacy_vector_table_identity() -> None:
+    provider = OllamaEmbeddingProvider(model="nomic-embed-text")
+
+    assert vector_table_name(provider, 768) == "chunk_embeddings_vec_768_68901dd67716"

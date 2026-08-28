@@ -120,9 +120,10 @@ removing tags.
 
 ## Advanced Commands
 
-Context, topics, semantic search, Obsidian, LLM, MCP, database diagnostics, and
-source-rebinding commands remain available but are not part of the main
-workflow. See [docs/commands.md](docs/commands.md) and
+Context, topics, Obsidian, MCP, database diagnostics, and source-rebinding
+commands remain available but are not part of the main workflow. Semantic
+retrieval is isolated to offline evaluation tooling, and the duplicate local
+LLM answer path has been removed. See [docs/commands.md](docs/commands.md) and
 [docs/integrations.md](docs/integrations.md).
 
 ## Development

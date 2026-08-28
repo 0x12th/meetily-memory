@@ -1,20 +1,18 @@
+from __future__ import annotations
+
 import re
 import sqlite3
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from meetily_memory.semantic_search import (
-    EmbeddingProvider,
-    resolve_embedding_provider,
-    semantic_index_coverage,
-    semantic_search,
-)
 from meetily_memory.user_state import ensure_user_state_schema
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from meetily_memory.repositories.index import IndexRepository
+    from meetily_memory.semantic_search import EmbeddingProvider
 
 TAG_SUGGESTION_LIMIT = 5
 SEMANTIC_SUGGESTION_CANDIDATES = 50
@@ -345,7 +343,7 @@ def normalize_tags(values: tuple[str, ...]) -> tuple[Tag, ...]:
 
 
 class TagService:
-    def __init__(self, index_repository: "IndexRepository") -> None:
+    def __init__(self, index_repository: IndexRepository) -> None:
         self.index_repository = index_repository
         self.repository = TagRepository(index_repository.state_path)
 
@@ -439,12 +437,13 @@ class TagService:
         )
         if len(suggestions) >= TAG_SUGGESTION_LIMIT:
             return tuple(suggestions)
-        provider = embedding_provider or resolve_embedding_provider()
+        if embedding_provider is None:
+            return tuple(suggestions)
         return self._append_semantic_suggestions(
             suggestions,
             identity,
             f"{title}\n{text}",
-            provider,
+            embedding_provider,
         )
 
     def _append_text_suggestions(
@@ -467,6 +466,8 @@ class TagService:
         document: str,
         provider: EmbeddingProvider,
     ) -> tuple[TagSuggestion, ...]:
+        from meetily_memory.semantic_search import semantic_index_coverage  # noqa: PLC0415
+
         try:
             coverage = semantic_index_coverage(
                 self.index_repository.index_path,
@@ -531,6 +532,8 @@ class TagService:
         document: str,
         provider: EmbeddingProvider,
     ) -> Iterator[list[dict[str, object]]]:
+        from meetily_memory.semantic_search import semantic_search  # noqa: PLC0415
+
         candidate_limit = SEMANTIC_SUGGESTION_CANDIDATES
         while True:
             rows = semantic_search(

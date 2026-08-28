@@ -4,7 +4,7 @@ import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated
 
 import typer
 
@@ -18,7 +18,12 @@ from meetily_memory.cli.common import (
     sqlite_has_fts5,
 )
 from meetily_memory.config.paths import discover_meetily_db
-from meetily_memory.config.settings import AppSettings, load_app_settings, update_app_settings
+from meetily_memory.config.settings import (
+    AppSettings,
+    ObsidianSettings,
+    load_app_settings,
+    update_app_settings,
+)
 from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import index_connection
@@ -31,12 +36,6 @@ from meetily_memory.scanner.meetily_sqlite import (
     meeting_external_ids,
 )
 from meetily_memory.scanner.sqlite_source import can_open_readonly_sqlite
-from meetily_memory.semantic_search import (
-    index_semantic_embeddings,
-    load_semantic_config,
-    resolve_embedding_provider,
-)
-from meetily_memory.structure_analyzer import StructureAnalyzer
 from meetily_memory.tagging import TagService
 
 app = make_typer("Local Meetily history lifecycle commands.")
@@ -95,32 +94,10 @@ def scan_update(
     index_path: Path,
     source_path: Path,
     *,
-    semantic: bool = False,
     finalize: bool = True,
-) -> tuple[dict[str, object], int, ScanResult]:
-    result = MeetilySQLiteScanner(index_path).scan(source_path, analyze=True, finalize=False)
+) -> tuple[dict[str, object], ScanResult]:
+    result = MeetilySQLiteScanner(index_path).scan(source_path, analyze=False, finalize=False)
     repo = IndexRepository(index_path)
-    embeddings_indexed = 0
-
-    if semantic:
-        repo.update_scan_run_phase(result.run_id, "semantic_refresh")
-        try:
-            provider = resolve_embedding_provider()
-            embeddings_indexed = index_semantic_embeddings(
-                index_path,
-                embedding_provider=provider,
-            )
-        except Exception as exc:
-            repo.fail_scan_run(
-                result.run_id,
-                utc_now_iso(),
-                "semantic_refresh",
-                result,
-                type(exc).__name__,
-            )
-            if isinstance(exc, RuntimeError):
-                raise typer.BadParameter(str(exc)) from exc
-            raise
 
     if finalize:
         repo.complete_scan_run(result.run_id, utc_now_iso(), result)
@@ -134,20 +111,17 @@ def scan_update(
         "chunks_seen": result.chunks_seen,
         "chunks_inserted": result.chunks_inserted,
         "chunks_updated": result.chunks_updated,
-        "embeddings_indexed": embeddings_indexed,
     }
 
-    return payload, embeddings_indexed, result
+    return payload, result
 
 
-def print_update_payload(payload: dict[str, object], *, semantic: bool) -> None:
+def print_update_payload(payload: dict[str, object]) -> None:
     console.print(f"meetings seen: {payload['meetings_seen']}")
     console.print(f"meetings inserted: {payload['meetings_inserted']}")
     console.print(f"meetings updated: {payload['meetings_updated']}")
     console.print(f"meetings analyzed: {payload['meetings_analyzed']}")
     console.print(f"chunks seen: {payload['chunks_seen']}")
-    if semantic:
-        console.print(f"embeddings indexed: {payload['embeddings_indexed']}")
 
 
 def print_scan_diagnostics(diagnostics: dict[str, dict[str, object] | None]) -> None:
@@ -194,7 +168,7 @@ def init(
         should_enable_autosync = typer.confirm("Enable automatic index refreshes?", default=False)
     try:
         with RefreshLock(ctx.obj["index_path"]):
-            payload, _, _ = scan_update(ctx.obj["index_path"], source_path)
+            payload, _ = scan_update(ctx.obj["index_path"], source_path)
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     repo = IndexRepository(ctx.obj["index_path"])
@@ -232,7 +206,7 @@ def init(
     print_text_block(f"index path: {ctx.obj['index_path']}")
     print_text_block(f"source path: {source_path}")
     print_text_block(f"autosync: {'enabled' if settings.autosync_enabled else 'disabled'}")
-    print_update_payload(payload, semantic=False)
+    print_update_payload(payload)
 
 
 @app.command()
@@ -250,9 +224,7 @@ def status(
     source_path = str(selected_source["current_path"]) if selected_source else None
     stats = repo.stats()
     scan_diagnostics = current_scan_diagnostics(index_path, repo)
-    semantic_config = load_semantic_config()
     obsidian_configured = bool(settings.obsidian.vault_path)
-    llm_provider = settings.llm.provider or "not configured"
     resolved_ui_language = resolve_ui_language(index_path, ctx.obj["settings_path"])
     payload = {
         "index_path": str(index_path),
@@ -264,9 +236,7 @@ def status(
         "autosync_configured": autosync_status.configured,
         "autosync_installed": autosync_status.installed,
         "autosync_active": autosync_status.active,
-        "semantic_provider": semantic_config.provider,
         "obsidian_configured": obsidian_configured,
-        "llm_provider": settings.llm.provider,
         **scan_diagnostics,
         **stats,
     }
@@ -279,9 +249,7 @@ def status(
     print_text_block(f"language: {resolved_ui_language} ({configured_label})")
     print_text_block(f"last refresh: {settings.last_update_at or 'never'}")
     print_text_block(f"autosync: {autosync_status.label}")
-    print_text_block(f"semantic: {semantic_config.provider or 'not configured'}")
     print_text_block(f"obsidian: {'configured' if obsidian_configured else 'not configured'}")
-    print_text_block(f"llm: {llm_provider}")
     print_text_block(f"meetings: {stats['meetings']}")
     print_text_block(f"chunks: {stats['chunks']}")
     print_scan_diagnostics(scan_diagnostics)
@@ -453,19 +421,16 @@ def run_refresh(
     index_path: Path,
     settings_path: Path,
     source_path: Path,
-    *,
-    semantic: bool,
-) -> tuple[dict[str, object], bool, bool]:
+) -> tuple[dict[str, object], bool]:
     settings = load_app_settings(settings_path)
-    run_semantic = semantic or bool(load_semantic_config().provider)
-    payload, _, result = scan_update(
+    payload, result = scan_update(
         index_path,
         source_path,
-        semantic=run_semantic,
         finalize=False,
     )
     repo = IndexRepository(index_path)
-    phase = "semantic_refresh" if run_semantic else "source_scan"
+    phase = "source_scan"
+    obsidian_settings = settings.obsidian
     try:
         phase = "finalizing"
         repo.update_scan_run_phase(result.run_id, phase)
@@ -481,6 +446,12 @@ def run_refresh(
                 Path(settings.obsidian.vault_path),
                 settings.obsidian.folder,
             )
+            obsidian_settings = ObsidianSettings(
+                vault_path=settings.obsidian.vault_path,
+                folder=settings.obsidian.folder,
+                sync_after_update=settings.obsidian.sync_after_update,
+                last_sync_at=utc_now_iso(),
+            )
             obsidian_synced = True
         phase = "finalizing"
         repo.update_scan_run_phase(result.run_id, phase)
@@ -490,6 +461,7 @@ def run_refresh(
             source_uuid=source_uuid,
             source_path=None,
             last_update_at=utc_now_iso(),
+            obsidian=obsidian_settings,
         )
     except Exception as exc:
         repo.fail_scan_run(
@@ -500,7 +472,7 @@ def run_refresh(
             type(exc).__name__,
         )
         raise
-    return payload, run_semantic, obsidian_synced
+    return payload, obsidian_synced
 
 
 @app.command("refresh")
@@ -510,10 +482,6 @@ def refresh(
         Path | None,
         typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
     ] = None,
-    semantic: Annotated[
-        bool,
-        typer.Option("--semantic", help="Also refresh configured semantic embeddings."),
-    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
     autosync_run: Annotated[bool, typer.Option("--autosync-run", hidden=True)] = False,
 ) -> None:
@@ -525,11 +493,10 @@ def refresh(
             if source_path is None:
                 message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
                 raise typer.BadParameter(message)
-            payload, run_semantic, obsidian_synced = run_refresh(
+            payload, obsidian_synced = run_refresh(
                 ctx.obj["index_path"],
                 ctx.obj["settings_path"],
                 source_path,
-                semantic=semantic,
             )
     except RefreshLockBusyError as exc:
         if autosync_run:
@@ -540,7 +507,7 @@ def refresh(
         payload["obsidian_synced"] = obsidian_synced
         print_json(payload)
         return
-    print_update_payload(payload, semantic=run_semantic)
+    print_update_payload(payload)
     if obsidian_synced:
         console.print("obsidian sync: yes")
 
@@ -598,53 +565,13 @@ def db_status(
 
 
 @mcp_app.command("serve")
-def mcp_serve(
-    ctx: typer.Context,
-    transport: Annotated[
-        str,
-        typer.Option("--transport", help="MCP transport: stdio, sse, or streamable-http."),
-    ] = "stdio",
-) -> None:
-    if transport not in {"stdio", "sse", "streamable-http"}:
-        message = "MCP transport must be one of: stdio, sse, streamable-http."
-        raise typer.BadParameter(message)
+def mcp_serve(ctx: typer.Context) -> None:
     try:
-        from meetily_memory.mcp_server import MCPTransport, run_mcp_server  # noqa: PLC0415
+        from meetily_memory.mcp_server import run_mcp_server  # noqa: PLC0415
     except ImportError as exc:
         message = "MCP support is optional. Install with `meetily-memory[mcp]`."
         raise typer.BadParameter(message) from exc
-    run_mcp_server(ctx.obj["index_path"], transport=cast("MCPTransport", transport))
-
-
-@app.command(hidden=True)
-def analyze(
-    ctx: typer.Context,
-    meeting_id: Annotated[
-        str | None,
-        typer.Argument(help="Meeting external id or internal id. Omit to analyze all meetings."),
-    ] = None,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
-) -> None:
-    repo = IndexRepository(ctx.obj["index_path"])
-    analyzer = StructureAnalyzer(repo)
-    if meeting_id:
-        meeting = repo.get_meeting(meeting_id)
-        if not meeting:
-            message = f"Meeting not found: {meeting_id}"
-            raise typer.BadParameter(message)
-        result = analyzer.analyze_meeting(int(meeting["id"]))
-    else:
-        result = analyzer.analyze_all()
-
-    payload = result.as_payload()
-    if json_output:
-        print_json(payload)
-        return
-    console.print(f"meetings analyzed: {payload['meetings_analyzed']}")
-    console.print(f"decisions: {payload['decisions']}")
-    console.print(f"action items: {payload['action_items']}")
-    console.print(f"risks: {payload['risks']}")
-    console.print(f"open questions: {payload['open_questions']}")
+    run_mcp_server(ctx.obj["index_path"])
 
 
 @app.command()

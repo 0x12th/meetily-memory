@@ -88,13 +88,6 @@ def topic_labels(language: str) -> dict[str, str]:
     }
 
 
-def graph_node_title(nodes: list[dict[str, object]], node_id: int) -> str:
-    for node in nodes:
-        if int(str(node["id"])) == node_id:
-            return str(node["title"])
-    return str(node_id)
-
-
 def entity_source(row: dict[str, object]) -> str:
     source_parts = [
         str(row.get("meeting_external_id") or row.get("meeting_id") or ""),
@@ -104,21 +97,6 @@ def entity_source(row: dict[str, object]) -> str:
     if row.get("chunk_timestamp_label"):
         return f"{source} @ {row['chunk_timestamp_label']}"
     return source
-
-
-def embedding_label(row: dict[str, object], provider: object) -> str:
-    provider_name = str(row.get("embedding_provider") or getattr(provider, "name", ""))
-    model = str(row.get("embedding_model") or getattr(provider, "model", ""))
-    dimensions = row.get("embedding_dimensions") or getattr(provider, "dims", None)
-    suffix = f"/{dimensions}d" if dimensions else ""
-    return f"{provider_name}/{model}{suffix}"
-
-
-def float_value(value: object, label: str) -> float:
-    if isinstance(value, int | float):
-        return float(value)
-    message = f"Expected numeric {label}."
-    raise RuntimeError(message)
 
 
 def print_search_meeting_summaries(rows: list[dict[str, object]]) -> None:
@@ -134,14 +112,6 @@ def print_search_meeting_summaries(rows: list[dict[str, object]]) -> None:
         date = compact_date(row.get("updated_at") or row.get("created_at"))
         suffix = f" ({date})" if date else ""
         print_text_block(f"- #{meeting_id} {row['title']}{suffix} | open: mm open {meeting_id}")
-
-
-def print_meeting_summaries(rows: list[dict[str, object]]) -> None:
-    if not rows:
-        print_text_block("No matching meetings.")
-        return
-    for row in rows:
-        print_text_block(f"- #{row['id']} {row['title']} | open: mm open {row['id']}")
 
 
 def print_entity_bullets(rows: list[dict[str, object]]) -> None:
@@ -292,12 +262,3 @@ def print_evidence_bullets(
             f"- {prefix}{row['text']} | Source: {entity_source(row)} "
             f"| open: mm open {row['meeting_id']}"
         )
-
-
-def print_grouped_entity_bullets(rows: list[dict[str, object]]) -> None:
-    if not rows:
-        print_text_block("No structured signals.")
-        return
-    for row in rows:
-        kind = str(row.get("kind", "signal")).replace("_", " ")
-        print_text_block(f"- {kind}: {row['text']} | Source: {entity_source(row)}")

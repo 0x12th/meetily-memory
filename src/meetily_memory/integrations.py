@@ -15,12 +15,14 @@ class ObsidianSyncResult:
     root_dir: Path
     files_written: int
     files_skipped: int
+    files_removed: int
 
     def as_payload(self) -> dict[str, Any]:
         return {
             "root_dir": str(self.root_dir),
             "files_written": self.files_written,
             "files_skipped": self.files_skipped,
+            "files_removed": self.files_removed,
         }
 
 
@@ -41,85 +43,116 @@ def sync_obsidian_vault(
     vault_path: Path,
     folder: str = "Meetily Memory",
     *,
-    limit: int = 100,
+    limit: int | None = None,
 ) -> ObsidianSyncResult:
-    root_dir = vault_path.expanduser() / folder
+    root_dir = obsidian_root_dir(vault_path, folder)
     for directory in OBSIDIAN_DIRS:
-        (root_dir / directory).mkdir(parents=True, exist_ok=True)
+        directory_path = root_dir / directory
+        directory_path.mkdir(parents=True, exist_ok=True)
+        if not directory_path.resolve().is_relative_to(root_dir):
+            msg = f"Obsidian managed directory escapes configured root: {directory}"
+            raise ValueError(msg)
 
     core = MeetilyMemoryCore(index_path)
     files_written = 0
     files_skipped = 0
+    expected_paths: set[Path] = set()
     people: dict[str, dict[str, Any]] = {}
+    effective_limit = limit if limit is not None else 2**31 - 1
 
-    written, skipped = sync_obsidian_meetings(root_dir, core, limit)
+    written, skipped, paths = sync_obsidian_meetings(root_dir, core, effective_limit)
     files_written += written
     files_skipped += skipped
+    expected_paths.update(paths)
 
-    written, skipped, topic_people = sync_obsidian_topics(root_dir, core, limit)
+    written, skipped, topic_people, paths = sync_obsidian_topics(root_dir, core, effective_limit)
     files_written += written
     files_skipped += skipped
     people.update(topic_people)
+    expected_paths.update(paths)
 
-    written, skipped, entity_people = sync_obsidian_entities(root_dir, core, limit)
+    written, skipped, entity_people, paths = sync_obsidian_entities(root_dir, core, effective_limit)
     files_written += written
     files_skipped += skipped
     people.update(entity_people)
+    expected_paths.update(paths)
 
-    written, skipped = sync_obsidian_people(root_dir, people)
+    written, skipped, paths = sync_obsidian_people(root_dir, people)
     files_written += written
     files_skipped += skipped
+    expected_paths.update(paths)
+
+    files_removed = remove_stale_managed_notes(root_dir, expected_paths) if limit is None else 0
 
     return ObsidianSyncResult(
         root_dir=root_dir,
         files_written=files_written,
         files_skipped=files_skipped,
+        files_removed=files_removed,
     )
+
+
+def obsidian_root_dir(vault_path: Path, folder: str) -> Path:
+    vault_root = vault_path.expanduser().resolve()
+    folder_path = Path(folder)
+    if folder_path.is_absolute():
+        msg = "Obsidian folder must be relative to the configured vault."
+        raise ValueError(msg)
+    root_dir = (vault_root / folder_path).resolve()
+    if not root_dir.is_relative_to(vault_root):
+        msg = "Obsidian folder must stay inside the configured vault."
+        raise ValueError(msg)
+    return root_dir
 
 
 def sync_obsidian_meetings(
     root_dir: Path,
     core: MeetilyMemoryCore,
     limit: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, set[Path]]:
     files_written = 0
     files_skipped = 0
+    expected_paths: set[Path] = set()
     for value in core.meetings(limit=limit):
         meeting = meeting_payload(value)
         path = root_dir / "Meetings" / f"{safe_note_name(str(meeting['title']))}.md"
+        expected_paths.add(path)
         written = write_managed_note(path, render_obsidian_meeting_note(meeting))
         files_written += int(written)
         files_skipped += int(not written)
-    return files_written, files_skipped
+    return files_written, files_skipped, expected_paths
 
 
 def sync_obsidian_topics(
     root_dir: Path,
     core: MeetilyMemoryCore,
     limit: int,
-) -> tuple[int, int, dict[str, dict[str, Any]]]:
+) -> tuple[int, int, dict[str, dict[str, Any]], set[Path]]:
     files_written = 0
     files_skipped = 0
     people: dict[str, dict[str, Any]] = {}
+    expected_paths: set[Path] = set()
     for topic in core.topics(limit=limit):
         title = topic.title
         payload = topic_memory_payload(core.topic(title))
         path = root_dir / "Topics" / f"{safe_note_name(title)}.md"
+        expected_paths.add(path)
         written = write_managed_note(path, render_obsidian_topic_memory(payload))
         files_written += int(written)
         files_skipped += int(not written)
         people.update(people_from_topic_payload(payload))
-    return files_written, files_skipped, people
+    return files_written, files_skipped, people, expected_paths
 
 
 def sync_obsidian_entities(
     root_dir: Path,
     core: MeetilyMemoryCore,
     limit: int,
-) -> tuple[int, int, dict[str, dict[str, Any]]]:
+) -> tuple[int, int, dict[str, dict[str, Any]], set[Path]]:
     files_written = 0
     files_skipped = 0
     people: dict[str, dict[str, Any]] = {}
+    expected_paths: set[Path] = set()
     entity_dirs = {
         "action_items": "Tasks",
         "decisions": "Decisions",
@@ -134,31 +167,48 @@ def sync_obsidian_entities(
                 safe_note_name(str(entity["text"])[:80]) or f"{entity['kind']}-{entity['id']}"
             )
             path = root_dir / directory / f"{filename}.md"
+            expected_paths.add(path)
             written = write_managed_note(path, render_obsidian_entity_note(entity))
             files_written += int(written)
             files_skipped += int(not written)
             for person in payload_people(entity):
                 people[person.casefold()] = {"display_name": person}
-    return files_written, files_skipped, people
+    return files_written, files_skipped, people, expected_paths
 
 
 def sync_obsidian_people(
     root_dir: Path,
     people: dict[str, dict[str, Any]],
-) -> tuple[int, int]:
+) -> tuple[int, int, set[Path]]:
     files_written = 0
     files_skipped = 0
+    expected_paths: set[Path] = set()
     for person in people.values():
         display_name = str(person["display_name"])
         path = root_dir / "People" / f"{safe_note_name(display_name)}.md"
+        expected_paths.add(path)
         written = write_managed_note(path, render_obsidian_person_note(display_name))
         files_written += int(written)
         files_skipped += int(not written)
-    return files_written, files_skipped
+    return files_written, files_skipped, expected_paths
+
+
+def remove_stale_managed_notes(root_dir: Path, expected_paths: set[Path]) -> int:
+    files_removed = 0
+    for directory in OBSIDIAN_DIRS:
+        for path in (root_dir / directory).glob("*.md"):
+            if path not in expected_paths and has_managed_marker(path):
+                path.unlink()
+                files_removed += 1
+    return files_removed
+
+
+def has_managed_marker(path: Path) -> bool:
+    return MANAGED_MARKER in path.read_text(encoding="utf-8").splitlines()
 
 
 def write_managed_note(path: Path, text: str) -> bool:
-    if path.exists() and MANAGED_MARKER not in path.read_text(encoding="utf-8"):
+    if path.exists() and not has_managed_marker(path):
         return False
     write_text_file(path, text)
     return True

@@ -199,6 +199,13 @@ class EvaluationManifest:
     semantic_provider: str | None = None
     semantic_model: str | None = None
     semantic_dimension: int | None = None
+    semantic_model_digest: str | None = None
+    semantic_query_instruction: str | None = None
+    semantic_document_instruction: str | None = None
+    semantic_index_fingerprint: str | None = None
+    chunk_fingerprint: str | None = None
+    semantic_refresh_ms: float | None = None
+    semantic_index_size_bytes: int | None = None
 
     COMPATIBILITY_FIELDS: ClassVar[tuple[str, ...]] = (
         "dataset_fingerprint",
@@ -210,6 +217,11 @@ class EvaluationManifest:
         "semantic_provider",
         "semantic_model",
         "semantic_dimension",
+        "semantic_model_digest",
+        "semantic_query_instruction",
+        "semantic_document_instruction",
+        "semantic_index_fingerprint",
+        "chunk_fingerprint",
     )
 
     @classmethod
@@ -244,6 +256,13 @@ class EvaluationRetrievalConfig:
     semantic_provider: str | None = None
     semantic_model: str | None = None
     semantic_dimension: int | None = None
+    semantic_model_digest: str | None = None
+    semantic_query_instruction: str | None = None
+    semantic_document_instruction: str | None = None
+    semantic_index_fingerprint: str | None = None
+    chunk_fingerprint: str | None = None
+    semantic_refresh_ms: float | None = None
+    semantic_index_size_bytes: int | None = None
     repository_root: Path | None = None
     warmup: bool = False
 
@@ -710,6 +729,13 @@ def build_manifest(
         semantic_provider=config.semantic_provider,
         semantic_model=config.semantic_model,
         semantic_dimension=config.semantic_dimension,
+        semantic_model_digest=config.semantic_model_digest,
+        semantic_query_instruction=config.semantic_query_instruction,
+        semantic_document_instruction=config.semantic_document_instruction,
+        semantic_index_fingerprint=config.semantic_index_fingerprint,
+        chunk_fingerprint=config.chunk_fingerprint,
+        semantic_refresh_ms=config.semantic_refresh_ms,
+        semantic_index_size_bytes=config.semantic_index_size_bytes,
     )
 
 

@@ -6,7 +6,7 @@ import typer
 
 from meetily_memory.cli.common import make_typer, print_json, print_text_block
 from meetily_memory.config.settings import ObsidianSettings, load_app_settings, update_app_settings
-from meetily_memory.integrations import sync_obsidian_vault
+from meetily_memory.integrations import obsidian_root_dir, sync_obsidian_vault
 
 obsidian_app = make_typer("Sync Meetily Memory into Obsidian.")
 
@@ -17,6 +17,7 @@ def utc_now_iso() -> str:
 
 @obsidian_app.command("init")
 def obsidian_init(
+    ctx: typer.Context,
     vault: Annotated[
         Path,
         typer.Option("--vault", help="Obsidian vault path."),
@@ -34,12 +35,17 @@ def obsidian_init(
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
+    try:
+        obsidian_root_dir(vault, folder)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     settings = update_app_settings(
+        settings_path=ctx.obj["settings_path"],
         obsidian=ObsidianSettings(
             vault_path=str(vault.expanduser()),
             folder=folder,
             sync_after_update=sync_after_update,
-        )
+        ),
     )
     payload = settings.obsidian.__dict__
     if json_output:
@@ -56,7 +62,7 @@ def obsidian_sync(
     ctx: typer.Context,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    settings = load_app_settings()
+    settings = load_app_settings(ctx.obj["settings_path"])
     if not settings.obsidian.vault_path:
         message = "Obsidian is not configured. Run `mm obsidian init`."
         raise typer.BadParameter(message)
@@ -71,20 +77,22 @@ def obsidian_sync(
         sync_after_update=settings.obsidian.sync_after_update,
         last_sync_at=utc_now_iso(),
     )
-    update_app_settings(obsidian=updated_obsidian)
+    update_app_settings(settings_path=ctx.obj["settings_path"], obsidian=updated_obsidian)
     if json_output:
         print_json(result.as_payload())
         return
     print_text_block(f"obsidian root: {result.root_dir}")
     print_text_block(f"obsidian files synced: {result.files_written}")
     print_text_block(f"obsidian files skipped: {result.files_skipped}")
+    print_text_block(f"obsidian files removed: {result.files_removed}")
 
 
 @obsidian_app.command("status")
 def obsidian_status(
+    ctx: typer.Context,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    settings = load_app_settings()
+    settings = load_app_settings(ctx.obj["settings_path"])
     payload = settings.obsidian.__dict__
     if json_output:
         print_json(payload)

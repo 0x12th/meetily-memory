@@ -7,19 +7,19 @@ compatibility payloads do not exist. `Meeting` contains product identity and cur
 data; source IDs, paths, fingerprints, and raw storage JSON remain inside the repository layer.
 
 `build_context()` and `build_meeting_context()` return the same data-only `ContextBundle`.
-Markdown is a CLI presentation concern and is rendered by `ContextRenderer`; MCP context never
-contains Markdown. `MemoryEntity` values use the canonical kinds `decision`, `task`, `risk`, and
-`question`, point directly to their source excerpt, and are marked non-authoritative. Extractor
-confidence remains internal diagnostics and is not part of the domain contract or generated
-Obsidian notes. The heuristic task extractor requires an explicit action verb or assignment
-phrase; generic mentions of a task or what one "can do" are not treated as established action
-items.
+Markdown is a CLI presentation concern and is rendered by `ContextRenderer`. `MemoryEntity`
+values use the canonical kinds `decision`, `task`, `risk`, and `question`, point directly to their
+source excerpt, and are marked non-authoritative. Extractor confidence remains internal
+diagnostics and is not part of the domain contract or generated Obsidian notes. The heuristic
+task extractor requires an explicit action verb or assignment phrase; generic mentions of a task
+or what one "can do" are not treated as established action items.
 
 All Core operations return domain or operation models rather than transport dictionaries.
 Explicit serializers in `meetily_memory.serializers` are called only by CLI, MCP, and integration
-adapters. MCP keeps the `{kind, data}` envelope and invokes the same canonical search path as
-`mm s`. Optional meeting lookups return `None`; required meeting and evidence resolution raise
-specialized `LookupError` subclasses.
+adapters. The MCP adapter has only `search_meetings` and `get_meeting`, keeps the `{kind, data}`
+envelope, and invokes the same canonical meeting-level search path and date filters as `mm s`.
+It has no contract-version selector. Optional meeting lookups return `None`; required meeting and
+evidence resolution raise specialized `LookupError` subclasses.
 
 `RetrievalStrategy` accepts only a query and candidate limit and returns ranked `SearchHit`
 values. Meeting scope, neighboring excerpts, bundle limits, and `MemoryEntity` attachment are

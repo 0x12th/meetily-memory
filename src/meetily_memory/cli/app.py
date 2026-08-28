@@ -8,12 +8,8 @@ from meetily_memory.cli.autosync_commands import autosync_app
 from meetily_memory.cli.common import index_option, make_typer, version_callback
 from meetily_memory.cli.lifecycle_commands import app as lifecycle_app
 from meetily_memory.cli.lifecycle_commands import config_app, db_app, mcp_app
-from meetily_memory.cli.llm_commands import app as llm_root_app
-from meetily_memory.cli.llm_commands import llm_app
 from meetily_memory.cli.obsidian_commands import obsidian_app
 from meetily_memory.cli.search_commands import app as search_app
-from meetily_memory.cli.semantic_commands import app as semantic_root_app
-from meetily_memory.cli.semantic_commands import semantic_app
 from meetily_memory.cli.tag_commands import tag_app
 from meetily_memory.config.paths import app_config_path
 
@@ -26,12 +22,8 @@ app = make_typer(
     "  mm tag ...       Mark related meetings."
 )
 app.add_typer(lifecycle_app)
-app.add_typer(semantic_root_app)
-app.add_typer(llm_root_app)
 app.add_typer(search_app)
 app.add_typer(tag_app, name="tag")
-app.add_typer(semantic_app, name="semantic", hidden=True)
-app.add_typer(llm_app, name="llm", hidden=True)
 app.add_typer(obsidian_app, name="obsidian", hidden=True)
 app.add_typer(autosync_app, name="autosync")
 app.add_typer(config_app, name="config", hidden=True)

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0 - 2026-08-28
+
+- Collapse Core search to one typed meeting-level contract and add consistent `--since`,
+  `--from`, and `--to` date filters across CLI and MCP search.
+- Serialize refresh writers, record honest scan-run failures, and reconcile meetings deleted
+  from the read-only Meetily source so stale search results disappear.
+- Remove unreachable and unproven CLI surfaces, including local LLM answering and product
+  semantic commands; keep semantic retrieval isolated as optional offline research tooling.
+- Narrow experimental MCP to local stdio `search_meetings` and `get_meeting` tools backed by the
+  same search contract as `mm s`.
+- Keep Obsidian settings in the selected global or workspace scope and reconcile deleted or
+  renamed managed notes without touching unmarked user files.
+
 ## 0.5.0 - 2026-07-28
 
 - Focus the public workflow on meeting search, opening original records, and explicit

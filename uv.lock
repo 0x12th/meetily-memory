@@ -370,12 +370,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e2/5e/d118fce19f87a2e7d8101c35c8ae0ec289098a4df0ff244cec23e415aca0/mcp-1.28.1-py3-none-any.whl", hash = "sha256:2726bca5e7193f61c5dde8b12500a6de2d9acf6d1a1c0be9e8c2e706437991df", size = 222620, upload-time = "2026-06-26T12:57:27.218Z" },
 ]
 
-[package.optional-dependencies]
-cli = [
-    { name = "python-dotenv" },
-    { name = "typer" },
-]
-
 [[package]]
 name = "mdurl"
 version = "0.1.2"
@@ -387,49 +381,53 @@ wheels = [
 
 [[package]]
 name = "meetily-memory"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "orjson" },
     { name = "platformdirs" },
     { name = "rich" },
-    { name = "sqlite-vec" },
     { name = "typer" },
 ]
 
 [package.optional-dependencies]
 mcp = [
-    { name = "mcp", extra = ["cli"] },
+    { name = "mcp" },
+]
+semantic = [
+    { name = "sqlite-vec" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "mcp", extra = ["cli"] },
+    { name = "mcp" },
     { name = "pre-commit" },
     { name = "pyinstaller" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "sqlite-vec" },
     { name = "ty" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", extras = ["cli"], marker = "extra == 'mcp'", specifier = ">=1.27,<2" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27,<2" },
     { name = "orjson", specifier = ">=3.10.0" },
     { name = "platformdirs", specifier = ">=4.3.0" },
     { name = "rich", specifier = ">=13.9.0" },
-    { name = "sqlite-vec", specifier = ">=0.1.9,<0.2.0" },
+    { name = "sqlite-vec", marker = "extra == 'semantic'", specifier = ">=0.1.9,<0.2.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
-provides-extras = ["mcp"]
+provides-extras = ["semantic", "mcp"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "mcp", extras = ["cli"], specifier = ">=1.27,<2" },
+    { name = "mcp", specifier = ">=1.27,<2" },
     { name = "pre-commit", specifier = ">=4.0.0" },
     { name = "pyinstaller", specifier = ">=6.11.0" },
     { name = "pytest", specifier = ">=8.3.0" },
     { name = "ruff", specifier = ">=0.8.0" },
+    { name = "sqlite-vec", specifier = ">=0.1.9,<0.2.0" },
     { name = "ty", specifier = ">=0.0.1a21" },
 ]
 

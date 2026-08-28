@@ -228,6 +228,13 @@ def test_evaluation_records_explicit_hybrid_strategy(meetily_db: Path, tmp_path:
             semantic_provider="ollama",
             semantic_model="nomic-embed-text",
             semantic_dimension=768,
+            semantic_model_digest="sha256:model",
+            semantic_query_instruction="search_query: {text}",
+            semantic_document_instruction="search_document: {text}",
+            semantic_index_fingerprint="sha256:index",
+            chunk_fingerprint="sha256:chunks",
+            semantic_refresh_ms=1234.5,
+            semantic_index_size_bytes=4096,
         ),
     )
 
@@ -236,6 +243,13 @@ def test_evaluation_records_explicit_hybrid_strategy(meetily_db: Path, tmp_path:
     assert report.manifest.semantic_provider == "ollama"
     assert report.manifest.semantic_model == "nomic-embed-text"
     assert report.manifest.semantic_dimension == 768
+    assert report.manifest.semantic_model_digest == "sha256:model"
+    assert report.manifest.semantic_query_instruction == "search_query: {text}"
+    assert report.manifest.semantic_document_instruction == "search_document: {text}"
+    assert report.manifest.semantic_index_fingerprint == "sha256:index"
+    assert report.manifest.chunk_fingerprint == "sha256:chunks"
+    assert report.manifest.semantic_refresh_ms == 1234.5
+    assert report.manifest.semantic_index_size_bytes == 4096
 
 
 def test_evaluation_records_cold_start_before_warm_latency_measurements(

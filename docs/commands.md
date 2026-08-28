@@ -8,10 +8,10 @@ available for compatibility and experiments.
 | Command | Public role |
 |---|---|
 | `mm init` | First-run setup. Discovers the Meetily DB, creates `index.sqlite`, runs the first refresh, and asks before enabling automatic index refreshes. |
-| `mm refresh` | Main manual index refresh. Reads the Meetily DB, updates the local index, and rebuilds structured memory. If semantic search or Obsidian are configured, it also refreshes those derived layers. |
+| `mm refresh` | Main manual index refresh. Reads the Meetily DB and updates the lexical index. If Obsidian post-refresh sync is configured, it also syncs that projection. |
 | `mm update` | Updates the installed `meetily-memory` utility through Homebrew. |
-| `mm status` | Short system state: Meetily DB path, index path, UI language, last refresh, actual autosync scheduler state, Obsidian, LLM, and semantic status. |
-| `mm doctor` | Diagnostics only. Checks Meetily DB access/schema, SQLite/FTS5/sqlite-vec support, index permissions, and config. It does not change state. |
+| `mm status` | Short system state: Meetily DB path, index path, UI language, last refresh, actual autosync scheduler state, and Obsidian. |
+| `mm doctor` | Diagnostics only. Checks Meetily DB access/schema, SQLite/FTS5 support, index permissions, and config. It does not change state. |
 | `mm tag add 10 11 migration` | Assigns an explicit tag to one or more meetings. Tags are user state stored separately from the rebuildable index. |
 | `mm tag list [MEETING_ID]` | Lists all active tags or the tags assigned to one meeting. |
 | `mm tag suggest MEETING_ID` | Suggests up to five existing tags without changing assignments. |
@@ -60,24 +60,13 @@ retrieval.
 `mm c` uses direct lexical matches by default. `--context N` explicitly appends neighboring
 chunks, marks their evidence role, and caps the resulting evidence bundle at 20 excerpts.
 
-## Optional Experimental: Semantic Search
+## Offline Semantic Research
 
-| Command | Public role |
-|---|---|
-| `mm semantic init` | Configures the embedding provider, such as Ollama or a deterministic hash diagnostic baseline. Settings are stored in the main app settings file. |
-| `mm semantic index` | Explicitly builds or refreshes embeddings for chunks. `mm refresh` also updates embeddings once semantic search is configured. |
-| `mm sem "migration blockers"` | Semantic search. If embeddings are missing, it asks the user to run `mm semantic index`. |
-
-## Optional Experimental: LLM Setup
-
-| Command | Public role |
-|---|---|
-| `mm llm init` | Configures optional local LLM settings. Initial modes are `manual` and `ollama`; `agent` is reserved for later. |
-
-The answer path is not part of the everyday CLI yet. Prefer `mm c` for
-source-backed prompt/context handoff until local answering has a reliable
-provider setup, source-grounding checks, and a clear difference from context
-export.
+Semantic retrieval did not pass its product gate and is no longer a CLI or
+refresh surface. Install the `semantic` extra only when reproducing an offline
+experiment, then use `scripts/evaluate-semantic-search.py` as documented in
+[evaluation.md](evaluation.md). Standard installation, `mm s`, `mm refresh`,
+and autosync do not import or require `sqlite-vec` or Ollama.
 
 ## Optional Experimental: Obsidian
 
@@ -119,8 +108,7 @@ Managed notes use:
 | `mm autosync stop` | Stops automatic refreshes and removes generated launchd/systemd files when present. |
 | `mm autosync status` | Verifies saved configuration, scheduler installation, runtime registration, and the last successful refresh. |
 
-The background cycle runs `mm refresh`, then semantic indexing if configured, then
-Obsidian sync if configured.
+The background cycle runs `mm refresh`, then Obsidian sync if configured.
 
 Autosync status is `enabled` only when configuration, scheduler files, and runtime registration
 agree. A `misconfigured` status can be repaired by rerunning `mm autosync start`. Background
@@ -133,7 +121,5 @@ There should be no separate public watch command.
 | Command | Role |
 |---|---|
 | `mm scan` | Low-level Meetily DB indexing for debugging and tests. Ordinary users use `mm refresh`. |
-| `mm analyze` | Rebuilds structured memory manually for debug or repair. |
 | `mm db status` | Shows schema version and local index internals. |
-| `mm ask ...` | Hidden experimental compatibility command. In manual mode it prints a prompt, which overlaps with `mm c`; do not treat it as a core user workflow yet. |
-| `mm mcp serve` | Experimental MCP adapter for external agents. It is optional for pip/uv installs via `meetily-memory[mcp]`. |
+| `mm mcp serve` | Experimental stdio-only MCP adapter with meeting search and lookup. It is optional for pip/uv installs via `meetily-memory[mcp]`. |

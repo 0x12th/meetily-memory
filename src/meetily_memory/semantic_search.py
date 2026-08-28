@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -44,14 +44,24 @@ MIN_STEM_TOKEN_LENGTH = 3
 ZERO_VECTOR_FALLBACK = 1.0
 TOKEN_WEIGHT = 1.0
 BIGRAM_WEIGHT = 1.25
+QWEN3_QUERY_INSTRUCTION = (
+    "Instruct: Given a search query about personal meeting history, "
+    "retrieve relevant meeting passages that answer the query\nQuery:{text}"
+)
+EmbeddingRole = Literal["query", "document"]
 
 
 class EmbeddingProvider(Protocol):
-    name: str
-    model: str
-    dims: int | None
+    @property
+    def name(self) -> str: ...
 
-    def embed(self, texts: list[str]) -> list[list[float]]: ...
+    @property
+    def model(self) -> str: ...
+
+    @property
+    def dims(self) -> int | None: ...
+
+    def embed(self, texts: list[str], *, role: EmbeddingRole) -> list[list[float]]: ...
 
 
 @dataclass(frozen=True)
@@ -99,7 +109,8 @@ class LocalHashEmbeddingProvider:
     model: str = EMBEDDING_MODEL
     dims: int | None = EMBEDDING_DIMENSIONS
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], *, role: EmbeddingRole) -> list[list[float]]:
+        del role
         return [embed_text(text) for text in texts]
 
 
@@ -110,11 +121,26 @@ class OllamaEmbeddingProvider:
     base_url: str = DEFAULT_OLLAMA_URL
     timeout_seconds: float = DEFAULT_OLLAMA_TIMEOUT_SECONDS
     dims: int | None = None
+    query_instruction: str | None = None
+    document_instruction: str | None = None
+    model_digest: str | None = None
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    @property
+    def effective_query_instruction(self) -> str | None:
+        if self.query_instruction is not None:
+            return self.query_instruction
+        if self.model.casefold().startswith("qwen3-embedding"):
+            return QWEN3_QUERY_INSTRUCTION
+        return None
+
+    def embed(self, texts: list[str], *, role: EmbeddingRole) -> list[list[float]]:
+        instruction = (
+            self.effective_query_instruction if role == "query" else self.document_instruction
+        )
+        prepared = [apply_embedding_instruction(text, instruction) for text in texts]
         embeddings: list[list[float]] = []
-        for offset in range(0, len(texts), OLLAMA_BATCH_SIZE):
-            embeddings.extend(self._embed_batch(texts[offset : offset + OLLAMA_BATCH_SIZE]))
+        for offset in range(0, len(prepared), OLLAMA_BATCH_SIZE):
+            embeddings.extend(self._embed_batch(prepared[offset : offset + OLLAMA_BATCH_SIZE]))
         return embeddings
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
@@ -159,14 +185,14 @@ def semantic_search(
     filters: MeetingSearchFilters | None = None,
 ) -> list[Row]:
     provider = embedding_provider or resolve_embedding_provider()
-    query_embedding = provider.embed([query])[0]
+    query_embedding = provider.embed([query], role="query")[0]
     dimensions = len(query_embedding)
     vector_table = vector_table_name(provider, dimensions)
     with index_connection(index_path) as conn:
         load_sqlite_vec(conn)
         ensure_semantic_schema(conn, vector_table, dimensions)
         if count_indexed_embeddings(conn, provider, dimensions) == 0:
-            message = "Semantic index is empty. Run: mm semantic index"
+            message = "Semantic index is empty; build embeddings with the evaluation tooling."
             raise RuntimeError(message)
         time_sql, time_params = meeting_time_predicate(filters, alias="m_filter")
         semantic_sql = f"""
@@ -237,7 +263,7 @@ def index_semantic_embeddings(
     provider = embedding_provider or resolve_embedding_provider()
     dimensions = provider.dims
     if dimensions is None:
-        dimensions = len(provider.embed([""])[0])
+        dimensions = len(provider.embed([""], role="document")[0])
     vector_table = vector_table_name(provider, dimensions)
     with index_connection(index_path) as conn:
         load_sqlite_vec(conn)
@@ -408,7 +434,10 @@ def index_missing_embeddings(
         if not rows:
             conn.commit()
             return indexed
-        embeddings = provider.embed([str(row["text"] or "") for row in rows])
+        embeddings = provider.embed(
+            [str(row["text"] or "") for row in rows],
+            role="document",
+        )
         for row, embedding in zip(rows, embeddings, strict=True):
             chunk_id = int(row["id"])
             conn.execute(
@@ -467,9 +496,29 @@ def ensure_embedding_metadata_columns(conn: sqlite3.Connection) -> None:
 
 
 def vector_table_name(provider: EmbeddingProvider, dimensions: int) -> str:
-    model_key = f"{provider.name}:{provider.model}:{dimensions}"
+    model_key = dumps_embedding_configuration(provider, dimensions)
     digest = hashlib.sha256(model_key.encode()).hexdigest()[:VECTOR_TABLE_HASH_LENGTH]
     return assert_safe_identifier(f"chunk_embeddings_vec_{dimensions}_{digest}")
+
+
+def dumps_embedding_configuration(provider: EmbeddingProvider, dimensions: int) -> str:
+    query_instruction = getattr(provider, "effective_query_instruction", None)
+    document_instruction = getattr(provider, "document_instruction", None)
+    model_digest = getattr(provider, "model_digest", None)
+    if query_instruction is None and document_instruction is None and model_digest is None:
+        return f"{provider.name}:{provider.model}:{dimensions}"
+    return json.dumps(
+        {
+            "provider": provider.name,
+            "model": provider.model,
+            "model_digest": model_digest,
+            "dimensions": dimensions,
+            "query_instruction": query_instruction,
+            "document_instruction": document_instruction,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def assert_safe_identifier(value: str) -> str:
@@ -598,6 +647,15 @@ def ollama_embed_endpoint(base_url: str) -> str:
         message = "Ollama URL must be an http(s) URL."
         raise RuntimeError(message)
     return f"{base_url.rstrip('/')}/api/embed"
+
+
+def apply_embedding_instruction(text: str, instruction: str | None) -> str:
+    if instruction is None:
+        return text
+    if "{text}" not in instruction:
+        message = "Embedding instruction must contain a {text} placeholder."
+        raise ValueError(message)
+    return instruction.replace("{text}", text)
 
 
 def parse_embedding(values: object) -> list[float]:

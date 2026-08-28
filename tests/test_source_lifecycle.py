@@ -17,6 +17,7 @@ from meetily_memory.refresh_lock import RefreshLock
 from meetily_memory.repositories.meetings import MeetingsRepository
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.structure_analyzer import StructureAnalyzer
 from meetily_memory.tagging import TagService
 
 
@@ -99,6 +100,7 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
         env=env,
     )
     assert init.exit_code == 0
+    StructureAnalyzer(IndexRepository(index_path)).analyze_all()
     before = MeetilyMemoryCore(index_path)
     evidence_id = before.search("migration risks", limit=1).results[0].evidence[0].id
     task = before.structured_entities("action_items").entities[0]
