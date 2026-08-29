@@ -85,10 +85,19 @@ class MeetilyMemoryCore:
         retrieval_strategy: RetrievalStrategy | None = None,
         meeting_retrieval_strategy: MeetingRetrievalStrategy | None = None,
     ) -> None:
-        repository = IndexRepository(Path(index_path), state_path=state_path)
+        self._index_path = Path(index_path)
+        self._state_path = (
+            Path(state_path)
+            if state_path is not None
+            else self._index_path.with_name("state.sqlite")
+        )
+        repository = IndexRepository.open_existing(
+            self._index_path,
+            state_path=self._state_path,
+        )
         self._repository = repository
         lexical = retrieval_strategy or LexicalRetrievalStrategy(repository)
-        tag_repository = TagRepository(repository.state_path)
+        tag_repository = TagRepository.open_existing(repository.state_path)
         tag_retrieval = TagRetrievalStrategy(tag_repository)
         self._meeting_retrieval = meeting_retrieval_strategy or LexicalTagMeetingRetrievalStrategy(
             repository=repository,
@@ -193,7 +202,8 @@ class MeetilyMemoryCore:
         return person_memory(self._repository, name, limit)
 
     def topic(self, query: str, limit: int = 10) -> TopicMemory:
-        payload = self._repository.topic_memory(query, limit)
+        # Topic reads still materialize derived knowledge until task 09 removes that debt.
+        payload = self._writer_repository().topic_memory(query, limit)
         return TopicMemory(
             topic=topic_from_row(payload["topic"]),
             language=optional_str(payload.get("language")),
@@ -210,14 +220,15 @@ class MeetilyMemoryCore:
         return tuple(topic_from_row(row) for row in self._repository.list_topics(limit))
 
     def add_topic_alias(self, query: str, aliases: list[str]) -> TopicAliasResult:
-        payload = self._repository.ensure_topic(query, aliases=aliases)
+        payload = self._writer_repository().ensure_topic(query, aliases=aliases)
         return TopicAliasResult(
             topic=topic_from_row(payload),
             added_aliases=tuple(str(alias) for alias in payload["added_aliases"]),
         )
 
     def graph(self, query: str, limit: int = 50) -> TopicGraph:
-        payload = self._repository.graph_for_topic(query, limit)
+        # Graph lookup shares the task-09 topic materialization path for now.
+        payload = self._writer_repository().graph_for_topic(query, limit)
         return TopicGraph(
             topic=topic_from_row(payload["topic"]),
             nodes=tuple(graph_node_from_row(row) for row in payload["nodes"]),
@@ -247,7 +258,7 @@ class MeetilyMemoryCore:
         note: str | None = None,
     ) -> TaskStatusResult:
         try:
-            row = self._repository.set_task_status(task_id, status, note=note)
+            row = self._writer_repository().set_task_status(task_id, status, note=note)
         except ValueError as exc:
             if str(exc).startswith("Task not found:"):
                 raise TaskNotFoundError(str(exc)) from exc
@@ -260,6 +271,9 @@ class MeetilyMemoryCore:
             status_source=str(row["status_source"]),
             status_updated_at=str(row["status_updated_at"]),
         )
+
+    def _writer_repository(self) -> IndexRepository:
+        return IndexRepository(self._index_path, state_path=self._state_path)
 
     def _build_context_bundle(
         self,

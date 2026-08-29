@@ -1,7 +1,6 @@
 import hashlib
 import math
 import shutil
-import sqlite3
 import subprocess
 import uuid
 from collections.abc import Iterable
@@ -13,6 +12,7 @@ from time import perf_counter
 from typing import Any, ClassVar
 
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.db.schema import existing_index_connection
 from meetily_memory.domain import MeetingSearchResult, RetrievalSource, SearchHit
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
 from meetily_memory.retrieval import (
@@ -403,7 +403,7 @@ def evaluate_retrieval(
         message = "evaluation limit must be at least 5"
         raise ValueError(message)
     index_path = Path(index_path)
-    repo = IndexRepository(index_path)
+    repo = IndexRepository.open_existing(index_path)
     retrieval_config = config or EvaluationRetrievalConfig()
     cold_start_latency_ms = None
     if retrieval_config.warmup and dataset.tasks:
@@ -713,7 +713,7 @@ def build_manifest(
     root = config.repository_root or Path.cwd()
     commit = git_output(root, "rev-parse", "HEAD") or "unknown"
     dirty = bool(git_output(root, "status", "--porcelain"))
-    with sqlite3.connect(index_path) as conn:
+    with existing_index_connection(index_path) as conn:
         schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     return EvaluationManifest(
         run_id=str(uuid.uuid4()),
@@ -725,7 +725,9 @@ def build_manifest(
         index_schema_version=schema_version,
         retrieval_mode=config.mode,
         retrieval_parameters=retrieval_parameters,
-        tag_state_fingerprint=tag_state_fingerprint(IndexRepository(index_path).state_path),
+        tag_state_fingerprint=tag_state_fingerprint(
+            IndexRepository.open_existing(index_path).state_path
+        ),
         semantic_provider=config.semantic_provider,
         semantic_model=config.semantic_model,
         semantic_dimension=config.semantic_dimension,
@@ -740,7 +742,7 @@ def build_manifest(
 
 
 def corpus_fingerprint(index_path: Path) -> str:
-    with sqlite3.connect(index_path) as conn:
+    with existing_index_connection(index_path) as conn:
         rows = conn.execute(
             """
             SELECT s.kind, s.path, m.external_id, m.fingerprint, c.external_id,
@@ -755,7 +757,7 @@ def corpus_fingerprint(index_path: Path) -> str:
 
 
 def tag_state_fingerprint(state_path: Path) -> str:
-    assignments = TagRepository(state_path).list_assignments()
+    assignments = TagRepository.open_existing(state_path).list_assignments()
     return sha256_payload(
         [
             [

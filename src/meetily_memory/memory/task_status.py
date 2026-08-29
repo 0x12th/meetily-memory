@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from meetily_memory.db.schema import index_connection
+from meetily_memory.db.schema import IndexConnectionFactory
 from meetily_memory.user_state import UserStateRepository, task_identity
 
 ValidateTaskStatus = Callable[[str], None]
@@ -13,6 +13,7 @@ NowProvider = Callable[[], str]
 @dataclass(frozen=True)
 class TaskStatusContext:
     index_path: Path
+    connection: IndexConnectionFactory
     user_state: UserStateRepository
     validate_status: ValidateTaskStatus
     now: NowProvider
@@ -32,7 +33,7 @@ class TaskStatusRepository:
     ) -> dict[str, Any]:
         self.context.validate_status(status)
         now = now or self.context.now()
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             task = conn.execute(
                 """
                 SELECT e.*, m.external_id AS meeting_external_id,

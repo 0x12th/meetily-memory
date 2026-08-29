@@ -70,6 +70,7 @@ class SearchHit:
     id: str
     meeting: Meeting
     excerpt: SourceExcerpt
+    source_chunk_id: int
     is_context: bool = False
 
 

@@ -70,6 +70,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=5)
     args = parser.parse_args()
 
+    source_repository = IndexRepository.open_existing(args.index)
+    TagRepository.open_existing(source_repository.state_path)
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset = load_dataset(args.dataset)
@@ -112,12 +114,12 @@ def main() -> None:
             raise RuntimeError(message)
         semantic_size = max(0, candidate_path.stat().st_size - lexical_index_size)
 
-        repository = IndexRepository(candidate_path)
+        repository = IndexRepository.open_existing(candidate_path)
         strategy = HybridRetrievalStrategy(
             repository=repository,
             lexical=LexicalRetrievalStrategy(repository),
             semantic=SemanticRetrievalStrategy(repository, provider),
-            tags=TagRetrievalStrategy(TagRepository(repository.state_path)),
+            tags=TagRetrievalStrategy(TagRepository.open_existing(repository.state_path)),
             semantic_provider=provider,
         )
         report = evaluate_retrieval(

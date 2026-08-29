@@ -1,6 +1,9 @@
 import importlib
 import importlib.util
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,6 +13,7 @@ from typer.testing import CliRunner
 from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.db.schema import existing_index_connection
 from meetily_memory.domain import MeetingSearchFilters, RetrievalSource
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import (
@@ -147,6 +151,84 @@ def test_tag_service_validates_batch_and_persists_assignments(
     with pytest.raises(ValueError, match="Meetings not found: 999"):
         service.assign(("1", "999"), ("не записывать",))
     assert service.repository.search("не записывать") == ()
+
+
+def test_tag_list_and_suggest_hydrate_assignments_with_bounded_queries(
+    meetily_db: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    state_path = tmp_path / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    writer = TagService(IndexRepository(index_path, state_path=state_path))
+    writer.assign(("2",), tuple(f"batch-only-tag-{index}" for index in range(16)))
+    service = TagService(IndexRepository.open_existing(index_path, state_path=state_path))
+    counts = {
+        "index_connections": 0,
+        "index_queries": 0,
+        "state_connections": 0,
+        "state_queries": 0,
+    }
+
+    @contextmanager
+    def counted_index_connection(path: Path) -> Generator[sqlite3.Connection, None, None]:
+        counts["index_connections"] += 1
+        with existing_index_connection(path) as conn:
+
+            def trace(statement: str) -> None:
+                if statement.lstrip().upper().startswith(("SELECT", "WITH")):
+                    counts["index_queries"] += 1
+
+            conn.set_trace_callback(trace)
+            yield conn
+
+    original_state_connection = service.repository._connect  # noqa: SLF001
+
+    @contextmanager
+    def counted_state_connection() -> Generator[sqlite3.Connection, None, None]:
+        counts["state_connections"] += 1
+        with original_state_connection() as conn:
+
+            def trace(statement: str) -> None:
+                if statement.lstrip().upper().startswith(("SELECT", "WITH")):
+                    counts["state_queries"] += 1
+
+            conn.set_trace_callback(trace)
+            yield conn
+
+    monkeypatch.setattr(
+        service.index_repository.meetings,
+        "context",
+        replace(
+            service.index_repository.meetings.context,
+            connection=counted_index_connection,
+        ),
+    )
+    monkeypatch.setattr(service.index_repository, "connection", counted_index_connection)
+    monkeypatch.setattr(service.repository, "_connect", counted_state_connection)
+
+    assert len(service.list_all()) == 16
+    assert counts == {
+        "index_connections": 1,
+        "index_queries": 1,
+        "state_connections": 1,
+        "state_queries": 1,
+    }
+
+    counts.update(
+        index_connections=0,
+        index_queries=0,
+        state_connections=0,
+        state_queries=0,
+    )
+    assert service.suggest("1") == ()
+    assert counts == {
+        "index_connections": 5,
+        "index_queries": 5,
+        "state_connections": 2,
+        "state_queries": 2,
+    }
 
 
 def test_manual_tags_survive_disposable_index_rebuild(

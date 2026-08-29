@@ -11,7 +11,11 @@ from typer.testing import CliRunner
 
 from meetily_memory import diagnostics
 from meetily_memory.cli.app import app
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION, MIGRATIONS
+from meetily_memory.db.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    LATEST_IN_PLACE_SCHEMA_VERSION,
+    MIGRATIONS,
+)
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.tagging import TagRepository
 from meetily_memory.user_state import CURRENT_USER_STATE_SCHEMA_VERSION
@@ -174,7 +178,7 @@ def test_doctor_and_status_preserve_files_and_observe_running_scan(
     assert not (data_dir / "refresh.lock").exists()
 
 
-@pytest.mark.parametrize("legacy_version", [1, CURRENT_SCHEMA_VERSION - 1])
+@pytest.mark.parametrize("legacy_version", [1, LATEST_IN_PLACE_SCHEMA_VERSION])
 def test_db_status_reports_legacy_schema_without_upgrading(
     tmp_path: Path,
     legacy_version: int,
@@ -680,7 +684,7 @@ def test_doctor_reports_valid_legacy_index_without_upgrading(tmp_path: Path) -> 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     index_path = data_dir / "index.sqlite"
-    legacy_version = CURRENT_SCHEMA_VERSION - 1
+    legacy_version = LATEST_IN_PLACE_SCHEMA_VERSION
     with sqlite3.connect(index_path) as conn:
         for version in range(1, legacy_version + 1):
             MIGRATIONS[version](conn)
@@ -788,7 +792,7 @@ def test_doctor_rejects_malformed_columns_in_supported_legacy_index(tmp_path: Pa
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     index_path = data_dir / "index.sqlite"
-    legacy_version = CURRENT_SCHEMA_VERSION - 1
+    legacy_version = LATEST_IN_PLACE_SCHEMA_VERSION
     with sqlite3.connect(index_path) as conn:
         for version in range(1, legacy_version + 1):
             MIGRATIONS[version](conn)

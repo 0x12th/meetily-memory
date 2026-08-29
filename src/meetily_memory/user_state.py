@@ -1,9 +1,10 @@
 import hashlib
 import sqlite3
 import uuid
-from collections.abc import Callable
-from contextlib import closing
+from collections.abc import Callable, Generator, Iterable
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from meetily_memory.db.migrations import (
     read_index_generation_marker,
 )
 from meetily_memory.db.rows import rows_to_dicts
+from meetily_memory.db.schema import IndexReadError, missing_user_state_message
 
 USER_STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -224,6 +226,7 @@ LEGACY_INDEX_SCHEMA_VERSION = 3
 DUPLICATE_LEGACY_IDENTITY_REASON = "duplicate legacy strict identity"
 LEGACY_STATE_CONFLICT_REASON = "legacy status conflicts with persistent state"
 MISSING_STATE_SOURCE_REASON = "legacy source identity is absent from persistent state"
+TASK_STATE_READ_BATCH_SIZE = 100
 
 
 class AmbiguousSourceIdentityError(RuntimeError):
@@ -316,11 +319,22 @@ class LegacyMigrationOutcome:
 
 
 class UserStateRepository:
-    def __init__(self, state_path: Path) -> None:
+    def __init__(self, state_path: Path, *, _read_only: bool = False) -> None:
         self.state_path = Path(state_path)
+        self.read_only = _read_only
+        if self.read_only:
+            if not self.state_path.is_file():
+                raise IndexReadError(missing_user_state_message(self.state_path))
+            with self._connect() as conn:
+                validate_existing_user_state_schema(conn)
+            return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             ensure_user_state_schema(conn)
+
+    @classmethod
+    def open_existing(cls, state_path: Path) -> "UserStateRepository":
+        return cls(state_path, _read_only=True)
 
     def get_or_create_source(self, kind: str, path: str, *, now: str) -> str:
         with self._connect() as conn:
@@ -1110,27 +1124,58 @@ class UserStateRepository:
             conn.commit()
 
     def get_task_state(self, identity: TaskIdentity) -> dict[str, Any] | None:
+        return self.get_task_states((identity,)).get(identity)
+
+    def get_task_states(
+        self,
+        identities: Iterable[TaskIdentity],
+    ) -> dict[TaskIdentity, dict[str, Any]]:
+        unique_identities = tuple(dict.fromkeys(identities))
+        if not unique_identities:
+            return {}
+        states: dict[TaskIdentity, dict[str, Any]] = {}
         with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT status, note, source, updated_at
-                FROM task_states
-                WHERE source_uuid = ?
-                  AND meeting_external_id = ?
-                  AND chunk_external_id = ?
-                  AND entity_kind = ?
-                  AND content_fingerprint = ?
-                  AND orphaned = 0
-                """,
-                (
-                    identity.source_uuid,
-                    identity.meeting_external_id,
-                    identity.chunk_external_id,
-                    identity.entity_kind,
-                    identity.content_fingerprint,
-                ),
-            ).fetchone()
-            return dict(row) if row else None
+            for identity_batch in batched(unique_identities, TASK_STATE_READ_BATCH_SIZE):
+                placeholders = ", ".join("(?, ?, ?, ?, ?)" for _ in identity_batch)
+                params = tuple(
+                    value
+                    for identity in identity_batch
+                    for value in (
+                        identity.source_uuid,
+                        identity.meeting_external_id,
+                        identity.chunk_external_id,
+                        identity.entity_kind,
+                        identity.content_fingerprint,
+                    )
+                )
+                sql = f"""
+                    SELECT
+                      source_uuid, meeting_external_id, chunk_external_id,
+                      entity_kind, content_fingerprint,
+                      status, note, source, updated_at
+                    FROM task_states
+                    WHERE (
+                      source_uuid, meeting_external_id, chunk_external_id,
+                      entity_kind, content_fingerprint
+                    ) IN (VALUES {placeholders})
+                      AND orphaned = 0
+                    """  # noqa: S608
+                rows = conn.execute(sql, params).fetchall()
+                for row in rows:
+                    identity = TaskIdentity(
+                        source_uuid=str(row["source_uuid"]),
+                        meeting_external_id=str(row["meeting_external_id"]),
+                        chunk_external_id=str(row["chunk_external_id"]),
+                        entity_kind=str(row["entity_kind"]),
+                        content_fingerprint=str(row["content_fingerprint"]),
+                    )
+                    states[identity] = {
+                        "status": str(row["status"]),
+                        "note": row["note"],
+                        "source": str(row["source"]),
+                        "updated_at": str(row["updated_at"]),
+                    }
+        return states
 
     def migrate_legacy_index_state(
         self,
@@ -1233,11 +1278,19 @@ class UserStateRepository:
                 conn.execute("SELECT * FROM task_states WHERE orphaned = 1 ORDER BY id")
             )
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.state_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
+        if self.read_only:
+            physical_path = self.state_path.resolve(strict=True)
+            connection = sqlite3.connect(f"{physical_path.as_uri()}?mode=ro", uri=True)
+        else:
+            connection = sqlite3.connect(self.state_path)
+        with closing(connection) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            if self.read_only:
+                conn.execute("PRAGMA query_only=ON")
+            yield conn
 
 
 def recover_and_validate_index(index_path: Path) -> int | None:
@@ -1857,6 +1910,23 @@ def task_identity(
 def content_fingerprint(text: str) -> str:
     normalized = " ".join(text.casefold().split())
     return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def validate_existing_user_state_schema(conn: sqlite3.Connection) -> None:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version != CURRENT_USER_STATE_SCHEMA_VERSION:
+        if version > CURRENT_USER_STATE_SCHEMA_VERSION:
+            message = (
+                f"User-state schema {version} is newer than supported schema "
+                f"{CURRENT_USER_STATE_SCHEMA_VERSION}. Update Meetily Memory before reading it."
+            )
+        else:
+            message = (
+                f"User-state schema {version} is outdated; schema "
+                f"{CURRENT_USER_STATE_SCHEMA_VERSION} is required. "
+                "Run `mm refresh` or `mm scan --source PATH` to migrate writer-owned state."
+            )
+        raise IndexReadError(message)
 
 
 def ensure_user_state_schema(conn: sqlite3.Connection) -> None:

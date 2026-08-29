@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from meetily_memory.db.schema import IndexReadError, missing_user_state_message
 from meetily_memory.domain import MeetingRef
-from meetily_memory.user_state import ensure_user_state_schema
+from meetily_memory.user_state import (
+    ensure_user_state_schema,
+    validate_existing_user_state_schema,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator, Iterator
 
     from meetily_memory.repositories.index import IndexRepository
     from meetily_memory.semantic_search import EmbeddingProvider
@@ -18,6 +24,7 @@ if TYPE_CHECKING:
 TAG_SUGGESTION_LIMIT = 5
 SEMANTIC_SUGGESTION_CANDIDATES = 50
 SEMANTIC_SUGGESTION_QUERY_LENGTH = 8_000
+TAG_READ_BATCH_SIZE = 200
 
 
 @dataclass(frozen=True)
@@ -74,11 +81,22 @@ class TagSuggestion:
 
 
 class TagRepository:
-    def __init__(self, state_path: Path) -> None:
+    def __init__(self, state_path: Path, *, _read_only: bool = False) -> None:
         self.state_path = Path(state_path)
+        self.read_only = _read_only
+        if self.read_only:
+            if not self.state_path.is_file():
+                raise IndexReadError(missing_user_state_message(self.state_path))
+            with self._connect() as conn:
+                validate_existing_user_state_schema(conn)
+            return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             ensure_user_state_schema(conn)
+
+    @classmethod
+    def open_existing(cls, state_path: Path) -> TagRepository:
+        return cls(state_path, _read_only=True)
 
     def assign(
         self,
@@ -244,6 +262,43 @@ class TagRepository:
             ).fetchall()
         return tuple(Tag(str(row["normalized_name"]), str(row["display_name"])) for row in rows)
 
+    def list_for_meetings(self, refs: tuple[MeetingRef, ...]) -> dict[MeetingRef, tuple[Tag, ...]]:
+        unique_refs = tuple(dict.fromkeys(refs))
+        tags_by_ref: dict[MeetingRef, list[Tag]] = {ref: [] for ref in unique_refs}
+        if not unique_refs:
+            return {}
+        with self._connect() as conn:
+            for ref_batch in batched(unique_refs, TAG_READ_BATCH_SIZE):
+                values_sql = ", ".join("(?, ?, ?)" for _ in ref_batch)
+                params = tuple(
+                    value
+                    for request_order, ref in enumerate(ref_batch)
+                    for value in (request_order, ref.source_uuid, ref.external_id)
+                )
+                sql = f"""
+                    WITH requested(request_order, source_uuid, external_id) AS (
+                      VALUES {values_sql}
+                    )
+                    SELECT
+                      requested.source_uuid,
+                      requested.external_id,
+                      t.normalized_name,
+                      t.display_name
+                    FROM requested
+                    JOIN meeting_tags mt
+                      ON mt.source_uuid = requested.source_uuid
+                     AND mt.meeting_external_id = requested.external_id
+                    JOIN tags t ON t.id = mt.tag_id
+                    ORDER BY requested.request_order, t.id
+                    """  # noqa: S608
+                rows = conn.execute(sql, params).fetchall()
+                for row in rows:
+                    ref = MeetingRef(str(row["source_uuid"]), str(row["external_id"]))
+                    tags_by_ref[ref].append(
+                        Tag(str(row["normalized_name"]), str(row["display_name"]))
+                    )
+        return {ref: tuple(tags) for ref, tags in tags_by_ref.items()}
+
     def search(self, query: str) -> tuple[TagMatch, ...]:
         normalized_query = normalize_tag_name(query)
         if not normalized_query:
@@ -319,11 +374,19 @@ class TagRepository:
             for row in rows
         )
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.state_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+    @contextmanager
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
+        if self.read_only:
+            physical_path = self.state_path.resolve(strict=True)
+            connection = sqlite3.connect(f"{physical_path.as_uri()}?mode=ro", uri=True)
+        else:
+            connection = sqlite3.connect(self.state_path)
+        with closing(connection) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            if self.read_only:
+                conn.execute("PRAGMA query_only=ON")
+            yield conn
 
 
 def normalize_tag_name(value: str) -> str:
@@ -349,7 +412,11 @@ def normalize_tags(values: tuple[str, ...]) -> tuple[Tag, ...]:
 class TagService:
     def __init__(self, index_repository: IndexRepository) -> None:
         self.index_repository = index_repository
-        self.repository = TagRepository(index_repository.state_path)
+        self.repository = (
+            TagRepository.open_existing(index_repository.state_path)
+            if index_repository.read_only
+            else TagRepository(index_repository.state_path)
+        )
 
     def assign(
         self,
@@ -381,9 +448,11 @@ class TagService:
         )
 
     def list_all(self) -> tuple[TagCount, ...]:
+        assignments = self.repository.list_assignments()
+        active_refs = self._active_assignment_refs(assignments)
         counts: dict[Tag, int] = {}
-        for assignment in self.repository.list_assignments():
-            if not self._assignment_is_active(assignment):
+        for assignment in assignments:
+            if assignment.identity not in active_refs:
                 continue
             counts[assignment.tag] = counts.get(assignment.tag, 0) + 1
         return tuple(
@@ -391,10 +460,9 @@ class TagService:
         )
 
     def orphaned_assignment_count(self) -> int:
-        return sum(
-            not self._assignment_is_active(assignment)
-            for assignment in self.repository.list_assignments()
-        )
+        assignments = self.repository.list_assignments()
+        active_refs = self._active_assignment_refs(assignments)
+        return sum(assignment.identity not in active_refs for assignment in assignments)
 
     def suggest(
         self,
@@ -448,6 +516,7 @@ class TagService:
             identity,
             f"{title}\n{text}",
             embedding_provider,
+            assigned,
         )
 
     def _append_text_suggestions(
@@ -469,6 +538,7 @@ class TagService:
         identity: MeetingRef,
         document: str,
         provider: EmbeddingProvider,
+        assigned: set[str],
     ) -> tuple[TagSuggestion, ...]:
         from meetily_memory.semantic_search import semantic_index_coverage  # noqa: PLC0415
 
@@ -485,13 +555,6 @@ class TagService:
         if source is None:
             return tuple(suggestions)
         similar_meeting_id, tags = source
-        assigned = {
-            tag.normalized_name
-            for tag in self.repository.list_for_meeting(
-                identity.source_uuid,
-                identity.meeting_external_id,
-            )
-        }
         suggested = {item.tag.normalized_name for item in suggestions}
         for tag in tags:
             if len(suggestions) >= TAG_SUGGESTION_LIMIT:
@@ -518,20 +581,22 @@ class TagService:
         try:
             batches = self._semantic_candidate_batches(document, provider)
             for rows in batches:
-                for row in rows:
-                    hit = self.index_repository.search_hit_from_row(row)
-                    candidate_ref = self.index_repository.source_identity_for_meeting(
-                        hit.meeting.id
+                hits = tuple(
+                    self.index_repository.search_hit_from_row(row)
+                    for row in rows
+                    if MeetingRef(
+                        source_uuid=str(row["source_uuid"]),
+                        external_id=str(row["meeting_external_id"]),
                     )
-                    if candidate_ref == target_ref:
-                        continue
-                    tags = self.repository.list_for_meeting(
-                        candidate_ref.source_uuid,
-                        candidate_ref.external_id,
-                    )
-                    resolved = self.index_repository.meeting_by_ref(candidate_ref)
-                    if tags and resolved is not None:
-                        return resolved[0], tags
+                    != target_ref
+                )
+                tags_by_ref = self.repository.list_for_meetings(
+                    tuple(dict.fromkeys(hit.meeting.ref for hit in hits))
+                )
+                for hit in hits:
+                    tags = tags_by_ref.get(hit.meeting.ref, ())
+                    if tags:
+                        return hit.meeting.id, tags
         except (RuntimeError, sqlite3.Error):
             return None
         return None
@@ -556,8 +621,12 @@ class TagService:
                 return
             candidate_limit *= 2
 
-    def _assignment_is_active(self, assignment: TagAssignment) -> bool:
-        return self.index_repository.get_meeting_by_ref(assignment.identity) is not None
+    def _active_assignment_refs(
+        self,
+        assignments: tuple[TagAssignment, ...],
+    ) -> frozenset[MeetingRef]:
+        refs = tuple(dict.fromkeys(assignment.identity for assignment in assignments))
+        return frozenset(self.index_repository.get_meetings_by_refs(refs))
 
     def _resolve_meetings(
         self,
@@ -566,19 +635,28 @@ class TagService:
         if not meeting_ids:
             message = "No meeting IDs provided."
             raise ValueError(message)
-        resolved: list[MeetingRef] = []
+        parsed: list[tuple[str, int]] = []
         missing: list[str] = []
         for meeting_id in meeting_ids:
             try:
-                local_id = int(meeting_id)
+                parsed.append((meeting_id, int(meeting_id)))
             except ValueError:
                 missing.append(meeting_id)
-                continue
-            identity = self.index_repository.meeting_ref_for_local_id(local_id)
-            if identity is None:
+        meetings = self.index_repository.get_meetings_by_local_ids(
+            tuple(local_id for _, local_id in parsed)
+        )
+        resolved: list[MeetingRef] = []
+        for meeting_id, local_id in parsed:
+            meeting = meetings.get(local_id)
+            if meeting is None:
                 missing.append(meeting_id)
                 continue
-            resolved.append(identity)
+            resolved.append(
+                MeetingRef(
+                    source_uuid=str(meeting["source_uuid"]),
+                    external_id=str(meeting["external_id"]),
+                )
+            )
         if missing:
             message = f"Meetings not found: {', '.join(missing)}"
             raise ValueError(message)

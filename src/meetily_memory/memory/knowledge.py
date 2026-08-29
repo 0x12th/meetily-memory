@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from meetily_memory.db.rows import rows_to_dicts
-from meetily_memory.db.schema import index_connection
+from meetily_memory.db.schema import IndexConnectionFactory
 from meetily_memory.memory.entities import ENTITY_NODE_TYPES, structured_entity_sort_key
 from meetily_memory.memory.keys import (
     entity_stable_key,
@@ -27,6 +27,7 @@ NowProvider = Callable[[], str]
 @dataclass(frozen=True)
 class KnowledgeContext:
     index_path: Path
+    connection: IndexConnectionFactory
     search_meetings: SearchMeetings
     chunk_rows: ChunkRows
     meeting_people_rows: PeopleRows
@@ -313,7 +314,7 @@ class KnowledgeRepository:
         now = self.context.now()
         topic = self.context.user_state.topic_for_query(title)
         if topic is None:
-            with index_connection(self.context.index_path) as conn:
+            with self.context.connection(self.context.index_path) as conn:
                 row = conn.execute(
                     """
                     SELECT *
@@ -340,7 +341,7 @@ class KnowledgeRepository:
             now=now,
         )
         self.project_topic_aliases()
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             topic_row = conn.execute(
                 """
                 SELECT id
@@ -373,7 +374,7 @@ class KnowledgeRepository:
 
     def project_topic_aliases(self) -> None:
         aliases = self.context.user_state.list_topic_aliases()
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             for alias in aliases:
                 conn.execute(
@@ -441,7 +442,7 @@ class KnowledgeRepository:
         topic = self.ensure_topic(title)
         topic_terms = [str(topic["title"]), *(str(alias) for alias in topic["aliases"])]
         evidence = search_topic_evidence(self.context.search_meetings, topic_terms, limit)
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             rows = self.list_topic_entity_details(conn, int(topic["id"]), limit)
             related_people = self.list_topic_people(conn, int(topic["id"]), limit)
         language = dominant_language(
@@ -461,7 +462,7 @@ class KnowledgeRepository:
         }
 
     def list_topics(self, limit: int = 100) -> list[dict[str, Any]]:
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             rows = conn.execute(
                 """
                 SELECT *
@@ -477,7 +478,7 @@ class KnowledgeRepository:
     def graph_for_topic(self, title: str, limit: int = 50) -> dict[str, Any]:
         topic = self.ensure_topic(title)
         topic_id = int(topic["id"])
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             linked_entity_rows = conn.execute(
                 """
                 SELECT from_node_id

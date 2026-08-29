@@ -2,7 +2,11 @@ from typing import Annotated
 
 import typer
 
-from meetily_memory.cli.common import make_typer, print_text_block
+from meetily_memory.cli.common import (
+    make_typer,
+    print_text_block,
+    read_repository_from_context,
+)
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.tagging import TagMutationResult, TagService
 
@@ -51,7 +55,7 @@ def list_tags(
     ctx: typer.Context,
     meeting_id: Annotated[str | None, typer.Argument()] = None,
 ) -> None:
-    service = TagService(IndexRepository(ctx.obj["index_path"]))
+    service = TagService(read_repository_from_context(ctx))
     if meeting_id is not None:
         try:
             tags = service.list_for_meeting(meeting_id)
@@ -70,7 +74,7 @@ def suggest_tags(
     ctx: typer.Context,
     meeting_id: Annotated[str, typer.Argument()],
 ) -> None:
-    service = TagService(IndexRepository(ctx.obj["index_path"]))
+    service = TagService(read_repository_from_context(ctx))
     try:
         suggestions = service.suggest(meeting_id)
     except ValueError as exc:

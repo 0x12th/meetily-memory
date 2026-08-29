@@ -276,6 +276,110 @@ def test_evaluation_records_cold_start_before_warm_latency_measurements(
     assert report.manifest.retrieval_parameters["warmed_up"] is True
 
 
+def test_hybrid_evaluation_scripts_do_not_create_missing_index_or_state(tmp_path: Path) -> None:
+    dataset = "tests/fixtures/evaluation/synthetic_dataset.json"
+    retrieval_index = tmp_path / "missing-retrieval" / "index.sqlite"
+    retrieval_output = tmp_path / "retrieval.json"
+    retrieval = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/evaluate-retrieval.py",
+            dataset,
+            "--index",
+            str(retrieval_index),
+            "--output",
+            str(retrieval_output),
+            "--retrieval",
+            "hybrid",
+            "--embedding-provider",
+            "hash",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    semantic_index = tmp_path / "missing-semantic" / "index.sqlite"
+    semantic_output = tmp_path / "semantic-output"
+    semantic = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "scripts/evaluate-semantic-search.py",
+            dataset,
+            "--index",
+            str(semantic_index),
+            "--output-dir",
+            str(semantic_output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert retrieval.returncode != 0
+    assert "index not found" in retrieval.stderr
+    assert semantic.returncode != 0
+    assert "index not found" in semantic.stderr
+    assert not retrieval_index.parent.exists()
+    assert not semantic_index.parent.exists()
+    assert not retrieval_output.exists()
+    assert not semantic_output.exists()
+
+
+def test_hybrid_evaluation_scripts_report_authoritative_state_recovery(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    dataset = "tests/fixtures/evaluation/synthetic_dataset.json"
+    index_path = tmp_path / "current" / "index.sqlite"
+    state_path = index_path.with_name("state.sqlite")
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    state_path.unlink()
+    before = (index_path.read_bytes(), index_path.stat().st_mtime_ns)
+    retrieval_output = tmp_path / "retrieval.json"
+    semantic_output = tmp_path / "semantic-output"
+    commands = (
+        [
+            sys.executable,
+            "scripts/evaluate-retrieval.py",
+            dataset,
+            "--index",
+            str(index_path),
+            "--output",
+            str(retrieval_output),
+            "--retrieval",
+            "hybrid",
+            "--embedding-provider",
+            "hash",
+        ],
+        [
+            sys.executable,
+            "scripts/evaluate-semantic-search.py",
+            dataset,
+            "--index",
+            str(index_path),
+            "--output-dir",
+            str(semantic_output),
+        ],
+    )
+
+    for command in commands:
+        result = subprocess.run(  # noqa: S603
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "Restore the authoritative `state.sqlite`" in result.stderr
+        assert "`mm refresh` alone cannot recover" in result.stderr
+        assert "Manual tags, task statuses, and task notes cannot be recovered" in result.stderr
+
+    assert not state_path.exists()
+    assert (index_path.read_bytes(), index_path.stat().st_mtime_ns) == before
+    assert not retrieval_output.exists()
+    assert not semantic_output.exists()
+
+
 @requires_sqlite_vec
 def test_evaluation_script_runs_explicit_hybrid_mode(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"

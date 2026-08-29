@@ -41,15 +41,16 @@ selected source in settings. Refresh/rebuild, ordinary source selection, and reb
 interprocess `refresh.lock`. Unknown UUIDs and targets owned by another UUID are rejected from state
 before the index is opened. A valid rebind first completes any legacy v3 task-state transfer and the
 safe in-place upgrade through v5, then claims path ownership with a monotonic pending revision.
-State retains the last confirmed projected path until the v5/v6 projection succeeds, settings are
-written, and that exact revision is finalized. A failed step first persists a fresh reverse pending
+State retains the last confirmed projected path until the v5/v6/v7 projection succeeds, settings
+are written, and that exact revision is finalized. A failed step first persists a fresh reverse pending
 claim (`current_path=old`, `projected_path=actual new`), then rolls back the index under that token,
 and only then clears pending state. Settings are never restored by comparing UUID/path values alone,
 so an older failure cannot undo a newer same-target selection; an incomplete rollback reports an
 explicit recovery error. After process death at any point around the forward or reverse
 claim/projection, a refresh or repeated same-target `--rebind` uses the persisted paths to repair
-legacy or v6 index paths before clearing pending metadata. A current v6 open checks every pending source,
-including secondary sources, and finalizes all verified claims in one state transaction.
+legacy or source-aware index paths before clearing pending metadata. A current v7 writer open checks
+every pending source, including secondary sources, and finalizes all verified claims in one state
+transaction.
 
 Read-only local diagnostics pin the physical `index.sqlite` and `state.sqlite` targets as one pair at
 the start of each snapshot. A shared logical parent is resolved once, then both child/file targets
@@ -66,7 +67,14 @@ tag assignments are unavailable unless both index and user-state schemas are cur
 `mm s QUERY` returns one ranked result per meeting. Exact tag matches rank first, followed by
 lexical transcript matches and token-level tag matches. Each result includes source evidence
 when available. `--context N` appends adjacent chunks around matching excerpts; the default
-remains `--context 0`.
+remains `--context 0`. Search, context, evidence resolution, open, tag listing, and MCP reads require
+an existing schema-v7 index and state and open both with SQLite `mode=ro`. They never create or
+migrate databases. A missing or legacy disposable index reports that `mm refresh` or
+`mm scan --source PATH` is required. Missing authoritative `state.sqlite` is different: restore it
+from backup. `mm refresh` alone cannot recover the UUID already projected by a current index. For an
+intentional identity reset, first move or remove `index.sqlite`, then run `mm init` or
+`mm scan --source PATH`; manual tags, task statuses, and task notes cannot be recovered without the
+original state database.
 
 Date filters use the meeting timestamp `started_at`, falling back to `created_at`, `updated_at`,
 and then `indexed_at`. `--since Nd` includes meetings from exactly N days ago through now.
@@ -89,10 +97,16 @@ combined; `--to` can be used by itself or as an upper bound.
 | `mm c "what did we decide?" --context 2` | Explicitly adds two neighboring chunks around each lexical match. |
 | `mm t "migration"` | Experimental source-backed topic dossier. It starts from search evidence, labels heuristic matches as possible decisions/tasks/risks/questions, and still shows evidence when structured memory is empty. It is not an LLM answer. |
 
+Context and entity hydration never carry a generation-local chunk ID into another SQLite
+snapshot. Every hit is batch-resolved by stable `evidence_id` inside one explicit read transaction
+that remains open through the final context/entity SELECT, and its `MeetingRef` must still match. A
+missing or mismatched hit fails closed and asks the caller to repeat the search instead of
+substituting whichever chunk currently owns the old integer ID.
+
 `mm t` expands stored topic aliases. Manual aliases are authoritative in `state.sqlite`; the index
 table is only a derived retrieval projection, so aliases survive full index deletion and rebuild.
 Legacy v5 and old unmarked v6 aliases are imported once under a locked, digest-checked snapshot.
-Every current v6 generation has a stable generation marker; fresh and rebuilt generations are
+Every current v7 generation has a stable generation marker; fresh and rebuilt generations are
 registered as state-owned before projection and never import their derived aliases back. Add aliases
 explicitly with repeated `--alias` options, for example:
 
@@ -105,7 +119,10 @@ should come from user aliases, indexed aliases, extracted aliases, or semantic
 retrieval.
 
 `mm c` uses direct lexical matches by default. `--context N` explicitly appends neighboring
-chunks, marks their evidence role, and caps the resulting evidence bundle at 20 excerpts.
+chunks, marks their evidence role, and caps the resulting evidence bundle at 20 excerpts. Evidence
+IDs are materialized during scan with the unchanged stable-ID algorithm; resolving one uses the
+unique `chunks.evidence_id` index. Structured entities for the bundle are selected only for those
+chunk IDs in bounded SQL batches.
 
 ## Offline Semantic Research
 

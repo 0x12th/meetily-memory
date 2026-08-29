@@ -19,10 +19,10 @@ from sqlite_vec import serialize_float32
 
 from meetily_memory.config.paths import app_config_path, semantic_config_path
 from meetily_memory.config.settings import SemanticSettings, load_app_settings, update_app_settings
-from meetily_memory.db.schema import index_connection
+from meetily_memory.db.schema import existing_index_connection, index_connection
 from meetily_memory.domain import MeetingSearchFilters
 from meetily_memory.json_codec import loads_json
-from meetily_memory.repositories.search import meeting_time_predicate
+from meetily_memory.repositories.search import SEARCH_DOMAIN_COLUMNS, meeting_time_predicate
 
 EMBEDDING_DIMENSIONS = 128
 Row = dict[str, object]
@@ -188,9 +188,9 @@ def semantic_search(
     query_embedding = provider.embed([query], role="query")[0]
     dimensions = len(query_embedding)
     vector_table = vector_table_name(provider, dimensions)
-    with index_connection(index_path) as conn:
+    with existing_index_connection(index_path) as conn:
         load_sqlite_vec(conn)
-        ensure_semantic_schema(conn, vector_table, dimensions)
+        require_semantic_schema(conn, vector_table)
         if count_indexed_embeddings(conn, provider, dimensions) == 0:
             message = "Semantic index is empty; build embeddings with the evaluation tooling."
             raise RuntimeError(message)
@@ -210,23 +210,7 @@ def semantic_search(
               ORDER BY distance
             )
             SELECT
-              m.id AS meeting_id,
-              m.external_id AS meeting_external_id,
-              s.source_uuid AS source_uuid,
-              m.title AS title,
-              m.created_at AS created_at,
-              m.updated_at AS updated_at,
-              m.folder_path AS folder_path,
-              m.language AS language,
-              c.id AS chunk_id,
-              c.external_id AS chunk_external_id,
-              c.kind AS kind,
-              c.ordinal AS ordinal,
-              c.text AS text,
-              c.speaker AS speaker,
-              c.starts_at_seconds AS starts_at_seconds,
-              c.ends_at_seconds AS ends_at_seconds,
-              c.timestamp_label AS timestamp_label,
+            {SEARCH_DOMAIN_COLUMNS},
               matches.distance AS distance,
               e.embedding_provider AS embedding_provider,
               e.embedding_model AS embedding_model,
@@ -368,6 +352,19 @@ def load_sqlite_vec(conn: sqlite3.Connection) -> None:
     finally:
         with suppress(AttributeError, sqlite3.Error):
             conn.enable_load_extension(LOAD_EXTENSION_DISABLED)
+
+
+def require_semantic_schema(conn: sqlite3.Connection, vector_table: str) -> None:
+    vector_table = assert_safe_identifier(vector_table)
+    tables = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    }
+    if "chunk_embeddings" not in tables or vector_table not in tables:
+        message = "Semantic index is empty; build embeddings with the evaluation tooling."
+        raise RuntimeError(message)
 
 
 def ensure_semantic_schema(
@@ -553,7 +550,7 @@ def semantic_index_coverage(
     index_path: Path,
     provider: EmbeddingProvider,
 ) -> SemanticIndexCoverage:
-    with index_connection(index_path) as conn:
+    with existing_index_connection(index_path) as conn:
         total_chunks = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         dimensions = indexed_dimensions(conn, provider)
         metadata_exists = conn.execute(

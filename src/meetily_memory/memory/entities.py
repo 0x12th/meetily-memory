@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from meetily_memory.db.schema import index_connection
+from meetily_memory.db.schema import IndexConnectionFactory, index_connection
 from meetily_memory.meeting_structure import ENTITY_KINDS, StructuredEntity, empty_entity_counts
 
 DeleteKnowledge = Callable[[Any, int], None]
@@ -16,6 +16,7 @@ AllEntityDetails = Callable[[Any, int], list[dict[str, Any]]]
 @dataclass(frozen=True)
 class StructuredEntityContext:
     index_path: Path
+    connection: IndexConnectionFactory
     delete_structured_knowledge: DeleteKnowledge
     delete_structured_entities: DeleteStructuredEntities
     sync_meeting_knowledge: SyncKnowledge
@@ -234,7 +235,7 @@ class StructuredEntityRepository:
             kinds = (kind,)
         else:
             kinds = ENTITY_KINDS
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             rows: list[dict[str, Any]] = []
             for entity_kind in kinds:
                 entity_rows = conn.execute(
@@ -253,7 +254,7 @@ class StructuredEntityRepository:
     ) -> list[dict[str, Any]]:
         assert_known_entity_kind(kind)
         assert_known_task_status_filter(status)
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             rows = self.context.list_entity_details(
                 conn,
                 kind,
@@ -264,7 +265,7 @@ class StructuredEntityRepository:
             return rows[:limit]
 
     def list_all_structured_entity_details(self, limit: int = 100) -> list[dict[str, Any]]:
-        with index_connection(self.context.index_path) as conn:
+        with self.context.connection(self.context.index_path) as conn:
             rows = self.context.list_all_entity_details(conn, limit)
             rows.sort(key=structured_entity_sort_key, reverse=True)
             return rows[:limit]

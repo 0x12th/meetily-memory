@@ -33,7 +33,7 @@ def _rebuild_checkpoint(_name: str) -> None:
 
 def previous_index_backup_path(index_path: Path) -> Path:
     path = Path(index_path)
-    return path.with_name(f"{path.name}.pre-v6")
+    return path.with_name(f"{path.name}.pre-v{CURRENT_SCHEMA_VERSION}")
 
 
 @dataclass

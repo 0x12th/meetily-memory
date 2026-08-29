@@ -311,6 +311,10 @@ def _assert_current_v4_rewrite(index_path: Path) -> None:
                 for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
             }
             assert columns["source_chunk_id"] == 1
+            indexes = {
+                str(row[1]) for row in conn.execute(f"PRAGMA index_list({table})").fetchall()
+            }
+            assert f"idx_{table}_source_chunk" in indexes
             assert _table_count(conn, table) == 1
     _assert_database_ok(index_path)
 

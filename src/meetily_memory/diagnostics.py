@@ -11,7 +11,11 @@ from urllib.parse import quote
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION, LATEST_IN_PLACE_SCHEMA_VERSION
+from meetily_memory.db.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    LATEST_IN_PLACE_SCHEMA_VERSION,
+    SOURCE_AWARE_SCHEMA_VERSION,
+)
 from meetily_memory.scanner.meetily_sqlite import validate_meetily_schema
 from meetily_memory.user_state import (
     CURRENT_USER_STATE_SCHEMA_VERSION,
@@ -173,10 +177,14 @@ TASK_STATUS_OVERRIDE_COLUMNS = {
     "created_at",
     "updated_at",
 }
-CURRENT_BASE_INDEX_COLUMNS = {
+SOURCE_AWARE_BASE_INDEX_COLUMNS = {
     **BASE_INDEX_COLUMNS,
     "sources": BASE_INDEX_COLUMNS["sources"] | {"source_uuid"},
     "scan_runs": CURRENT_SCAN_RUN_COLUMNS,
+}
+CURRENT_BASE_INDEX_COLUMNS = {
+    **SOURCE_AWARE_BASE_INDEX_COLUMNS,
+    "chunks": BASE_INDEX_COLUMNS["chunks"] | {"evidence_id"},
 }
 INDEX_COLUMNS_BY_VERSION = {
     1: BASE_INDEX_COLUMNS,
@@ -186,10 +194,14 @@ INDEX_COLUMNS_BY_VERSION = {
     | KNOWLEDGE_INDEX_COLUMNS
     | {"task_status_overrides": TASK_STATUS_OVERRIDE_COLUMNS},
     4: BASE_INDEX_COLUMNS | STRUCTURED_INDEX_COLUMNS | KNOWLEDGE_INDEX_COLUMNS,
-    LATEST_IN_PLACE_SCHEMA_VERSION: CURRENT_BASE_INDEX_COLUMNS
+    LATEST_IN_PLACE_SCHEMA_VERSION: SOURCE_AWARE_BASE_INDEX_COLUMNS
     | {"sources": BASE_INDEX_COLUMNS["sources"]}
     | STRUCTURED_INDEX_COLUMNS
     | KNOWLEDGE_INDEX_COLUMNS,
+    SOURCE_AWARE_SCHEMA_VERSION: SOURCE_AWARE_BASE_INDEX_COLUMNS
+    | STRUCTURED_INDEX_COLUMNS
+    | KNOWLEDGE_INDEX_COLUMNS
+    | {"index_generation": {"singleton", "generation_id", "alias_owner"}},
     CURRENT_SCHEMA_VERSION: CURRENT_BASE_INDEX_COLUMNS
     | STRUCTURED_INDEX_COLUMNS
     | KNOWLEDGE_INDEX_COLUMNS

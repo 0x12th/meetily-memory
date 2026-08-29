@@ -16,6 +16,7 @@ from meetily_memory.config.paths import default_index_path
 from meetily_memory.config.settings import load_app_settings, normalize_ui_language
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.db.schema import IndexReadError
 from meetily_memory.json_codec import dumps_json
 
 PACKAGE_NAME = "meetily-memory"
@@ -75,7 +76,17 @@ def print_text_block(text: str) -> None:
 
 
 def core_from_context(ctx: typer.Context) -> MeetilyMemoryCore:
-    return MeetilyMemoryCore(ctx.obj["index_path"])
+    try:
+        return MeetilyMemoryCore(ctx.obj["index_path"])
+    except IndexReadError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def read_repository_from_context(ctx: typer.Context) -> IndexRepository:
+    try:
+        return IndexRepository.open_existing(ctx.obj["index_path"])
+    except IndexReadError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def ui_language_from_context(ctx: typer.Context) -> str:
@@ -87,7 +98,7 @@ def resolve_ui_language(index_path: Path, settings_path: Path | None = None) -> 
     if settings.ui_language:
         return settings.ui_language
     indexed_language = normalize_ui_language(
-        IndexRepository(index_path).dominant_meeting_language()
+        IndexRepository.open_existing(index_path).dominant_meeting_language()
     )
     if indexed_language:
         return indexed_language

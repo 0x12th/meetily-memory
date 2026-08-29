@@ -15,7 +15,8 @@ from meetily_memory.db.migration_identity import (
 )
 
 LATEST_IN_PLACE_SCHEMA_VERSION = 5
-CURRENT_SCHEMA_VERSION = 6
+SOURCE_AWARE_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 INDEX_ALIAS_OWNER_STATE = "state"
 INDEX_ALIAS_OWNER_LEGACY = "legacy"
 INDEX_GENERATION_SCHEMA_SQL = """
@@ -91,6 +92,10 @@ CREATE INDEX IF NOT EXISTS idx_decisions_meeting ON decisions(meeting_id, ordina
 CREATE INDEX IF NOT EXISTS idx_action_items_meeting ON action_items(meeting_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_risks_meeting ON risks(meeting_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_open_questions_meeting ON open_questions(meeting_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_decisions_source_chunk ON decisions(source_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_action_items_source_chunk ON action_items(source_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_risks_source_chunk ON risks(source_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_open_questions_source_chunk ON open_questions(source_chunk_id);
 """
 
 KNOWLEDGE_SCHEMA_SQL = """
@@ -317,8 +322,22 @@ CURRENT_KNOWLEDGE_SCHEMA_SQL = KNOWLEDGE_SCHEMA_SQL.replace(
 """,
     "",
 )
+SOURCE_AWARE_BASE_SCHEMA_SQL = BASE_SCHEMA_SQL.replace(
+    LEGACY_SOURCE_SCHEMA_SQL,
+    CURRENT_SOURCE_SCHEMA_SQL,
+)
+CURRENT_BASE_SCHEMA_SQL = SOURCE_AWARE_BASE_SCHEMA_SQL.replace(
+    "  external_id TEXT,\n  kind TEXT NOT NULL,",
+    "  external_id TEXT,\n  evidence_id TEXT NOT NULL UNIQUE,\n  kind TEXT NOT NULL,",
+)
+SOURCE_AWARE_INDEX_SCHEMA_SQL = (
+    SOURCE_AWARE_BASE_SCHEMA_SQL
+    + CURRENT_STRUCTURED_ENTITIES_SQL
+    + CURRENT_KNOWLEDGE_SCHEMA_SQL
+    + INDEX_GENERATION_SCHEMA_SQL
+)
 CURRENT_INDEX_SCHEMA_SQL = (
-    BASE_SCHEMA_SQL.replace(LEGACY_SOURCE_SCHEMA_SQL, CURRENT_SOURCE_SCHEMA_SQL)
+    CURRENT_BASE_SCHEMA_SQL
     + CURRENT_STRUCTURED_ENTITIES_SQL
     + CURRENT_KNOWLEDGE_SCHEMA_SQL
     + INDEX_GENERATION_SCHEMA_SQL
@@ -681,6 +700,7 @@ def migrate_entity_table_to_required_chunk(conn: sqlite3.Connection, table: str)
     conn.execute(f"DROP TABLE {legacy_table}")
     _migration_checkpoint(f"v4:{table}:legacy_dropped")
     conn.execute(f"CREATE INDEX idx_{table}_meeting ON {table}(meeting_id, ordinal)")
+    conn.execute(f"CREATE INDEX idx_{table}_source_chunk ON {table}(source_chunk_id)")
     _migration_checkpoint(f"v4:{table}:index_created")
 
 

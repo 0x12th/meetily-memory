@@ -13,11 +13,11 @@ from meetily_memory.cli.common import (
     open_path,
     print_json,
     print_text_block,
+    read_repository_from_context,
     ui_language_from_context,
 )
 from meetily_memory.cli.renderers import print_topic_memory
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, ContextRenderer
-from meetily_memory.db.repository import IndexRepository
 from meetily_memory.domain import AmbiguousMeetingError, MeetingRef, MeetingSearchFilters
 from meetily_memory.serializers import (
     meeting_search_result_payload,
@@ -212,7 +212,7 @@ def open_command(
     ] = None,
 ) -> None:
     """Open the original meeting folder."""
-    repo = IndexRepository(ctx.obj["index_path"])
+    repo = read_repository_from_context(ctx)
     if meeting_id is not None and (source_uuid is not None or external_id is not None):
         message = "Use either a local meeting ID or --external-id/--source-uuid."
         raise typer.BadParameter(message)

@@ -87,12 +87,12 @@ def main() -> None:
             ollama_model=args.embedding_model,
             ollama_url=args.ollama_url,
         )
-        repository = IndexRepository(args.index)
+        repository = IndexRepository.open_existing(args.index)
         meeting_strategy = HybridRetrievalStrategy(
             repository=repository,
             lexical=LexicalRetrievalStrategy(repository),
             semantic=SemanticRetrievalStrategy(repository, provider),
-            tags=TagRetrievalStrategy(TagRepository(repository.state_path)),
+            tags=TagRetrievalStrategy(TagRepository.open_existing(repository.state_path)),
             semantic_provider=provider,
             fts_weight=args.fts_weight,
             semantic_weight=args.semantic_weight,

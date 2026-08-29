@@ -720,7 +720,7 @@ def test_legacy_v5_rebuild_projects_only_the_explicitly_registered_state_uuid(
     assert source_uuid_column[3] == 1
     assert ("source_uuid",) in unique_column_sets
 
-    backup_path = index_path.with_name(f"{index_path.name}.pre-v6")
+    backup_path = index_path.with_name(f"{index_path.name}.pre-v{CURRENT_SCHEMA_VERSION}")
     with sqlite3.connect(backup_path) as conn:
         legacy_columns = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
         legacy_path = conn.execute("SELECT path FROM sources").fetchone()[0]
@@ -2501,7 +2501,7 @@ def test_incomplete_v5_snapshot_aborts_without_changing_active_index(
 
     assert index_path.read_bytes() == bytes_before
     assert _legacy_index_semantics(index_path) == semantics_before
-    assert not index_path.with_name(f"{index_path.name}.pre-v6").exists()
+    assert not index_path.with_name(f"{index_path.name}.pre-v{CURRENT_SCHEMA_VERSION}").exists()
 
 
 def test_v5_rebuild_aborts_before_swap_while_keeper_holds_live_wal(
@@ -2543,7 +2543,7 @@ def test_v5_rebuild_aborts_before_swap_while_keeper_holds_live_wal(
             WHERE plugin_name = 'keeper-wal' AND key = 'sentinel'
             """
         ).fetchone() == ("{}",)
-        assert not index_path.with_name(f"{index_path.name}.pre-v6").exists()
+        assert not index_path.with_name(f"{index_path.name}.pre-v{CURRENT_SCHEMA_VERSION}").exists()
     finally:
         keeper.close()
 
@@ -2648,7 +2648,7 @@ def test_failed_then_successful_rebuild_preserves_refs_and_source_backed_state( 
         ).fetchone()[0]
         assert active_task_states == 1
 
-    backup_path = index_path.with_name(f"{index_path.name}.pre-v6")
+    backup_path = index_path.with_name(f"{index_path.name}.pre-v{CURRENT_SCHEMA_VERSION}")
     assert backup_path.exists()
     with sqlite3.connect(backup_path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
@@ -2699,7 +2699,7 @@ def test_state_owned_generation_does_not_resurrect_alias_deleted_before_projecti
         ).fetchone() == ("state",)
 
 
-def test_future_v7_alias_index_is_rejected_before_any_state_mutation(tmp_path: Path) -> None:
+def test_future_alias_index_is_rejected_before_any_state_mutation(tmp_path: Path) -> None:
     index_path = tmp_path / "future.sqlite"
     state_path = tmp_path / "state.sqlite"
     state = UserStateRepository(state_path)
@@ -2711,7 +2711,10 @@ def test_future_v7_alias_index_is_rejected_before_any_state_mutation(tmp_path: P
         conn.commit()
     expected_alias = _insert_legacy_topic_alias(index_path)
 
-    with pytest.raises(RuntimeError, match="Unsupported index schema version 7"):
+    with pytest.raises(
+        RuntimeError,
+        match=rf"Unsupported index schema version {CURRENT_SCHEMA_VERSION + 1}",
+    ):
         IndexRepository(index_path, state_path=state_path)
 
     assert state_path.read_bytes() == state_before

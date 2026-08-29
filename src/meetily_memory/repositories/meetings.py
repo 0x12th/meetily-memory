@@ -1,13 +1,19 @@
 import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
 from meetily_memory.db.fts import NO_MATCH_FTS_QUERY, build_fts_query
 from meetily_memory.db.rows import last_insert_id, row_to_dict, rows_to_dicts
-from meetily_memory.db.schema import index_connection
-from meetily_memory.domain import AmbiguousMeetingError, MeetingRef, MeetingSearchFilters
+from meetily_memory.db.schema import IndexConnectionFactory, index_connection
+from meetily_memory.domain import (
+    AmbiguousMeetingError,
+    MeetingRef,
+    MeetingSearchFilters,
+    stable_evidence_id,
+)
 from meetily_memory.json_codec import dumps_json
 from meetily_memory.meeting_structure import ENTITY_KINDS
 from meetily_memory.memory.entities import ENTITY_COUNT_SQL, ENTITY_DELETE_SQL, ENTITY_SELECT_SQL
@@ -16,13 +22,19 @@ from meetily_memory.repositories.search import meeting_time_predicate
 
 SyncKnowledge = Callable[[sqlite3.Connection, int, str], None]
 DeleteKnowledge = Callable[[sqlite3.Connection, int], None]
+MEETING_READ_BATCH_SIZE = 200
 
 
 @dataclass(frozen=True)
 class MeetingsContext:
     index_path: Path
+    connection: IndexConnectionFactory
     sync_meeting_knowledge: SyncKnowledge
     delete_meeting_knowledge: DeleteKnowledge
+
+
+class DuplicateEvidenceIdentityError(ValueError):
+    pass
 
 
 class MeetingsRepository:
@@ -99,7 +111,7 @@ class MeetingsRepository:
         return last_insert_id(cursor)
 
     def get_source(self, kind: str, path: str) -> dict[str, Any] | None:
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             row = conn.execute(
                 "SELECT * FROM sources WHERE kind = ? AND path = ?",
                 (kind, path),
@@ -107,7 +119,7 @@ class MeetingsRepository:
             return row_to_dict(row)
 
     def get_source_by_uuid(self, source_uuid: str) -> dict[str, Any] | None:
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             row = conn.execute(
                 "SELECT * FROM sources WHERE source_uuid = ?",
                 (source_uuid,),
@@ -122,7 +134,7 @@ class MeetingsRepository:
         filters: MeetingSearchFilters | None = None,
     ) -> dict[str, Any] | None:
         time_sql, time_params = meeting_time_predicate(filters)
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             sql = f"""
                 SELECT m.*, s.source_uuid
                 FROM meetings m
@@ -135,7 +147,7 @@ class MeetingsRepository:
             ).fetchone()
             return row_to_dict(row)
 
-    def upsert_meeting_with_chunks(
+    def upsert_meeting_with_chunks(  # noqa: C901
         self,
         meeting: MeetingRecord,
         chunks: Iterable[ChunkRecord],
@@ -151,6 +163,38 @@ class MeetingsRepository:
 
             if existing and existing["fingerprint"] == meeting.fingerprint and not force:
                 return int(existing["id"]), False, 0
+
+            source = conn.execute(
+                "SELECT source_uuid FROM sources WHERE id = ?",
+                (meeting.source_id,),
+            ).fetchone()
+            if source is None:
+                message = f"Source not found while indexing meeting: {meeting.source_id}."
+                raise ValueError(message)
+            source_uuid = str(source["source_uuid"])
+            evidence_chunks: list[tuple[ChunkRecord, str]] = []
+            evidence_owners: dict[str, ChunkRecord] = {}
+            for chunk in chunk_list:
+                evidence_id = stable_evidence_id(
+                    source_uuid,
+                    meeting.external_id,
+                    chunk.external_id,
+                    kind=chunk.kind,
+                    ordinal=chunk.ordinal,
+                    text=chunk.text,
+                )
+                previous = evidence_owners.get(evidence_id)
+                if previous is not None:
+                    first_identity = previous.external_id or f"{previous.kind}#{previous.ordinal}"
+                    second_identity = chunk.external_id or f"{chunk.kind}#{chunk.ordinal}"
+                    message = (
+                        "Duplicate upstream chunk identity while indexing "
+                        f"source {source_uuid}, meeting {meeting.external_id}: "
+                        f"{first_identity!r} and {second_identity!r} both map to {evidence_id}."
+                    )
+                    raise DuplicateEvidenceIdentityError(message)
+                evidence_owners[evidence_id] = chunk
+                evidence_chunks.append((chunk, evidence_id))
 
             meeting_values = asdict(meeting)
             if existing:
@@ -202,24 +246,37 @@ class MeetingsRepository:
 
             inserted_chunks = 0
             people_seen: set[str] = set()
-            for chunk in chunk_list:
+            for chunk, evidence_id in evidence_chunks:
                 chunk_values = asdict(chunk)
-                cursor = conn.execute(
-                    """
-                    INSERT INTO chunks (
-                      meeting_id, external_id, kind, ordinal, text, speaker,
-                      starts_at_seconds, ends_at_seconds, timestamp_label,
-                      token_count, fingerprint, raw_metadata_json
+                try:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO chunks (
+                          meeting_id, external_id, evidence_id, kind, ordinal, text, speaker,
+                          starts_at_seconds, ends_at_seconds, timestamp_label,
+                          token_count, fingerprint, raw_metadata_json
+                        )
+                        VALUES (
+                          :meeting_id, :external_id, :evidence_id, :kind, :ordinal, :text,
+                          :speaker, :starts_at_seconds, :ends_at_seconds,
+                          :timestamp_label, :token_count, :fingerprint,
+                          :raw_metadata_json
+                        )
+                        """,
+                        {
+                            "meeting_id": meeting_id,
+                            "evidence_id": evidence_id,
+                            **chunk_values,
+                        },
                     )
-                    VALUES (
-                      :meeting_id, :external_id, :kind, :ordinal, :text,
-                      :speaker, :starts_at_seconds, :ends_at_seconds,
-                      :timestamp_label, :token_count, :fingerprint,
-                      :raw_metadata_json
+                except sqlite3.IntegrityError as exc:
+                    if "chunks.evidence_id" not in str(exc):
+                        raise
+                    message = (
+                        "Duplicate evidence identity while indexing "
+                        f"source {source_uuid}, meeting {meeting.external_id}: {evidence_id}."
                     )
-                    """,
-                    {"meeting_id": meeting_id, **chunk_values},
-                )
+                    raise DuplicateEvidenceIdentityError(message) from exc
                 chunk_id = last_insert_id(cursor)
                 conn.execute(
                     """
@@ -359,7 +416,7 @@ class MeetingsRepository:
         return rows
 
     def get_chunks_for_meeting(self, meeting_id: int) -> list[dict[str, Any]]:
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             rows = conn.execute(
                 "SELECT * FROM chunks WHERE meeting_id = ? ORDER BY ordinal",
                 (meeting_id,),
@@ -367,7 +424,7 @@ class MeetingsRepository:
             return rows_to_dicts(rows)
 
     def list_meeting_ids(self) -> list[int]:
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             rows = conn.execute(
                 """
                 SELECT id
@@ -425,7 +482,7 @@ class MeetingsRepository:
                 """
 
         params.append(limit)
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             rows = conn.execute(sql, params).fetchall()
             return rows_to_dicts(rows)
 
@@ -436,7 +493,7 @@ class MeetingsRepository:
         filters: MeetingSearchFilters | None = None,
     ) -> dict[str, Any] | None:
         time_sql, time_params = meeting_time_predicate(filters)
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             row = conn.execute(
                 f"""
                 SELECT m.*, s.source_uuid
@@ -454,18 +511,73 @@ class MeetingsRepository:
         *,
         filters: MeetingSearchFilters | None = None,
     ) -> dict[str, Any] | None:
+        return self.get_meetings_by_refs((ref,), filters=filters).get(ref)
+
+    def get_meetings_by_refs(
+        self,
+        refs: tuple[MeetingRef, ...],
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> dict[MeetingRef, dict[str, Any]]:
+        unique_refs = tuple(dict.fromkeys(refs))
+        if not unique_refs:
+            return {}
         time_sql, time_params = meeting_time_predicate(filters)
-        with index_connection(self.index_path) as conn:
-            row = conn.execute(
-                f"""
-                SELECT m.*, s.source_uuid
-                FROM meetings m
-                JOIN sources s ON s.id = m.source_id
-                WHERE s.source_uuid = ? AND m.external_id = ? AND {time_sql}
-                """,
-                (ref.source_uuid, ref.external_id, *time_params),
-            ).fetchone()
-            return row_to_dict(row)
+        meetings: dict[MeetingRef, dict[str, Any]] = {}
+        with self.context.connection(self.index_path) as conn:
+            for ref_batch in batched(unique_refs, MEETING_READ_BATCH_SIZE):
+                values_sql = ", ".join("(?, ?, ?)" for _ in ref_batch)
+                requested_params = tuple(
+                    value
+                    for request_order, ref in enumerate(ref_batch)
+                    for value in (request_order, ref.source_uuid, ref.external_id)
+                )
+                rows = conn.execute(
+                    f"""
+                    WITH requested(request_order, source_uuid, external_id) AS (
+                      VALUES {values_sql}
+                    )
+                    SELECT requested.request_order, m.*, s.source_uuid
+                    FROM requested
+                    JOIN sources s ON s.source_uuid = requested.source_uuid
+                    JOIN meetings m
+                      ON m.source_id = s.id
+                     AND m.external_id = requested.external_id
+                    WHERE {time_sql}
+                    ORDER BY requested.request_order
+                    """,
+                    (*requested_params, *time_params),
+                ).fetchall()
+                for row in rows:
+                    ref = MeetingRef(str(row["source_uuid"]), str(row["external_id"]))
+                    meetings[ref] = dict(row)
+        return meetings
+
+    def get_meetings_by_local_ids(
+        self,
+        meeting_ids: tuple[int, ...],
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        unique_ids = tuple(dict.fromkeys(meeting_ids))
+        if not unique_ids:
+            return {}
+        time_sql, time_params = meeting_time_predicate(filters)
+        meetings: dict[int, dict[str, Any]] = {}
+        with self.context.connection(self.index_path) as conn:
+            for meeting_id_batch in batched(unique_ids, MEETING_READ_BATCH_SIZE):
+                placeholders = ", ".join("?" for _ in meeting_id_batch)
+                rows = conn.execute(
+                    f"""
+                    SELECT m.*, s.source_uuid
+                    FROM meetings m
+                    JOIN sources s ON s.id = m.source_id
+                    WHERE m.id IN ({placeholders}) AND {time_sql}
+                    """,
+                    (*meeting_id_batch, *time_params),
+                ).fetchall()
+                meetings.update((int(row["id"]), dict(row)) for row in rows)
+        return meetings
 
     def get_meeting_by_external_id(
         self,
@@ -474,7 +586,7 @@ class MeetingsRepository:
         filters: MeetingSearchFilters | None = None,
     ) -> dict[str, Any] | None:
         time_sql, time_params = meeting_time_predicate(filters)
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             rows = conn.execute(
                 f"""
                 SELECT m.*, s.source_uuid
@@ -496,7 +608,7 @@ class MeetingsRepository:
         return row_to_dict(rows[0]) if rows else None
 
     def dominant_meeting_language(self) -> str | None:
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             row = conn.execute(
                 """
                 SELECT language
@@ -622,7 +734,7 @@ class MeetingsRepository:
             conn.commit()
 
     def scan_run_diagnostics(self) -> dict[str, dict[str, Any] | None]:
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             completed = conn.execute(
                 "SELECT * FROM scan_runs WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -643,7 +755,7 @@ class MeetingsRepository:
         }
 
     def stats(self) -> dict[str, int]:
-        with index_connection(self.index_path) as conn:
+        with self.context.connection(self.index_path) as conn:
             stats = {
                 "meetings": int(conn.execute("SELECT COUNT(*) FROM meetings").fetchone()[0]),
                 "chunks": int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]),

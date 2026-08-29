@@ -1,13 +1,20 @@
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
 from meetily_memory.config.paths import canonical_source_path
 from meetily_memory.db.fts import build_fts_query
 from meetily_memory.db.rows import rows_to_dicts
-from meetily_memory.db.schema import IndexRebuildRequiredError, index_connection
+from meetily_memory.db.schema import (
+    IndexConnectionFactory,
+    IndexRebuildRequiredError,
+    existing_index_connection,
+    index_connection,
+    sqlite_read_snapshot,
+)
 from meetily_memory.domain import (
     Meeting,
     MeetingRef,
@@ -16,7 +23,6 @@ from meetily_memory.domain import (
     SearchHit,
     SourceExcerpt,
     canonical_entity_kind,
-    stable_evidence_id,
 )
 from meetily_memory.meeting_structure import ENTITY_KINDS, StructuredEntity
 from meetily_memory.memory.entities import (
@@ -35,9 +41,10 @@ from meetily_memory.memory.knowledge import KnowledgeContext, KnowledgeRepositor
 from meetily_memory.memory.task_status import TaskStatusContext, TaskStatusRepository
 from meetily_memory.repositories.meetings import MeetingsContext, MeetingsRepository
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, ScanRunStats
-from meetily_memory.repositories.search import SearchRepository
+from meetily_memory.repositories.search import EvidenceResolutionError, SearchRepository
 from meetily_memory.user_state import (
     SourcePathClaim,
+    UserStateRepository,
     prepare_index_user_state,
     prepare_user_state_migration,
     register_state_owned_index_generation,
@@ -46,11 +53,15 @@ from meetily_memory.user_state import (
 
 __all__ = [
     "ChunkRecord",
+    "EvidenceResolutionError",
     "IndexRepository",
     "MeetingRecord",
     "ScanRunStats",
     "build_fts_query",
 ]
+
+MEMORY_ENTITY_BATCH_SIZE = 200
+ENTITY_KIND_ORDER = {kind: order for order, kind in enumerate(ENTITY_KINDS)}
 
 
 class IndexRepository:
@@ -64,48 +75,64 @@ class IndexRepository:
         *,
         state_path: Path | None = None,
         generation_ledger_paths: Iterable[Path] = (),
+        _read_only: bool = False,
     ) -> None:
         self.index_path = Path(index_path)
         self.state_path = (
             Path(state_path) if state_path else self.index_path.with_name("state.sqlite")
         )
-        now = utc_now()
-        self.user_state = prepare_index_user_state(
-            self.index_path,
-            self.state_path,
-            now=now,
+        self.read_only = _read_only
+        self.connection: IndexConnectionFactory = (
+            existing_index_connection if self.read_only else index_connection
         )
-        prepare_user_state_migration(
-            self.index_path,
-            self.user_state,
-            now=now,
-        )
+        ledger_paths = tuple(generation_ledger_paths)
         self.requires_rebuild = False
-        try:
-            with index_connection(self.index_path):
+        if self.read_only:
+            if ledger_paths:
+                message = "Read-only index repositories cannot register generation paths."
+                raise ValueError(message)
+            with existing_index_connection(self.index_path):
                 pass
-        except IndexRebuildRequiredError:
-            self.requires_rebuild = True
-        if not self.requires_rebuild:
+            self.user_state = UserStateRepository.open_existing(self.state_path)
+        else:
+            now = utc_now()
             self.user_state = prepare_index_user_state(
                 self.index_path,
                 self.state_path,
                 now=now,
             )
-            self.heal_pending_source_path_projections()
-            for ledger_path in generation_ledger_paths:
-                self.register_state_owned_generation_path(ledger_path)
+            prepare_user_state_migration(
+                self.index_path,
+                self.user_state,
+                now=now,
+            )
+            try:
+                with index_connection(self.index_path):
+                    pass
+            except IndexRebuildRequiredError:
+                self.requires_rebuild = True
+            if not self.requires_rebuild:
+                self.user_state = prepare_index_user_state(
+                    self.index_path,
+                    self.state_path,
+                    now=now,
+                )
+                self.heal_pending_source_path_projections()
+                for ledger_path in ledger_paths:
+                    self.register_state_owned_generation_path(ledger_path)
         self.meetings = MeetingsRepository(
             MeetingsContext(
                 index_path=self.index_path,
+                connection=self.connection,
                 sync_meeting_knowledge=self._sync_meeting_knowledge,
                 delete_meeting_knowledge=self._delete_meeting_knowledge,
             )
         )
-        self.search_repo = SearchRepository(self.index_path)
+        self.search_repo = SearchRepository(self.index_path, self.connection)
         self.entities = StructuredEntityRepository(
             StructuredEntityContext(
                 index_path=self.index_path,
+                connection=self.connection,
                 delete_structured_knowledge=self._delete_structured_knowledge,
                 delete_structured_entities=self._delete_structured_entities,
                 sync_meeting_knowledge=self._sync_meeting_knowledge,
@@ -116,6 +143,7 @@ class IndexRepository:
         self.knowledge = KnowledgeRepository(
             KnowledgeContext(
                 index_path=self.index_path,
+                connection=self.connection,
                 search_meetings=self.search,
                 chunk_rows=self.meetings.chunk_rows,
                 meeting_people_rows=self.meetings.meeting_people_rows,
@@ -128,13 +156,23 @@ class IndexRepository:
         self.task_status = TaskStatusRepository(
             TaskStatusContext(
                 index_path=self.index_path,
+                connection=self.connection,
                 user_state=self.user_state,
                 validate_status=assert_known_task_status,
                 now=utc_now,
             )
         )
-        if not self.requires_rebuild:
+        if not self.read_only and not self.requires_rebuild:
             self.knowledge.project_topic_aliases()
+
+    @classmethod
+    def open_existing(
+        cls,
+        index_path: Path,
+        *,
+        state_path: Path | None = None,
+    ) -> "IndexRepository":
+        return cls(index_path, state_path=state_path, _read_only=True)
 
     def structured_entity_sort_key(self, row: dict[str, Any]) -> tuple[str, int]:
         return structured_entity_sort_key(row)
@@ -171,7 +209,7 @@ class IndexRepository:
         return self.meetings.get_source_by_uuid(source_uuid)
 
     def source_meeting_external_ids(self, source_uuid: str) -> set[str]:
-        with index_connection(self.index_path) as conn:
+        with self.connection(self.index_path) as conn:
             rows = conn.execute(
                 """
                 SELECT m.external_id
@@ -653,8 +691,7 @@ class IndexRepository:
         rows = conn.execute(ENTITY_DETAIL_SQL[kind], (limit,)).fetchall()
         details = rows_to_dicts(rows)
         if kind == "action_items":
-            for row in details:
-                self._hydrate_task_status(row)
+            self._hydrate_task_statuses(details)
         return details
 
     def _list_all_structured_entity_details_conn(
@@ -702,81 +739,59 @@ class IndexRepository:
         )
         return tuple(self.search_hit_from_row(row) for row in rows)
 
-    def search_hit_from_row(self, row: dict[str, Any]) -> SearchHit:
-        source_uuid = optional_str(row.get("source_uuid"))
-        if source_uuid is None:
-            source_uuid = str(self._source_details(int(row["meeting_id"]))["source_uuid"])
-        row["source_uuid"] = source_uuid
-        excerpt = source_excerpt_from_search_row(row)
-        return SearchHit(
-            id=stable_evidence_id(
-                source_uuid,
-                excerpt.meeting_external_id,
-                excerpt.chunk_external_id,
-                kind=excerpt.kind,
-                ordinal=excerpt.ordinal,
-                text=excerpt.text,
-            ),
-            meeting=meeting_from_row(row),
-            excerpt=excerpt,
-            is_context=bool(row.get("is_context", False)),
-        )
+    @staticmethod
+    def search_hit_from_row(row: Mapping[str, Any]) -> SearchHit:
+        return search_hit_from_row(row)
 
     def expand_search_hits(
         self, hits: tuple[SearchHit, ...], context: int
     ) -> tuple[SearchHit, ...]:
-        rows = [
-            row
-            for hit in hits
-            if (
-                row := self.search_repo.evidence_row(
-                    hit.meeting.id,
-                    hit.meeting.external_id,
-                    hit.excerpt.chunk_external_id,
-                    hit.excerpt.kind,
-                    hit.excerpt.ordinal,
-                )
-            )
-            is not None
-        ]
-        return tuple(
-            self.search_hit_from_row(row) for row in self.search_repo.expand_hits(rows, context)
+        if context <= 0 or not hits:
+            return hits
+        rows = self.search_repo.expand_evidence_refs(
+            tuple((hit.id, hit.meeting.ref) for hit in hits),
+            context,
         )
+        return tuple(search_hit_from_row(row) for row in rows)
 
     def get_search_hit(self, evidence_id: str) -> SearchHit | None:
-        for row in self.search_repo.all_evidence_rows():
-            hit = self.search_hit_from_row(row)
-            if hit.id == evidence_id:
-                return hit
-        return None
+        row = self.search_repo.evidence_by_id(evidence_id)
+        return search_hit_from_row(row) if row is not None else None
 
     def memory_entities_for_hits(self, hits: tuple[SearchHit, ...]) -> tuple[MemoryEntity, ...]:
-        evidence_ids = {hit.id for hit in hits}
-        entities: list[MemoryEntity] = []
-        for row in self.list_all_structured_entity_details(limit=10_000):
-            evidence_row = self._entity_evidence_details(int(row["source_chunk_id"]))
-            source_uuid = str(evidence_row["source_uuid"])
-            excerpt = source_excerpt_from_entity_row(evidence_row)
-            evidence_id = stable_evidence_id(
-                source_uuid,
-                excerpt.meeting_external_id,
-                excerpt.chunk_external_id,
-                kind=excerpt.kind,
-                ordinal=excerpt.ordinal,
-                text=excerpt.text,
+        if not hits:
+            return ()
+        rows: list[dict[str, Any]] = []
+        evidence_refs = tuple((hit.id, hit.meeting.ref) for hit in hits)
+        with self.connection(self.index_path) as conn, sqlite_read_snapshot(conn):
+            evidence_rows = self.search_repo.resolve_evidence_rows(conn, evidence_refs)
+            chunk_ids = tuple(
+                dict.fromkeys(int(evidence_row["chunk_id"]) for evidence_row in evidence_rows)
             )
-            if evidence_id not in evidence_ids:
-                continue
-            entities.append(
-                MemoryEntity(
-                    kind=canonical_entity_kind(str(row["kind"])),
-                    content=str(row["text"]),
-                    source=excerpt,
-                    evidence_id=evidence_id,
-                    extraction_method=str(row["source"]),
-                )
+            for chunk_id_batch in batched(chunk_ids, MEMORY_ENTITY_BATCH_SIZE):
+                placeholders = ", ".join("?" for _ in chunk_id_batch)
+                selects = [memory_entity_select_sql(kind, placeholders) for kind in ENTITY_KINDS]
+                params = tuple(chunk_id_batch) * len(ENTITY_KINDS)
+                entity_rows = conn.execute(" UNION ALL ".join(selects), params).fetchall()
+                rows.extend(rows_to_dicts(entity_rows))
+        rows.sort(
+            key=lambda row: (
+                str(row.get("meeting_date") or ""),
+                -int(row["entity_ordinal"]),
+                -ENTITY_KIND_ORDER[str(row["kind"])],
+            ),
+            reverse=True,
+        )
+        return tuple(
+            MemoryEntity(
+                kind=canonical_entity_kind(str(row["kind"])),
+                content=str(row["entity_text"]),
+                source=source_excerpt_from_entity_row(row),
+                evidence_id=str(row["evidence_id"]),
+                extraction_method=str(row["extraction_method"]),
             )
-        return tuple(entities)
+            for row in rows
+        )
 
     def list_meetings(self, limit: int = 20, person: str | None = None) -> list[dict[str, Any]]:
         return self.meetings.list_meetings(limit, person)
@@ -806,6 +821,22 @@ class IndexRepository:
     ) -> dict[str, Any] | None:
         return self.meetings.get_meeting_by_ref(ref, filters=filters)
 
+    def get_meetings_by_refs(
+        self,
+        refs: tuple[MeetingRef, ...],
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> dict[MeetingRef, dict[str, Any]]:
+        return self.meetings.get_meetings_by_refs(refs, filters=filters)
+
+    def get_meetings_by_local_ids(
+        self,
+        meeting_ids: tuple[int, ...],
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        return self.meetings.get_meetings_by_local_ids(meeting_ids, filters=filters)
+
     def meeting_ref_for_external_id(self, external_id: str) -> MeetingRef | None:
         meeting = self.get_meeting(external_id)
         return meeting_ref_from_row(meeting) if meeting is not None else None
@@ -832,7 +863,7 @@ class IndexRepository:
         if meeting is None:
             message = f"Meeting not found: {ref.source_uuid}/{ref.external_id}"
             raise ValueError(message)
-        with index_connection(self.index_path) as conn:
+        with self.connection(self.index_path) as conn:
             rows = self.meetings.chunk_rows(conn, int(meeting["id"]))
         return "\n".join(
             str(row["text"]) for row in rows if row["kind"] == "transcript" and row["text"]
@@ -875,85 +906,84 @@ class IndexRepository:
     def stats(self) -> dict[str, int]:
         return self.meetings.stats()
 
-    def _hydrate_task_status(self, row: dict[str, Any]) -> None:
-        chunk_external_id = row.get("chunk_external_id")
-        if not chunk_external_id:
-            return
-        source = self._source_details(int(row["meeting_id"]))
-        source_uuid = str(source["source_uuid"])
-        state = self.user_state.get_task_state(
-            task_identity(
-                source_uuid,
-                str(row["meeting_external_id"]),
-                str(chunk_external_id),
-                str(row["text"]),
+    def _hydrate_task_statuses(self, rows: list[dict[str, Any]]) -> None:
+        row_identities = [
+            (
+                row,
+                task_identity(
+                    str(row["source_uuid"]),
+                    str(row["meeting_external_id"]),
+                    str(row["chunk_external_id"]),
+                    str(row["text"]),
+                ),
             )
-        )
-        if state is None:
-            return
-        row["status"] = state["status"]
-        row["status_note"] = state["note"]
-        row["status_source"] = state["source"]
-        row["status_updated_at"] = state["updated_at"]
+            for row in rows
+            if row.get("chunk_external_id")
+        ]
+        states = self.user_state.get_task_states(identity for _, identity in row_identities)
+        for row, identity in row_identities:
+            state = states.get(identity)
+            if state is None:
+                continue
+            row["status"] = state["status"]
+            row["status_note"] = state["note"]
+            row["status_source"] = state["source"]
+            row["status_updated_at"] = state["updated_at"]
 
-    def _source_details(self, meeting_id: int) -> dict[str, Any]:
-        with index_connection(self.index_path) as conn:
-            row = conn.execute(
-                """
-                SELECT s.source_uuid, s.kind, s.path
-                FROM meetings m
-                JOIN sources s ON s.id = m.source_id
-                WHERE m.id = ?
-                """,
-                (meeting_id,),
-            ).fetchone()
-            if row is None:
-                message = f"Source not found for meeting: {meeting_id}"
-                raise ValueError(message)
-            return dict(row)
 
-    def _entity_evidence_details(self, source_chunk_id: int) -> dict[str, Any]:
-        with index_connection(self.index_path) as conn:
-            row = conn.execute(
-                """
-                SELECT
-                  m.external_id AS meeting_external_id,
-                  c.external_id AS chunk_external_id,
-                  c.kind AS chunk_kind,
-                  c.ordinal AS chunk_ordinal,
-                  c.text AS chunk_text,
-                  c.speaker AS chunk_speaker,
-                  c.starts_at_seconds AS chunk_starts_at_seconds,
-                  c.ends_at_seconds AS chunk_ends_at_seconds,
-                  c.timestamp_label AS chunk_timestamp_label,
-                  s.source_uuid AS source_uuid,
-                  s.kind AS source_kind,
-                  s.path AS source_path
-                FROM chunks c
-                JOIN meetings m ON m.id = c.meeting_id
-                JOIN sources s ON s.id = m.source_id
-                WHERE c.id = ?
-                """,
-                (source_chunk_id,),
-            ).fetchone()
-            if row is None:
-                message = f"Source chunk not found: {source_chunk_id}"
-                raise ValueError(message)
-            return dict(row)
+def memory_entity_select_sql(kind: str, placeholders: str) -> str:
+    assert_known_entity_kind(kind)
+    sql = f"""
+        SELECT
+          '{kind}' AS kind,
+          e.source_chunk_id AS source_chunk_id,
+          e.ordinal AS entity_ordinal,
+          e.text AS entity_text,
+          e.source AS extraction_method,
+          COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
+          m.external_id AS meeting_external_id,
+          s.source_uuid AS source_uuid,
+          c.external_id AS chunk_external_id,
+          c.evidence_id AS evidence_id,
+          c.kind AS chunk_kind,
+          c.ordinal AS chunk_ordinal,
+          c.text AS chunk_text,
+          c.speaker AS chunk_speaker,
+          c.starts_at_seconds AS chunk_starts_at_seconds,
+          c.ends_at_seconds AS chunk_ends_at_seconds,
+          c.timestamp_label AS chunk_timestamp_label
+        FROM {kind} e
+        JOIN chunks c ON c.id = e.source_chunk_id
+        JOIN meetings m ON m.id = c.meeting_id
+        JOIN sources s ON s.id = m.source_id
+        WHERE e.source_chunk_id IN ({placeholders})
+    """  # noqa: S608
+    return sql  # noqa: RET504
+
+
+def search_hit_from_row(row: Mapping[str, Any]) -> SearchHit:
+    excerpt = source_excerpt_from_search_row(row)
+    return SearchHit(
+        id=str(row["evidence_id"]),
+        meeting=meeting_from_row(row),
+        excerpt=excerpt,
+        source_chunk_id=int(row["chunk_id"]),
+        is_context=bool(row.get("is_context", False)),
+    )
 
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def meeting_ref_from_row(row: dict[str, Any]) -> MeetingRef:
+def meeting_ref_from_row(row: Mapping[str, Any]) -> MeetingRef:
     return MeetingRef(
         source_uuid=str(row["source_uuid"]),
         external_id=str(row.get("meeting_external_id") or row["external_id"]),
     )
 
 
-def meeting_from_row(row: dict[str, Any]) -> Meeting:
+def meeting_from_row(row: Mapping[str, Any]) -> Meeting:
     return Meeting(
         id=int(row.get("meeting_id") or row["id"]),
         ref=meeting_ref_from_row(row),
@@ -968,7 +998,7 @@ def meeting_from_row(row: dict[str, Any]) -> Meeting:
     )
 
 
-def source_excerpt_from_search_row(row: dict[str, Any]) -> SourceExcerpt:
+def source_excerpt_from_search_row(row: Mapping[str, Any]) -> SourceExcerpt:
     return SourceExcerpt(
         meeting_ref=meeting_ref_from_row(row),
         chunk_external_id=optional_str(row.get("chunk_external_id")),
@@ -982,7 +1012,7 @@ def source_excerpt_from_search_row(row: dict[str, Any]) -> SourceExcerpt:
     )
 
 
-def source_excerpt_from_entity_row(row: dict[str, Any]) -> SourceExcerpt:
+def source_excerpt_from_entity_row(row: Mapping[str, Any]) -> SourceExcerpt:
     return SourceExcerpt(
         meeting_ref=meeting_ref_from_row(row),
         chunk_external_id=optional_str(row.get("chunk_external_id")),

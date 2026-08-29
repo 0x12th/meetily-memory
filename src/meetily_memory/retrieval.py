@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from meetily_memory.domain import (
+    Meeting,
     MeetingRef,
     MeetingSearchFilters,
     MeetingSearchResult,
@@ -105,30 +106,30 @@ class LexicalTagMeetingRetrievalStrategy:
         *,
         filters: MeetingSearchFilters | None = None,
     ) -> tuple[MeetingSearchResult, ...]:
-        fts_ranks, fts_evidence = collect_hits_by_meeting(
+        fts_ranks, fts_evidence, fts_meetings = collect_hits_by_meeting(
             self.lexical,
             query,
             limit,
             candidate_multiplier=self.candidate_multiplier,
             filters=filters,
         )
-        exact_tag_order, token_tag_order, matched_tags = tag_candidates(
+        exact_tag_order, token_tag_order, matched_tags, tag_meetings = tag_candidates(
             self.repository,
             self.tags,
             query,
             filters=filters,
         )
+        meetings = {**tag_meetings, **fts_meetings}
         ordered_keys = tuple(dict.fromkeys((*exact_tag_order, *fts_ranks, *token_tag_order)))
+        selected_keys = tuple(key for key in ordered_keys if key in meetings)[:limit]
+        evidence_by_key = expand_evidence_by_meeting(
+            self.repository,
+            selected_keys,
+            fts_evidence,
+            context,
+        )
         results: list[MeetingSearchResult] = []
-        for key in ordered_keys[:limit]:
-            meeting_row = self.repository.get_meeting_by_local_id(key[0], filters=filters)
-            if meeting_row is None:
-                continue
-            meeting_id = key[0]
-            meeting = meeting_from_row(meeting_row)
-            evidence = fts_evidence.get(key, ())
-            if context and evidence:
-                evidence = self.repository.expand_search_hits(evidence, context)
+        for key in selected_keys:
             sources: list[RetrievalSource] = []
             if key in exact_tag_order:
                 sources.append(RetrievalSource.TAG)
@@ -138,11 +139,11 @@ class LexicalTagMeetingRetrievalStrategy:
                 sources.append(RetrievalSource.TAG)
             results.append(
                 MeetingSearchResult(
-                    meeting_id=meeting_id,
-                    meeting=meeting,
+                    meeting_id=key[0],
+                    meeting=meetings[key],
                     rank=len(results) + 1,
                     match_sources=tuple(sources),
-                    evidence=evidence,
+                    evidence=evidence_by_key.get(key, ()),
                     matched_tags=matched_tags.get(key, ()),
                 )
             )
@@ -209,19 +210,22 @@ class HybridRetrievalStrategy:
         *,
         filters: MeetingSearchFilters | None = None,
     ) -> RetrievalResult:
-        fts_ranks, fts_evidence = collect_hits_by_meeting(
+        fts_ranks, fts_evidence, fts_meetings = collect_hits_by_meeting(
             self.lexical,
             query,
             limit,
             candidate_multiplier=self.candidate_multiplier,
             filters=filters,
         )
-        semantic_ranks, semantic_evidence, semantic_status = self._semantic_candidates(
-            query,
-            limit,
-            filters=filters,
+        semantic_ranks, semantic_evidence, semantic_meetings, semantic_status = (
+            self._semantic_candidates(
+                query,
+                limit,
+                filters=filters,
+            )
         )
-        tag_ranks, matched_tags = self._tag_candidates(query, filters=filters)
+        tag_ranks, matched_tags, tag_meetings = self._tag_candidates(query, filters=filters)
+        meetings = {**tag_meetings, **semantic_meetings, **fts_meetings}
         candidate_keys = tuple(dict.fromkeys((*fts_ranks, *semantic_ranks, *tag_ranks)))
         traces = tuple(
             sorted(
@@ -246,30 +250,32 @@ class HybridRetrievalStrategy:
                 key=trace_sort_key,
             )
         )
-        selected = traces[:limit]
+        selected = tuple(
+            trace for trace in traces if (trace.meeting_id, trace.meeting_ref) in meetings
+        )[:limit]
+        selected_keys = tuple((trace.meeting_id, trace.meeting_ref) for trace in selected)
+        selected_evidence = {
+            key: unique_hits((*fts_evidence.get(key, ()), *semantic_evidence.get(key, ())))[
+                :MAX_EVIDENCE_PER_SOURCE
+            ]
+            for key in selected_keys
+        }
+        evidence_by_key = expand_evidence_by_meeting(
+            self.repository,
+            selected_keys,
+            selected_evidence,
+            context,
+        )
         results: list[MeetingSearchResult] = []
         for trace in selected:
             key = (trace.meeting_id, trace.meeting_ref)
-            meeting_row = self.repository.get_meeting_by_local_id(
-                trace.meeting_id,
-                filters=filters,
-            )
-            if meeting_row is None:
-                continue
-            meeting_id = trace.meeting_id
-            meeting = meeting_from_row(meeting_row)
-            evidence = unique_hits((*fts_evidence.get(key, ()), *semantic_evidence.get(key, ())))[
-                :MAX_EVIDENCE_PER_SOURCE
-            ]
-            if context and evidence:
-                evidence = self.repository.expand_search_hits(evidence, context)
             results.append(
                 MeetingSearchResult(
-                    meeting_id=meeting_id,
-                    meeting=meeting,
+                    meeting_id=trace.meeting_id,
+                    meeting=meetings[key],
                     rank=len(results) + 1,
                     match_sources=trace_sources(trace),
-                    evidence=evidence,
+                    evidence=evidence_by_key.get(key, ()),
                     matched_tags=matched_tags.get(key, ()),
                 )
             )
@@ -292,6 +298,7 @@ class HybridRetrievalStrategy:
     ) -> tuple[
         dict[MeetingKey, int],
         dict[MeetingKey, tuple[SearchHit, ...]],
+        dict[MeetingKey, Meeting],
         str,
     ]:
         if self.require_complete_semantic_index:
@@ -303,9 +310,9 @@ class HybridRetrievalStrategy:
                     self.semantic_provider,
                 )
             except (RuntimeError, sqlite3.Error):
-                return {}, {}, "unavailable"
+                return {}, {}, {}, "unavailable"
             if not coverage.complete:
-                return {}, {}, "incomplete"
+                return {}, {}, {}, "incomplete"
             status = "complete"
         else:
             status = "forced"
@@ -318,18 +325,22 @@ class HybridRetrievalStrategy:
                 filters=filters,
             )
         except (RuntimeError, sqlite3.Error):
-            return {}, {}, "error"
+            return {}, {}, {}, "error"
         else:
-            ranks, evidence = result
-            return ranks, evidence, status
+            ranks, evidence, meetings = result
+            return ranks, evidence, meetings, status
 
     def _tag_candidates(
         self,
         query: str,
         *,
         filters: MeetingSearchFilters | None = None,
-    ) -> tuple[dict[MeetingKey, int], dict[MeetingKey, tuple[str, ...]]]:
-        exact_order, token_order, names = tag_candidates(
+    ) -> tuple[
+        dict[MeetingKey, int],
+        dict[MeetingKey, tuple[str, ...]],
+        dict[MeetingKey, Meeting],
+    ]:
+        exact_order, token_order, names, meetings = tag_candidates(
             self.repository,
             self.tags,
             query,
@@ -339,6 +350,7 @@ class HybridRetrievalStrategy:
         return (
             {key: rank for rank, key in enumerate(ordered_keys, start=1)},
             names,
+            meetings,
         )
 
 
@@ -349,13 +361,17 @@ def collect_hits_by_meeting(
     *,
     candidate_multiplier: int,
     filters: MeetingSearchFilters | None = None,
-) -> tuple[dict[MeetingKey, int], dict[MeetingKey, tuple[SearchHit, ...]]]:
+) -> tuple[
+    dict[MeetingKey, int],
+    dict[MeetingKey, tuple[SearchHit, ...]],
+    dict[MeetingKey, Meeting],
+]:
     candidate_limit = max(meeting_limit, meeting_limit * candidate_multiplier)
     while True:
         hits = strategy.search(query, candidate_limit, filters=filters)
-        ranks, evidence = collapse_hits_by_meeting(hits)
+        ranks, evidence, meetings = collapse_hits_by_meeting(hits)
         if len(ranks) >= meeting_limit or len(hits) < candidate_limit:
-            return ranks, evidence
+            return ranks, evidence, meetings
         candidate_limit *= 2
 
 
@@ -365,18 +381,28 @@ def tag_candidates(
     query: str,
     *,
     filters: MeetingSearchFilters | None = None,
-) -> tuple[list[MeetingKey], list[MeetingKey], dict[MeetingKey, tuple[str, ...]]]:
+) -> tuple[
+    list[MeetingKey],
+    list[MeetingKey],
+    dict[MeetingKey, tuple[str, ...]],
+    dict[MeetingKey, Meeting],
+]:
+    matches = tags.search(query)
+    meeting_rows = repository.get_meetings_by_refs(
+        tuple(dict.fromkeys(match.meeting_ref for match in matches)),
+        filters=filters,
+    )
     exact_order: list[MeetingKey] = []
     token_order: list[MeetingKey] = []
     names: dict[MeetingKey, list[str]] = {}
-    for match in tags.search(query):
-        meeting = repository.get_meeting_by_ref(
-            match.meeting_ref,
-            filters=filters,
-        )
-        if meeting is None:
+    meetings: dict[MeetingKey, Meeting] = {}
+    for match in matches:
+        meeting_row = meeting_rows.get(match.meeting_ref)
+        if meeting_row is None:
             continue
-        key = (int(meeting["id"]), match.meeting_ref)
+        key = (int(meeting_row["id"]), match.meeting_ref)
+        if key not in meetings:
+            meetings[key] = meeting_from_row(meeting_row)
         order = exact_order if match.kind == "exact" else token_order
         if key not in order:
             order.append(key)
@@ -387,29 +413,58 @@ def tag_candidates(
         exact_order,
         token_order,
         {key: tuple(values) for key, values in names.items()},
+        meetings,
     )
 
 
 def collapse_hits_by_meeting(
     hits: tuple[SearchHit, ...],
-) -> tuple[dict[MeetingKey, int], dict[MeetingKey, tuple[SearchHit, ...]]]:
+) -> tuple[
+    dict[MeetingKey, int],
+    dict[MeetingKey, tuple[SearchHit, ...]],
+    dict[MeetingKey, Meeting],
+]:
     ranks: dict[MeetingKey, int] = {}
     evidence: dict[MeetingKey, list[SearchHit]] = {}
+    meetings: dict[MeetingKey, Meeting] = {}
     for hit in hits:
         key = (hit.meeting.id, hit.meeting.ref)
         if key not in ranks:
             ranks[key] = len(ranks) + 1
+            meetings[key] = hit.meeting
         values = evidence.setdefault(key, [])
         if len(values) < MAX_EVIDENCE_PER_SOURCE:
             values.append(hit)
-    return ranks, {key: tuple(values) for key, values in evidence.items()}
+    return ranks, {key: tuple(values) for key, values in evidence.items()}, meetings
 
 
 def unique_hits(hits: tuple[SearchHit, ...]) -> tuple[SearchHit, ...]:
     by_id: dict[str, SearchHit] = {}
     for hit in hits:
-        by_id.setdefault(hit.id, hit)
+        if hit.id not in by_id:
+            by_id[hit.id] = hit
     return tuple(by_id.values())
+
+
+def expand_evidence_by_meeting(
+    repository: IndexRepository,
+    selected_keys: tuple[MeetingKey, ...],
+    evidence_by_key: dict[MeetingKey, tuple[SearchHit, ...]],
+    context: int,
+) -> dict[MeetingKey, tuple[SearchHit, ...]]:
+    selected_evidence = unique_hits(
+        tuple(hit for key in selected_keys for hit in evidence_by_key.get(key, ()))
+    )
+    if context <= 0 or not selected_evidence:
+        return {key: evidence_by_key.get(key, ()) for key in selected_keys}
+    expanded = repository.expand_search_hits(selected_evidence, context)
+    keys_by_ref = {key[1]: key for key in selected_keys}
+    grouped: dict[MeetingKey, list[SearchHit]] = {key: [] for key in selected_keys}
+    for hit in expanded:
+        key = keys_by_ref.get(hit.meeting.ref)
+        if key is not None:
+            grouped[key].append(hit)
+    return {key: tuple(hits) for key, hits in grouped.items()}
 
 
 def weighted_rrf_score(

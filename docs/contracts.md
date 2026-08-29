@@ -30,7 +30,31 @@ when exactly one indexed source matches and otherwise raises an ambiguity error.
 values. Meeting scope, neighboring excerpts, bundle limits, and `MemoryEntity` attachment are
 owned by `ContextBundleBuilder`. The full `SearchHit` resolves through
 `MeetilyMemoryCore.resolve_search_hit()` with the same stable evidence ID; a missing ID is an
-integrity error, not an empty successful result.
+integrity error, not an empty successful result. Context expansion and entity hydration batch-resolve
+that stable ID inside one explicit SQLite read transaction, keep its snapshot through the final
+context/entity SELECT that consumes `source_chunk_id`, verify the stored `MeetingRef`, and use only
+the newly resolved chunk ID. Nested callers reuse an existing transaction; owned read snapshots are
+rolled back on success or failure. Missing or mismatched evidence fails closed with an explicit
+retry-search error; a generation-local integer is never accepted as identity.
+
+Index schema v7 materializes every `chunks.evidence_id` as `TEXT NOT NULL UNIQUE` during ingestion.
+The `evidence:` prefix, source/meeting/chunk payload, canonical JSON encoding, and content-fingerprint
+fallback are unchanged. Search SQL returns the complete `Meeting`, `SourceExcerpt`, source UUID,
+local chunk ID, and evidence ID in one row; row-to-domain conversion performs no database or state
+lookup. Evidence resolution is one unique-index lookup. Context windows reuse one open connection
+and bounded SQL batches, while context entities are selected directly by `source_chunk_id IN (...)`
+in bounded batches.
+
+`MeetilyMemoryCore`, CLI search/context/open/list operations, MCP reads, and offline retrieval reads
+open an already-existing current index and state with SQLite `mode=ro`. This mode never creates a
+directory or database, migrates a schema, registers a source, heals a projection, or projects topic
+aliases. A missing or legacy disposable index fails with refresh/scan guidance. A missing
+`state.sqlite` instead requires restoring that authoritative database: refresh alone cannot recover
+a UUID already projected by a current index. An intentional identity reset first moves/removes the
+disposable index and then explicitly runs init/scan, with the understood loss of manual tags, task
+statuses, and task notes. Writer setup, scan/refresh, rebind, manual tag/task mutations, and the
+still-experimental topic materialization path use the explicit writer repository. Making topic/graph
+reads non-materializing remains separate topic work.
 
 ## User state migration
 
@@ -47,11 +71,12 @@ changing the UUID. `projected_path` records the last index projection confirmed 
 monotonic revision doubles as the opaque pending-claim/compensation token. A claim changes
 `current_path` and persists its pending revision without overwriting `projected_path`; therefore a
 same-target retry after process death still knows the actual legacy/current index path it must heal.
-Index schema v6 stores `sources.source_uuid` only as a `NOT NULL UNIQUE` projection supplied by the
-scanner after state registration. It also stores one stable `generation_id` marker with alias
-ownership; this generation identifier is independent of every source UUID.
+Index schema v6 introduced `sources.source_uuid` as a `NOT NULL UNIQUE` projection supplied by the
+scanner after state registration and one stable `generation_id` marker with alias ownership. Schema
+v7 preserves both and adds the materialized evidence identity. The generation identifier remains
+independent of every source UUID.
 
-Existing populated v1-v5 indexes are rebuilt side by side from a complete state-owned source
+Existing populated v1-v6 indexes are rebuilt side by side from a complete state-owned source
 snapshot, not only the requested source. Before backup and replacement, the active SQLite family is
 recovered, any WAL is checkpointed, `journal_mode=DELETE` is forced and verified, and an exclusive
 transaction is held through the final sidecar check and swap. A live or uncheckpointable WAL fails
@@ -73,19 +98,19 @@ assigning an old UUID to another database. Legacy settings migration is lookup-o
 only by exact raw equality with `state.current_path`, or with `state.projected_path` while that source
 has a pending claim. A pending match then uses authoritative `current_path`; paths are never
 re-resolved as identity evidence, and settings can never create or backfill a UUID. Before a
-populated v1-v5 index is opened through migration-capable code, scanner
+populated v1-v6 index is opened through migration-capable code, scanner
 preflight verifies every legacy source against state. A missing identity fails with explicit
 `mm config source`/`--rebind --source-uuid` recovery guidance and leaves the index generation
 unchanged. Empty/new index flows may still register a source through explicit init/config/scan.
 App settings select the UUID and do not keep a second authoritative path after the legacy
-`source_path` setting migrates. On an ordinary v6 scan, any persisted pending binding is projected
+`source_path` setting migrates. On an ordinary v7 scan, any persisted pending binding is projected
 to both `sources.path` and every related `meetings.source_path` in one index transaction before
-unchanged meeting fingerprints can short-circuit content upserts. Opening a current v6 generation
+unchanged meeting fingerprints can short-circuit content upserts. Opening a current v7 writer
 checks every pending claim represented by the index, including secondary sources, and finalizes all
 verified claims with one state transaction/CAS. A legacy rebuild projects the same complete pending
 snapshot into the replacement and batch-finalizes it only after the verified swap. A successful
 refresh therefore heals process death before projection, after projection, during multi-source
-finalization, or after a v5-to-v6 swap.
+finalization, or after a v5/v6-to-v7 swap.
 
 `mm config source NEW_PATH --rebind [--source-uuid UUID]` is the explicit user assertion that a
 state-owned UUID now belongs to the validated target DB. The optional UUID can repair a
@@ -114,8 +139,8 @@ or no exact raw match fails without state/index creation or migration. Rebind th
 opens the index. For legacy v3, it completes the durable task-state transfer and safe in-place
 upgrade through v5 before creating the new path claim, so the old projection maps to the selected
 UUID. Rejected unknown or already-owned targets never open or migrate the index. Rebind then updates
-the existing v5 or v6 index projection without turning the operation into ordinary source selection.
-For v6, the current claim revision is checked
+the existing v5, v6, or v7 index projection without turning the operation into ordinary source
+selection. For v7, the current claim revision is checked
 before and inside the index write transaction, the source row is selected by authoritative UUID,
 target ownership is checked, and the actual projected path is compare-and-set to the claimed path
 while every `meetings.source_path` is updated. This permits a same-target rebind to repair a stale
@@ -146,7 +171,7 @@ incompatible, or unreadable. After migration,
 
 Manual topic aliases are also authoritative in `state.sqlite`. The additive state migration creates
 stable topic descriptors, normalized alias rows, a generation/path ownership ledger, and a
-composite generation/path import ledger atomically. Fresh and side-by-side v6 generations receive a
+composite generation/path import ledger atomically. Fresh and side-by-side v7 generations receive a
 stable marker unrelated to source UUIDs and are registered as state-owned before their first alias
 projection; a state-owned generation never imports its derived rows back. Legacy v5 and old
 unmarked v6 aliases are imported once while a normal read-write connection holds `BEGIN IMMEDIATE`:
