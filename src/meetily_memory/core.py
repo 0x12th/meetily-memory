@@ -305,6 +305,7 @@ def meeting_chunk_from_row(row: dict[str, Any]) -> MeetingChunk:
 def topic_from_row(row: dict[str, Any]) -> Topic:
     return Topic(
         id=int(row["id"]),
+        stable_key=str(row["stable_key"]),
         title=str(row["title"]),
         aliases=tuple(str(alias) for alias in row["aliases"]),
     )

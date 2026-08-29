@@ -1,14 +1,69 @@
+import base64
+import binascii
+import hashlib
+import re
 import shlex
-from dataclasses import dataclass
+import unicodedata
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
 from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.json_codec import dumps_json, loads_json
 from meetily_memory.serializers import (
     meeting_payload,
     structured_signal_payload,
     topic_memory_payload,
 )
+
+OBSIDIAN_DIRS = (
+    "Topics",
+    "Meetings",
+    "People",
+    "Tasks",
+    "Decisions",
+    "Risks",
+    "Questions",
+)
+MANAGED_MARKER = "<!-- meetily-memory:managed:v1:"
+MANAGED_MARKER_RE = re.compile(r"^<!-- meetily-memory:managed:v1:([A-Za-z0-9_-]+) -->$")
+MAX_FILENAME_COMPONENT_BYTES = 255
+NOTE_EXTENSION = ".md"
+SUFFIX_DIGEST_HEX_LENGTH = 20
+OBJECT_KEY_VERSION = 1
+ASCII_CONTROL_LIMIT = 32
+ASCII_DELETE = 127
+TEMP_PATH_ATTEMPTS = 1000
+FORBIDDEN_FILENAME_CHARS = frozenset('<>:"/\\|?*#^[]')
+FORBIDDEN_WIKILINK_ALIAS_CHARS = frozenset("\\|[]#^")
+WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{number}" for number in range(1, 10)}
+    | {f"lpt{number}" for number in range(1, 10)}
+)
+ENTITY_DIRS = {
+    "action_items": "Tasks",
+    "decisions": "Decisions",
+    "risks": "Risks",
+    "open_questions": "Questions",
+}
+IDENTITY_SCHEMAS = {
+    "meeting": frozenset({"version", "kind", "source_uuid", "external_id"}),
+    "entity": frozenset(
+        {
+            "version",
+            "kind",
+            "source_uuid",
+            "meeting_external_id",
+            "chunk_evidence_id",
+            "entity_kind",
+            "stable_content_fingerprint",
+        }
+    ),
+    "topic": frozenset({"version", "kind", "stable_key"}),
+    "person": frozenset({"version", "kind", "stable_key"}),
+}
 
 
 @dataclass(frozen=True)
@@ -27,16 +82,181 @@ class ObsidianSyncResult:
         }
 
 
-MANAGED_MARKER = "<!-- meetily-memory:managed -->"
-OBSIDIAN_DIRS = (
-    "Topics",
-    "Meetings",
-    "People",
-    "Tasks",
-    "Decisions",
-    "Risks",
-    "Questions",
-)
+@dataclass(frozen=True)
+class NoteRef:
+    object_key: str
+    directory: str
+    display_label: str
+    suffix_kind: str
+    stem: str = field(init=False)
+    relative_path: Path = field(init=False)
+    wikilink: str = field(init=False)
+    identity_marker: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.directory not in OBSIDIAN_DIRS:
+            message = f"Unknown Obsidian note directory: {self.directory}"
+            raise ValueError(message)
+        if not is_canonical_object_key(self.object_key):
+            message = "Obsidian note object key must use a canonical kind-specific v1 schema."
+            raise ValueError(message)
+        label = normalize_display_label(self.display_label)
+        digest = hashlib.sha256(self.object_key.encode()).hexdigest()
+        suffix = f"--{self.suffix_kind}-{digest[:SUFFIX_DIGEST_HEX_LENGTH]}"
+        stem = filename_stem(label, suffix)
+        encoded_key = base64.urlsafe_b64encode(self.object_key.encode()).decode().rstrip("=")
+        object.__setattr__(self, "display_label", label)
+        object.__setattr__(self, "stem", stem)
+        object.__setattr__(self, "relative_path", Path(self.directory) / f"{stem}{NOTE_EXTENSION}")
+        object.__setattr__(self, "wikilink", f"[[{stem}|{wikilink_alias(label)}]]")
+        object.__setattr__(
+            self,
+            "identity_marker",
+            f"{MANAGED_MARKER}{encoded_key} -->",
+        )
+
+    @classmethod
+    def meeting(cls, source_uuid: str, external_id: str, title: str) -> "NoteRef":
+        return cls(
+            object_key=note_object_key(
+                "meeting",
+                source_uuid=source_uuid,
+                external_id=external_id,
+            ),
+            directory="Meetings",
+            display_label=title,
+            suffix_kind="m",
+        )
+
+    @classmethod
+    def entity(  # noqa: PLR0913
+        cls,
+        *,
+        source_uuid: str,
+        meeting_external_id: str,
+        chunk_evidence_id: str,
+        kind: str,
+        stable_content_fingerprint: str,
+        text: str,
+        directory: str,
+    ) -> "NoteRef":
+        return cls(
+            object_key=note_object_key(
+                "entity",
+                source_uuid=source_uuid,
+                meeting_external_id=meeting_external_id,
+                chunk_evidence_id=chunk_evidence_id,
+                entity_kind=kind,
+                stable_content_fingerprint=stable_content_fingerprint,
+            ),
+            directory=directory,
+            display_label=text,
+            suffix_kind="e",
+        )
+
+    @classmethod
+    def topic(cls, stable_key: str, title: str) -> "NoteRef":
+        return cls(
+            object_key=note_object_key("topic", stable_key=stable_key),
+            directory="Topics",
+            display_label=title,
+            suffix_kind="t",
+        )
+
+    @classmethod
+    def person(cls, stable_key: str, display_name: str) -> "NoteRef":
+        return cls(
+            object_key=note_object_key("person", stable_key=stable_key),
+            directory="People",
+            display_label=display_name,
+            suffix_kind="p",
+        )
+
+
+@dataclass(frozen=True)
+class PlannedNote:
+    ref: NoteRef
+    text: str
+
+
+@dataclass(frozen=True)
+class _PlannedRemoval:
+    path: Path
+    replacement: Path | None
+    temporary: Path | None
+
+
+@dataclass(frozen=True)
+class _VaultPreflight:
+    writable: tuple[PlannedNote, ...]
+    removals: tuple[_PlannedRemoval, ...]
+    files_skipped: int
+
+
+def note_object_key(kind: str, **identity: str) -> str:
+    payload: dict[str, object] = {
+        "version": OBJECT_KEY_VERSION,
+        "kind": kind,
+        **identity,
+    }
+    if not is_valid_identity_payload(payload):
+        message = f"Invalid Obsidian {kind} note identity."
+        raise ValueError(message)
+    return dumps_json(payload)
+
+
+def normalize_display_label(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value)
+    label = " ".join(normalized.split())
+    return label or "Untitled"
+
+
+def normalize_domain_key(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFC", value).casefold().split())
+
+
+def stable_content_fingerprint(value: str) -> str:
+    return hashlib.sha256(normalize_domain_key(value).encode()).hexdigest()
+
+
+def filename_stem(label: str, suffix: str) -> str:
+    readable = "".join(
+        "_"
+        if char in FORBIDDEN_FILENAME_CHARS
+        or ord(char) < ASCII_CONTROL_LIMIT
+        or ord(char) == ASCII_DELETE
+        else char
+        for char in label
+    ).strip(" .")
+    if not readable or readable in {".", ".."}:
+        readable = "Untitled"
+    if readable.casefold().split(".", maxsplit=1)[0] in WINDOWS_RESERVED_NAMES:
+        readable = f"_{readable}"
+    readable_budget = (
+        MAX_FILENAME_COMPONENT_BYTES - len(suffix.encode()) - len(NOTE_EXTENSION.encode())
+    )
+    readable = truncate_utf8(readable, readable_budget).rstrip(" .") or "Untitled"
+    stem = f"{readable}{suffix}"
+    if len(f"{stem}{NOTE_EXTENSION}".encode()) > MAX_FILENAME_COMPONENT_BYTES:
+        message = "Obsidian note filename exceeds the UTF-8 component limit."
+        raise ValueError(message)
+    return stem
+
+
+def truncate_utf8(value: str, byte_limit: int) -> str:
+    result: list[str] = []
+    used = 0
+    for char in value:
+        char_bytes = len(char.encode())
+        if used + char_bytes > byte_limit:
+            break
+        result.append(char)
+        used += char_bytes
+    return "".join(result)
+
+
+def wikilink_alias(label: str) -> str:
+    return "".join("_" if char in FORBIDDEN_WIKILINK_ALIAS_CHARS else char for char in label)
 
 
 def sync_obsidian_vault(
@@ -47,183 +267,442 @@ def sync_obsidian_vault(
     limit: int | None = None,
 ) -> ObsidianSyncResult:
     root_dir = obsidian_root_dir(vault_path, folder)
-    for directory in OBSIDIAN_DIRS:
-        directory_path = root_dir / directory
-        directory_path.mkdir(parents=True, exist_ok=True)
-        if not directory_path.resolve().is_relative_to(root_dir):
-            msg = f"Obsidian managed directory escapes configured root: {directory}"
-            raise ValueError(msg)
-
     core = MeetilyMemoryCore(index_path)
-    files_written = 0
-    files_skipped = 0
-    expected_paths: set[Path] = set()
-    people: dict[str, dict[str, Any]] = {}
     effective_limit = limit if limit is not None else 2**31 - 1
-
-    written, skipped, paths = sync_obsidian_meetings(root_dir, core, effective_limit)
-    files_written += written
-    files_skipped += skipped
-    expected_paths.update(paths)
-
-    written, skipped, topic_people, paths = sync_obsidian_topics(root_dir, core, effective_limit)
-    files_written += written
-    files_skipped += skipped
-    people.update(topic_people)
-    expected_paths.update(paths)
-
-    written, skipped, entity_people, paths = sync_obsidian_entities(root_dir, core, effective_limit)
-    files_written += written
-    files_skipped += skipped
-    people.update(entity_people)
-    expected_paths.update(paths)
-
-    written, skipped, paths = sync_obsidian_people(root_dir, people)
-    files_written += written
-    files_skipped += skipped
-    expected_paths.update(paths)
-
-    files_removed = remove_stale_managed_notes(root_dir, expected_paths) if limit is None else 0
-
-    return ObsidianSyncResult(
-        root_dir=root_dir,
-        files_written=files_written,
-        files_skipped=files_skipped,
-        files_removed=files_removed,
-    )
+    plan = build_obsidian_note_plan(core, effective_limit)
+    return apply_obsidian_note_plan(root_dir, plan, destructive=limit is None)
 
 
 def obsidian_root_dir(vault_path: Path, folder: str) -> Path:
     vault_root = vault_path.expanduser().resolve()
     folder_path = Path(folder)
     if folder_path.is_absolute():
-        msg = "Obsidian folder must be relative to the configured vault."
-        raise ValueError(msg)
+        message = "Obsidian folder must be relative to the configured vault."
+        raise ValueError(message)
     root_dir = (vault_root / folder_path).resolve()
     if not root_dir.is_relative_to(vault_root):
-        msg = "Obsidian folder must stay inside the configured vault."
-        raise ValueError(msg)
+        message = "Obsidian folder must stay inside the configured vault."
+        raise ValueError(message)
     return root_dir
 
 
-def sync_obsidian_meetings(
+def build_obsidian_note_plan(core: MeetilyMemoryCore, limit: int) -> tuple[PlannedNote, ...]:
+    meetings = [meeting_payload(value) for value in core.meetings(limit=limit)]
+    topics = [topic_memory_payload(core.topic(topic.title)) for topic in core.topics(limit=limit)]
+    entities = [
+        structured_signal_payload(value)
+        for kind in ENTITY_DIRS
+        for value in core.structured_entities(kind, limit).entities
+    ]
+
+    notes: list[PlannedNote] = []
+    for meeting in meetings:
+        ref = meeting_note_ref(meeting)
+        notes.append(PlannedNote(ref, render_obsidian_meeting_note(meeting, ref)))
+
+    for topic in topics:
+        topic_definition = required_dict(topic, "topic")
+        ref = NoteRef.topic(str(topic_definition["stable_key"]), str(topic_definition["title"]))
+        notes.append(PlannedNote(ref, render_obsidian_topic_memory(topic, ref)))
+
+    for entity in entities:
+        ref = entity_note_ref(entity)
+        notes.append(PlannedNote(ref, render_obsidian_entity_note(entity, ref)))
+
+    people: dict[str, str] = {}
+    person_names = [
+        str(person["display_name"])
+        for topic in topics
+        for person in list_of_dicts(topic.get("related_people"))
+        if person.get("display_name")
+    ]
+    person_names.extend(person for entity in entities for person in payload_people(entity))
+    ordered_names = sorted(
+        person_names,
+        key=lambda value: (normalize_domain_key(value), value),
+    )
+    for display_name in ordered_names:
+        people.setdefault(person_stable_key(display_name), display_name)
+    for stable_key, display_name in sorted(people.items()):
+        ref = NoteRef.person(stable_key, display_name)
+        notes.append(PlannedNote(ref, render_obsidian_person_note(ref)))
+
+    ordered = tuple(sorted(notes, key=note_plan_sort_key))
+    validate_note_plan(ordered)
+    return ordered
+
+
+def note_plan_sort_key(note: PlannedNote) -> tuple[str, str]:
+    return (note.ref.relative_path.as_posix().casefold(), note.ref.object_key)
+
+
+def validate_note_plan(plan: tuple[PlannedNote, ...]) -> None:
+    object_keys: set[str] = set()
+    path_keys: set[str] = set()
+    for note in plan:
+        if note.ref.object_key in object_keys:
+            message = f"Duplicate Obsidian note object identity: {note.ref.object_key}"
+            raise ValueError(message)
+        path_key = portable_path_key(note.ref.relative_path)
+        if path_key in path_keys:
+            message = f"Duplicate Obsidian note path: {note.ref.relative_path}"
+            raise ValueError(message)
+        if note.ref.identity_marker not in note.text.splitlines():
+            message = f"Obsidian note is missing its identity marker: {note.ref.relative_path}"
+            raise ValueError(message)
+        object_keys.add(note.ref.object_key)
+        path_keys.add(path_key)
+
+
+def apply_obsidian_note_plan(
     root_dir: Path,
-    core: MeetilyMemoryCore,
-    limit: int,
-) -> tuple[int, int, set[Path]]:
-    files_written = 0
-    files_skipped = 0
-    expected_paths: set[Path] = set()
-    for value in core.meetings(limit=limit):
-        meeting = meeting_payload(value)
-        path = root_dir / "Meetings" / f"{safe_note_name(str(meeting['title']))}.md"
-        expected_paths.add(path)
-        written = write_managed_note(path, render_obsidian_meeting_note(meeting))
-        files_written += int(written)
-        files_skipped += int(not written)
-    return files_written, files_skipped, expected_paths
+    plan: tuple[PlannedNote, ...],
+    *,
+    destructive: bool,
+) -> ObsidianSyncResult:
+    validate_note_plan(plan)
+    preflight = preflight_obsidian_vault(root_dir, plan, destructive=destructive)
 
-
-def sync_obsidian_topics(
-    root_dir: Path,
-    core: MeetilyMemoryCore,
-    limit: int,
-) -> tuple[int, int, dict[str, dict[str, Any]], set[Path]]:
-    files_written = 0
-    files_skipped = 0
-    people: dict[str, dict[str, Any]] = {}
-    expected_paths: set[Path] = set()
-    for topic in core.topics(limit=limit):
-        title = topic.title
-        payload = topic_memory_payload(core.topic(title))
-        path = root_dir / "Topics" / f"{safe_note_name(title)}.md"
-        expected_paths.add(path)
-        written = write_managed_note(path, render_obsidian_topic_memory(payload))
-        files_written += int(written)
-        files_skipped += int(not written)
-        people.update(people_from_topic_payload(payload))
-    return files_written, files_skipped, people, expected_paths
-
-
-def sync_obsidian_entities(
-    root_dir: Path,
-    core: MeetilyMemoryCore,
-    limit: int,
-) -> tuple[int, int, dict[str, dict[str, Any]], set[Path]]:
-    files_written = 0
-    files_skipped = 0
-    people: dict[str, dict[str, Any]] = {}
-    expected_paths: set[Path] = set()
-    entity_dirs = {
-        "action_items": "Tasks",
-        "decisions": "Decisions",
-        "risks": "Risks",
-        "open_questions": "Questions",
-    }
-    for kind, directory in entity_dirs.items():
-        result = core.structured_entities(kind, limit)
-        for value in result.entities:
-            entity = structured_signal_payload(value)
-            filename = (
-                safe_note_name(str(entity["text"])[:80]) or f"{entity['kind']}-{entity['id']}"
-            )
-            path = root_dir / directory / f"{filename}.md"
-            expected_paths.add(path)
-            written = write_managed_note(path, render_obsidian_entity_note(entity))
-            files_written += int(written)
-            files_skipped += int(not written)
-            for person in payload_people(entity):
-                people[person.casefold()] = {"display_name": person}
-    return files_written, files_skipped, people, expected_paths
-
-
-def sync_obsidian_people(
-    root_dir: Path,
-    people: dict[str, dict[str, Any]],
-) -> tuple[int, int, set[Path]]:
-    files_written = 0
-    files_skipped = 0
-    expected_paths: set[Path] = set()
-    for person in people.values():
-        display_name = str(person["display_name"])
-        path = root_dir / "People" / f"{safe_note_name(display_name)}.md"
-        expected_paths.add(path)
-        written = write_managed_note(path, render_obsidian_person_note(display_name))
-        files_written += int(written)
-        files_skipped += int(not written)
-    return files_written, files_skipped, expected_paths
-
-
-def remove_stale_managed_notes(root_dir: Path, expected_paths: set[Path]) -> int:
-    files_removed = 0
     for directory in OBSIDIAN_DIRS:
-        for path in (root_dir / directory).glob("*.md"):
-            if path not in expected_paths and has_managed_marker(path):
-                path.unlink()
-                files_removed += 1
+        (root_dir / directory).mkdir(parents=True, exist_ok=True)
+    for note in preflight.writable:
+        (root_dir / note.ref.relative_path).write_text(note.text, encoding="utf-8")
+    files_removed = remove_planned_notes(preflight.removals)
+
+    return ObsidianSyncResult(
+        root_dir=root_dir,
+        files_written=len(preflight.writable),
+        files_skipped=preflight.files_skipped,
+        files_removed=files_removed,
+    )
+
+
+def preflight_obsidian_vault(
+    root_dir: Path,
+    plan: tuple[PlannedNote, ...],
+    *,
+    destructive: bool,
+) -> _VaultPreflight:
+    validate_managed_directories(root_dir)
+    existing_by_identity = existing_managed_notes(root_dir)
+    expected_paths = {note.ref.object_key: root_dir / note.ref.relative_path for note in plan}
+    writable, skipped_keys = writable_notes(plan, expected_paths)
+    occupied_path_keys = existing_portable_path_keys(root_dir) | {
+        portable_path_key(path) for path in expected_paths.values()
+    }
+    removals = (
+        stale_managed_notes(
+            existing_by_identity,
+            expected_paths,
+            skipped_keys,
+            occupied_path_keys,
+        )
+        if destructive
+        else set()
+    )
+    return _VaultPreflight(
+        writable=tuple(writable),
+        removals=tuple(sorted(removals, key=lambda removal: str(removal.path))),
+        files_skipped=len(skipped_keys),
+    )
+
+
+def existing_managed_notes(root_dir: Path) -> dict[str, list[Path]]:
+    notes: dict[str, list[Path]] = {}
+    for directory in OBSIDIAN_DIRS:
+        directory_path = root_dir / directory
+        if not directory_path.exists():
+            continue
+        for path in sorted(directory_path.glob(f"*{NOTE_EXTENSION}")):
+            if path.is_symlink():
+                message = f"Obsidian managed note must not be a symlink: {path}"
+                raise ValueError(message)
+            object_key = managed_object_key(path)
+            if object_key is not None:
+                notes.setdefault(object_key, []).append(path)
+    return notes
+
+
+def writable_notes(
+    plan: tuple[PlannedNote, ...],
+    expected_paths: dict[str, Path],
+) -> tuple[list[PlannedNote], set[str]]:
+    writable: list[PlannedNote] = []
+    skipped_keys: set[str] = set()
+    for note in plan:
+        path = expected_paths[note.ref.object_key]
+        if not path.exists():
+            writable.append(note)
+            continue
+        if path.is_symlink() or not path.is_file():
+            message = f"Obsidian note destination is not a regular file: {path}"
+            raise ValueError(message)
+        existing_text = path.read_text(encoding="utf-8")
+        existing_key = object_key_from_note_text(existing_text)
+        if existing_key is None:
+            skipped_keys.add(note.ref.object_key)
+        elif existing_key != note.ref.object_key:
+            message = f"Obsidian note path belongs to another managed object: {path}"
+            raise ValueError(message)
+        elif existing_text != note.text:
+            writable.append(note)
+    return writable, skipped_keys
+
+
+def stale_managed_notes(
+    existing_by_identity: dict[str, list[Path]],
+    expected_paths: dict[str, Path],
+    skipped_keys: set[str],
+    occupied_path_keys: set[str],
+) -> set[_PlannedRemoval]:
+    removals: set[_PlannedRemoval] = set()
+    for object_key, paths in existing_by_identity.items():
+        if object_key not in expected_paths:
+            removals.update(_PlannedRemoval(path, None, None) for path in paths)
+            continue
+        if object_key in skipped_keys:
+            continue
+        expected_path = expected_paths[object_key]
+        for path in paths:
+            if path == expected_path:
+                continue
+            temporary = None
+            if paths_are_same_case_variant(path, expected_path):
+                temporary = unique_case_rename_temp_path(
+                    path.parent,
+                    object_key,
+                    occupied_path_keys,
+                )
+            removals.add(_PlannedRemoval(path, expected_path, temporary))
+    return removals
+
+
+def existing_portable_path_keys(root_dir: Path) -> set[str]:
+    return {
+        portable_path_key(path)
+        for directory in OBSIDIAN_DIRS
+        if (directory_path := root_dir / directory).exists()
+        for path in directory_path.iterdir()
+    }
+
+
+def unique_case_rename_temp_path(
+    directory: Path,
+    object_key: str,
+    occupied_path_keys: set[str],
+) -> Path:
+    digest = hashlib.sha256(object_key.encode()).hexdigest()[:SUFFIX_DIGEST_HEX_LENGTH]
+    for attempt in range(TEMP_PATH_ATTEMPTS):
+        candidate = directory / f".meetily-memory-rename-{digest}-{attempt}{NOTE_EXTENSION}"
+        candidate_key = portable_path_key(candidate)
+        if candidate_key in occupied_path_keys or candidate.is_symlink() or candidate.exists():
+            continue
+        occupied_path_keys.add(candidate_key)
+        return candidate
+    message = f"Could not reserve a safe Obsidian rename path in {directory}."
+    raise ValueError(message)
+
+
+def remove_planned_notes(removals: tuple[_PlannedRemoval, ...]) -> int:
+    files_removed = 0
+    for removal in removals:
+        if removal.temporary is not None:
+            if removal.replacement is None or not paths_are_same_case_variant(
+                removal.path,
+                removal.replacement,
+            ):
+                message = f"Obsidian exact-name rename is no longer safe: {removal.path}"
+                raise RuntimeError(message)
+            rename_case_variant_exactly(
+                removal.path,
+                removal.temporary,
+                removal.replacement,
+            )
+            continue
+        removal.path.unlink()
+        files_removed += 1
     return files_removed
 
 
-def has_managed_marker(path: Path) -> bool:
-    return MANAGED_MARKER in path.read_text(encoding="utf-8").splitlines()
-
-
-def write_managed_note(path: Path, text: str) -> bool:
-    if path.exists() and not has_managed_marker(path):
+def paths_are_same_case_variant(path: Path, replacement: Path) -> bool:
+    if (
+        path.parent != replacement.parent
+        or path.name == replacement.name
+        or portable_path_key(path) != portable_path_key(replacement)
+        or path_entry_exists_exact(replacement)
+    ):
         return False
-    write_text_file(path, text)
-    return True
+    try:
+        return path.samefile(replacement)
+    except OSError:
+        return False
 
 
-def render_obsidian_meeting_note(meeting: dict[str, Any]) -> str:
-    meeting_ref = meeting["ref"]
-    if not isinstance(meeting_ref, dict):
-        message = "Serialized meeting ref must be an object."
-        raise TypeError(message)
+def path_entry_exists_exact(path: Path) -> bool:
+    if not path.parent.is_dir():
+        return False
+    return any(entry.name == path.name for entry in path.parent.iterdir())
+
+
+def rename_case_variant_exactly(path: Path, temporary: Path, replacement: Path) -> None:
+    if path.parent != temporary.parent or path.parent != replacement.parent:
+        message = "Obsidian exact-name rename paths must share one directory."
+        raise ValueError(message)
+    if not paths_are_same_case_variant(path, replacement):
+        message = f"Obsidian exact-name rename destination is not a safe alias: {replacement}"
+        raise FileExistsError(message)
+    if temporary.is_symlink() or temporary.exists() or path_entry_exists_exact(temporary):
+        message = f"Obsidian exact-name rename temporary path is no longer free: {temporary}"
+        raise FileExistsError(message)
+    try:
+        path.rename(temporary)
+    except OSError:
+        best_effort_restore_case_rename(temporary, path)
+        raise
+    try:
+        if replacement.is_symlink() or replacement.exists() or path_entry_exists_exact(replacement):
+            message = f"Obsidian exact-name rename destination is no longer free: {replacement}"
+            raise FileExistsError(message)
+        temporary.rename(replacement)
+    except OSError:
+        best_effort_restore_case_rename(temporary, path)
+        raise
+
+
+def best_effort_restore_case_rename(temporary: Path, original: Path) -> None:
+    if (
+        not path_entry_exists_exact(temporary)
+        or original.exists()
+        or path_entry_exists_exact(original)
+    ):
+        return
+    with suppress(OSError):
+        temporary.rename(original)
+
+
+def portable_path_key(path: Path) -> str:
+    return unicodedata.normalize("NFC", path.as_posix()).casefold()
+
+
+def validate_managed_directories(root_dir: Path) -> None:
+    root = root_dir.resolve()
+    for directory in OBSIDIAN_DIRS:
+        directory_path = root_dir / directory
+        if directory_path.is_symlink():
+            message = f"Obsidian managed directory must not be a symlink: {directory}"
+            raise ValueError(message)
+        if directory_path.exists() and not directory_path.is_dir():
+            message = f"Obsidian managed directory is not a directory: {directory}"
+            raise ValueError(message)
+        if not directory_path.resolve().is_relative_to(root):
+            message = f"Obsidian managed directory escapes configured root: {directory}"
+            raise ValueError(message)
+
+
+def managed_object_key(path: Path) -> str | None:
+    return object_key_from_note_text(path.read_text(encoding="utf-8"))
+
+
+def object_key_from_note_text(text: str) -> str | None:
+    managed_lines = [line for line in text.splitlines() if line.startswith("<!-- meetily-memory:")]
+    if len(managed_lines) != 1:
+        return None
+    match = MANAGED_MARKER_RE.fullmatch(managed_lines[0])
+    if match is None:
+        return None
+    encoded = match.group(1)
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        object_key = base64.urlsafe_b64decode(f"{encoded}{padding}").decode()
+        payload = loads_json(object_key)
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    canonical_encoded = base64.urlsafe_b64encode(object_key.encode()).decode().rstrip("=")
+    if canonical_encoded != encoded or not is_canonical_object_key(object_key, payload=payload):
+        return None
+    return object_key
+
+
+def is_canonical_object_key(object_key: str, *, payload: object | None = None) -> bool:
+    try:
+        decoded = loads_json(object_key) if payload is None else payload
+    except ValueError:
+        return False
+    return is_valid_identity_payload(decoded) and dumps_json(decoded) == object_key
+
+
+def is_valid_identity_payload(payload: object) -> bool:
+    if type(payload) is not dict:
+        return False
+    identity = cast("dict[object, object]", payload)
+    if type(identity.get("version")) is not int or identity["version"] != OBJECT_KEY_VERSION:
+        return False
+    kind = identity.get("kind")
+    if type(kind) is not str or kind not in IDENTITY_SCHEMAS:
+        return False
+    if set(identity) != IDENTITY_SCHEMAS[kind]:
+        return False
+    string_fields = IDENTITY_SCHEMAS[kind] - {"version"}
+    if any(type(identity.get(field)) is not str or not identity[field] for field in string_fields):
+        return False
+    return kind != "entity" or identity["entity_kind"] in ENTITY_DIRS
+
+
+def has_managed_marker(path: Path) -> bool:
+    return managed_object_key(path) is not None
+
+
+def meeting_note_ref(meeting: dict[str, Any]) -> NoteRef:
+    meeting_ref = required_dict(meeting, "ref")
+    return NoteRef.meeting(
+        str(meeting_ref["source_uuid"]),
+        str(meeting_ref["external_id"]),
+        str(meeting["title"]),
+    )
+
+
+def entity_note_ref(entity: dict[str, Any]) -> NoteRef:
+    meeting_ref = required_dict(entity, "meeting_ref")
+    kind = str(entity["kind"])
+    try:
+        directory = ENTITY_DIRS[kind]
+    except KeyError as exc:
+        message = f"Unknown Obsidian entity kind: {kind}"
+        raise ValueError(message) from exc
+    return NoteRef.entity(
+        source_uuid=str(meeting_ref["source_uuid"]),
+        meeting_external_id=str(meeting_ref["external_id"]),
+        chunk_evidence_id=str(entity["chunk_evidence_id"]),
+        kind=kind,
+        stable_content_fingerprint=stable_content_fingerprint(str(entity["text"])),
+        text=str(entity["text"]),
+        directory=directory,
+    )
+
+
+def meeting_ref_from_row(row: dict[str, Any]) -> NoteRef:
+    meeting_ref = required_dict(row, "meeting_ref")
+    return NoteRef.meeting(
+        str(meeting_ref["source_uuid"]),
+        str(meeting_ref["external_id"]),
+        str(row.get("title") or row.get("meeting_title") or "Untitled"),
+    )
+
+
+def person_stable_key(display_name: str) -> str:
+    return f"person:{normalize_domain_key(display_name)}"
+
+
+def render_obsidian_meeting_note(
+    meeting: dict[str, Any],
+    ref: NoteRef | None = None,
+) -> str:
+    note_ref = ref or meeting_note_ref(meeting)
+    meeting_ref = required_dict(meeting, "ref")
     lines = [
-        f"# {meeting['title']}",
+        f"# {note_ref.display_label}",
         "",
-        MANAGED_MARKER,
+        note_ref.identity_marker,
         "",
         f"- Meetily ID: `{meeting_ref['external_id']}`",
         f"- Source UUID: `{meeting_ref['source_uuid']}`",
@@ -244,55 +723,53 @@ def render_obsidian_meeting_note(meeting: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_obsidian_topic_memory(topic_payload: dict[str, Any]) -> str:
-    topic = topic_payload["topic"]
+def render_obsidian_topic_memory(topic_payload: dict[str, Any], ref: NoteRef) -> str:
     lines = [
-        f"# {topic['title']}",
+        f"# {ref.display_label}",
         "",
-        MANAGED_MARKER,
+        ref.identity_marker,
         "",
         "## Meetings",
         "",
     ]
-    meetings = unique_meeting_titles(topic_payload.get("meetings", []))
-    lines.extend(f"- [[{title}]]" for title in meetings)
-    lines.extend(render_signal_sections(topic_payload.get("structured_signals", []), obsidian=True))
-    people = topic_payload.get("related_people", [])
-    if isinstance(people, list) and people:
+    meeting_refs = unique_meeting_refs(topic_payload.get("meetings"))
+    lines.extend(f"- {meeting_ref.wikilink}" for meeting_ref in meeting_refs)
+    lines.extend(render_signal_sections(topic_payload.get("structured_signals")))
+    people = list_of_dicts(topic_payload.get("related_people"))
+    if people:
         lines.extend(["", "## People", ""])
-        lines.extend(
-            f"- [[{person['display_name']}]]"
-            for person in people
-            if isinstance(person, dict) and person.get("display_name")
-        )
+        for person in people:
+            display_name = str(person["display_name"])
+            person_ref = NoteRef.person(person_stable_key(display_name), display_name)
+            lines.append(f"- {person_ref.wikilink}")
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_obsidian_entity_note(entity: dict[str, Any]) -> str:
-    title = str(entity["text"])
+def render_obsidian_entity_note(entity: dict[str, Any], ref: NoteRef) -> str:
+    meeting_ref = meeting_ref_from_row(entity)
     lines = [
-        f"# {title}",
+        f"# {ref.display_label}",
         "",
-        MANAGED_MARKER,
+        ref.identity_marker,
         "",
         f"- Kind: `{entity['kind']}`",
-        f"- Meeting: [[{entity['meeting_title']}]]",
+        f"- Meeting: {meeting_ref.wikilink}",
         f"- Source: {source_label(entity)}",
         "",
-        title,
+        ref.display_label,
     ]
     if entity.get("status"):
         lines.insert(6, f"- Status: `{entity['status']}`")
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_obsidian_person_note(display_name: str) -> str:
+def render_obsidian_person_note(ref: NoteRef) -> str:
     lines = [
-        f"# {display_name}",
+        f"# {ref.display_label}",
         "",
-        MANAGED_MARKER,
+        ref.identity_marker,
         "",
-        f"- Person: {display_name}",
+        f"- Person: {ref.display_label}",
     ]
     return "\n".join(lines).rstrip() + "\n"
 
@@ -302,22 +779,8 @@ def payload_people(entity: dict[str, Any]) -> list[str]:
     return [str(value)] if value else []
 
 
-def people_from_topic_payload(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    people: dict[str, dict[str, Any]] = {}
-    related_people = payload.get("related_people", [])
-    if not isinstance(related_people, list):
-        return people
-    for person in related_people:
-        if isinstance(person, dict) and person.get("display_name"):
-            display_name = str(person["display_name"])
-            people[display_name.casefold()] = {"display_name": display_name}
-    return people
-
-
-def render_signal_sections(rows: object, *, obsidian: bool) -> list[str]:
-    if not isinstance(rows, list):
-        return []
-    row_dicts = [cast("dict[str, Any]", row) for row in rows if isinstance(row, dict)]
+def render_signal_sections(rows: object) -> list[str]:
+    row_dicts = list_of_dicts(rows)
     groups = {
         "decisions": "Latest Decisions",
         "action_items": "Unresolved Tasks",
@@ -333,28 +796,19 @@ def render_signal_sections(rows: object, *, obsidian: bool) -> list[str]:
         for row in matching:
             text = str(row["text"])
             source = source_label(row)
-            if obsidian and row.get("meeting_title"):
-                lines.append(f"- {text} - [[{row['meeting_title']}]] - Source: {source}")
+            if isinstance(row.get("meeting_ref"), dict):
+                lines.append(f"- {text} - {meeting_ref_from_row(row).wikilink} - Source: {source}")
             else:
                 lines.append(f"- {text} - Source: {source}")
     return lines
 
 
-def unique_meeting_titles(rows: object) -> list[str]:
-    if not isinstance(rows, list):
-        return []
-    row_dicts = [cast("dict[str, Any]", row) for row in rows if isinstance(row, dict)]
-    titles: list[str] = []
-    seen: set[str] = set()
-    for row in row_dicts:
-        title = row.get("title")
-        if title is None:
-            continue
-        value = str(title)
-        if value not in seen:
-            seen.add(value)
-            titles.append(value)
-    return titles
+def unique_meeting_refs(rows: object) -> tuple[NoteRef, ...]:
+    refs: dict[str, NoteRef] = {}
+    for row in list_of_dicts(rows):
+        ref = meeting_ref_from_row(row)
+        refs.setdefault(ref.object_key, ref)
+    return tuple(refs[key] for key in sorted(refs))
 
 
 def source_label(row: dict[str, Any]) -> str:
@@ -367,7 +821,7 @@ def source_label(row: dict[str, Any]) -> str:
         meeting_source = str(row.get("meeting_external_id") or row.get("meeting_local_id") or "")
     source_parts = [
         meeting_source,
-        str(row.get("chunk_external_id") or row.get("source_chunk_id") or ""),
+        str(row.get("chunk_external_id") or row.get("chunk_evidence_id") or ""),
     ]
     source = " / ".join(part for part in source_parts if part)
     if row.get("chunk_timestamp_label"):
@@ -375,10 +829,15 @@ def source_label(row: dict[str, Any]) -> str:
     return source
 
 
-def write_text_file(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+def required_dict(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        message = f"Serialized {key} must be an object."
+        raise TypeError(message)
+    return cast("dict[str, Any]", value)
 
 
-def safe_note_name(value: str) -> str:
-    return "".join("_" if char in '/\\:*?"<>|' else char for char in value).strip()
+def list_of_dicts(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [cast("dict[str, Any]", row) for row in value if isinstance(row, dict)]

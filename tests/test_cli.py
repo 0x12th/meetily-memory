@@ -868,10 +868,10 @@ def test_cli_init_status_and_obsidian_sync(meetily_db: Path, tmp_path: Path) -> 
     )
     assert obsidian_sync.exit_code == 0
     assert "obsidian files synced:" in obsidian_sync.stdout
-    assert (vault_dir / "Meetily Memory" / "Meetings" / "Dobrynya Follow-up.md").exists()
-    assert "<!-- meetily-memory:managed -->" in (
-        vault_dir / "Meetily Memory" / "Meetings" / "Dobrynya Follow-up.md"
-    ).read_text(encoding="utf-8")
+    meeting_note = next(
+        (vault_dir / "Meetily Memory" / "Meetings").glob("Dobrynya Follow-up--m-*.md")
+    )
+    assert "<!-- meetily-memory:managed:v1:" in meeting_note.read_text(encoding="utf-8")
 
 
 def test_cli_obsidian_uses_workspace_settings_scope(meetily_db: Path, tmp_path: Path) -> None:
@@ -930,7 +930,9 @@ def test_cli_obsidian_uses_workspace_settings_scope(meetily_db: Path, tmp_path: 
     assert status.exit_code == 0
     assert f"vault: {workspace_vault}" in status.stdout
     assert "last sync: never" not in status.stdout
-    meeting_note = workspace_vault / "Meetily Memory" / "Meetings" / "Launch Planning.md"
+    meeting_note = next(
+        (workspace_vault / "Meetily Memory" / "Meetings").glob("Launch Planning--m-*.md")
+    )
     meeting_note.unlink()
     refresh = runner.invoke(
         app,

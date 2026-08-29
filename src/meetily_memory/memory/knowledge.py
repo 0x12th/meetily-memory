@@ -395,7 +395,12 @@ class KnowledgeRepository:
     ) -> dict[str, Any]:
         state = state or self.context.user_state
         aliases = [alias.alias for alias in state.list_topic_aliases(topic.stable_key)]
-        return {"id": topic_id, "title": topic.title, "aliases": aliases}
+        return {
+            "id": topic_id,
+            "stable_key": topic.stable_key,
+            "title": topic.title,
+            "aliases": aliases,
+        }
 
     def project_topic_aliases(self, *, connection: sqlite3.Connection | None = None) -> None:
         aliases = self.context.user_state.list_topic_aliases()
@@ -546,6 +551,7 @@ class KnowledgeRepository:
                     definition.title,
                     {
                         "id": int(row["id"]),
+                        "stable_key": definition.stable_key,
                         "title": definition.title,
                         "aliases": state_aliases.get(stable_key, []),
                     },
@@ -559,6 +565,7 @@ class KnowledgeRepository:
                     definition.title,
                     {
                         "id": virtual_ids[stable_key],
+                        "stable_key": definition.stable_key,
                         "title": definition.title,
                         "aliases": state_aliases.get(stable_key, []),
                     },

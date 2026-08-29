@@ -191,6 +191,7 @@ def structured_signal_payload(signal: StructuredSignal) -> JsonObject:
         "meeting_language": signal.meeting_language,
         "meeting_date": signal.meeting_date,
         "chunk_external_id": signal.chunk_external_id,
+        "chunk_evidence_id": signal.chunk_evidence_id,
         "chunk_kind": signal.chunk_kind,
         "chunk_speaker": signal.chunk_speaker,
         "chunk_timestamp_label": signal.chunk_timestamp_label,
@@ -225,7 +226,12 @@ def timeline_memory_payload(memory: TimelineMemory) -> JsonObject:
 
 
 def topic_payload(topic: Topic) -> JsonObject:
-    return {"id": topic.id, "title": topic.title, "aliases": list(topic.aliases)}
+    return {
+        "id": topic.id,
+        "stable_key": topic.stable_key,
+        "title": topic.title,
+        "aliases": list(topic.aliases),
+    }
 
 
 def person_payload(person: Person) -> JsonObject:

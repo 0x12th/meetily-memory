@@ -180,15 +180,21 @@ Risks/
 Questions/
 ```
 
-Managed notes use:
+Managed notes use a versioned object-identity marker:
 
 ```html
-<!-- meetily-memory:managed -->
+<!-- meetily-memory:managed:v1:ENCODED_OBJECT_KEY -->
 ```
 
+Readable filenames have a deterministic identity suffix, and wikilinks use readable aliases, for
+example `[[Launch Planning--m-3fa912abcdef12345678|Launch Planning]]`. The complete filename is
+NFC-normalized, cross-platform-safe, and limited to 255 UTF-8 bytes without splitting a code point.
 A generated meeting note persists its open command with the stable meeting reference:
 `mm open --source-uuid UUID --external-id ID`. Obsidian output never persists a generation-local
-integer meeting ID in that command.
+integer meeting ID in that command. Identity markers are owned only when canonical and an exact,
+non-empty kind-specific v1 schema; opaque identity strings are not Unicode-normalized. Sync rejects
+symlinked managed directories and preflights the complete note plan before filesystem mutation;
+limited sync never removes notes.
 
 ## Automatic Refreshes
 

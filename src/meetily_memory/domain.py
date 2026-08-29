@@ -179,6 +179,7 @@ class StructuredSignal:
     meeting_language: str | None
     meeting_date: str | None
     chunk_external_id: str | None
+    chunk_evidence_id: str
     chunk_kind: str
     chunk_speaker: str | None
     chunk_timestamp_label: str | None
@@ -211,6 +212,7 @@ class TimelineMemory:
 @dataclass(frozen=True)
 class Topic:
     id: int
+    stable_key: str
     title: str
     aliases: tuple[str, ...]
 

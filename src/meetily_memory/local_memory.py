@@ -121,6 +121,7 @@ def structured_signal_from_row(row: Row) -> StructuredSignal:
         meeting_language=optional_str(row.get("meeting_language")),
         meeting_date=optional_str(row.get("meeting_date")),
         chunk_external_id=optional_str(row.get("chunk_external_id")),
+        chunk_evidence_id=str(row["chunk_evidence_id"]),
         chunk_kind=str(row["chunk_kind"]),
         chunk_speaker=optional_str(row.get("chunk_speaker")),
         chunk_timestamp_label=optional_str(row.get("chunk_timestamp_label")),

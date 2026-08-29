@@ -64,23 +64,45 @@ Questions/
 This gives Obsidian a useful graph without exposing Meetily Memory's internal
 graph projection as a user-facing command.
 
-Managed files must include:
+Every generated object is represented by one typed note reference. That reference produces the
+stable object key, readable filename plus deterministic 80-bit suffix, relative path, display
+label, alias wikilink, and versioned identity marker. Example:
 
-```html
-<!-- meetily-memory:managed -->
+```text
+Meetings/Launch Planning--m-3fa912abcdef12345678.md
+[[Launch Planning--m-3fa912abcdef12345678|Launch Planning]]
+<!-- meetily-memory:managed:v1:ENCODED_OBJECT_KEY -->
 ```
+
+Meeting keys contain `source_uuid` plus `external_id`. Entity keys contain source UUID, meeting
+external ID, stable chunk evidence ID, entity kind, and a stable normalized-content fingerprint
+computed by the adapter; the repository entity fingerprint and local meeting, chunk, entity, topic,
+or person row IDs never participate. Topics use their persistent stable key, and people use their
+normalized domain key. Opaque UUID, external-ID, evidence-ID, and stable-key strings are preserved
+exactly in identity; only display labels and readable path components are NFC-normalized.
+
+Filenames are NFC-normalized and sanitize Windows, macOS, Linux, and Obsidian-reserved filename or
+wikilink characters. Each complete `.md` filename is at most 255 UTF-8 bytes; truncation reserves
+space for the suffix and extension and never splits a code point. The suffix keeps duplicate titles,
+sanitization collisions, and equal readable prefixes distinct while alias links remain readable.
 
 Generated meeting-note open commands use
 `mm open --source-uuid UUID --external-id ID`. The persisted command payload always carries the
-source-aware `MeetingRef` and never a generation-local integer meeting ID; title-based note naming
-and wikilinks are unchanged here.
+source-aware `MeetingRef` and never a generation-local integer meeting ID.
 
-The sync command may update managed files, but it must not overwrite unrelated
-user notes in the vault. A full sync also removes stale generated paths after a
-meeting is deleted or renamed. Removal is restricted to the integration's own
-directories and files containing the exact managed-marker line; unmarked notes
-and notes with a changed marker are preserved. Text and JSON results report
-written, skipped, and removed file counts.
+Sync builds and validates the complete, deterministically ordered note plan before creating a
+directory, writing a file, or removing a stale file. Duplicate object identities or cross-platform
+paths, any symlinked managed-directory component, managed destination collisions, and filesystem
+preflight errors therefore leave the vault unchanged. Marker ownership requires canonical JSON and
+base64 plus the exact kind-specific v1 field set with non-empty strings; missing, extra, or wrong-typed
+fields are foreign. Unmanaged files and markers from another format/version are never overwritten or
+removed. A full sync uses the object identity marker to remove a previous readable path after rename
+and to remove stale notes whose managed identities disappeared. Case-only rename uses portable path
+equivalence and filesystem identity so the newly written destination is never unlinked on a
+case-insensitive filesystem, while a genuinely distinct old path is removed on a case-sensitive one. If an unmanaged destination blocks a
+rename, the prior managed note is retained. A limited sync has an incomplete expected set and never
+performs destructive reconciliation. Text and JSON results report written, skipped, and removed file
+counts.
 
 With an explicit `--index`, Obsidian configuration is stored in the workspace
 `settings.json` next to that index. Without it, commands use the global settings

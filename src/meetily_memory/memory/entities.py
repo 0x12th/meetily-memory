@@ -84,6 +84,7 @@ ENTITY_DETAIL_SQL = {
           m.language AS meeting_language,
           COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
           c.external_id AS chunk_external_id,
+          c.evidence_id AS chunk_evidence_id,
           c.kind AS chunk_kind,
           c.speaker AS chunk_speaker,
           c.timestamp_label AS chunk_timestamp_label
@@ -108,6 +109,7 @@ ENTITY_DETAIL_SQL = {
           m.language AS meeting_language,
           COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
           c.external_id AS chunk_external_id,
+          c.evidence_id AS chunk_evidence_id,
           c.kind AS chunk_kind,
           c.speaker AS chunk_speaker,
           c.timestamp_label AS chunk_timestamp_label
@@ -128,6 +130,7 @@ ENTITY_DETAIL_SQL = {
           m.language AS meeting_language,
           COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
           c.external_id AS chunk_external_id,
+          c.evidence_id AS chunk_evidence_id,
           c.kind AS chunk_kind,
           c.speaker AS chunk_speaker,
           c.timestamp_label AS chunk_timestamp_label
@@ -148,6 +151,7 @@ ENTITY_DETAIL_SQL = {
           m.language AS meeting_language,
           COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
           c.external_id AS chunk_external_id,
+          c.evidence_id AS chunk_evidence_id,
           c.kind AS chunk_kind,
           c.speaker AS chunk_speaker,
           c.timestamp_label AS chunk_timestamp_label

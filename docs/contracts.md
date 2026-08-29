@@ -63,6 +63,34 @@ identity with SQLite `mode=rw`: they do not create a directory/database or migra
 missing, replaced, or retargeted state path fails with restore-state guidance before commit instead
 of writing a new database or another workspace/global state.
 
+## Obsidian note identity
+
+The Obsidian adapter builds one complete, immutable note plan before filesystem mutation. Each typed
+`NoteRef` owns the canonical object key, NFC-normalized byte-bounded readable stem, deterministic
+80-bit suffix, relative path, display label, alias wikilink, and versioned identity marker; path and
+link policy cannot diverge. Meeting identity is `(source_uuid, external_id)`. Entity identity is
+`(source_uuid, meeting_external_id, chunk_evidence_id, entity_kind,
+stable_content_fingerprint)` and never contains a local row ID. Topics use their persistent stable
+key; people use a normalized domain key. Opaque source UUIDs, external IDs, evidence IDs, and stable
+domain keys are preserved byte-for-byte in the canonical object key; NFC applies only to display
+labels and readable path components.
+
+The complete `.md` component is at most 255 UTF-8 bytes with suffix and extension space reserved;
+truncation does not split code points. Windows reserved basenames, control characters, trailing dots
+or spaces, filesystem separators, and Obsidian link delimiters are sanitized. Planned object keys and
+NFC/case-folded relative paths must both be unique, and plan order is deterministic.
+
+Vault preflight rejects every symlink at a managed directory component, then reads all destinations
+and recognized markers before the first `mkdir`, write, or remove. Any duplicate, symlink, or
+managed-object collision fails with zero filesystem mutation. Marker ownership requires canonical
+JSON/base64 plus the exact non-empty typed v1 schema for its kind; missing, extra, or wrong-typed
+fields are foreign. A full sync reconciles by decoded object identity: rename removes only prior paths
+for that identity, and deleted identities remove only valid v1 managed notes. Case-only rename checks
+portable path equivalence and filesystem `samefile` after writing, so it never unlinks a destination
+that is the same filesystem object while still removing a distinct old path on case-sensitive
+filesystems. Unmanaged files and foreign or malformed marker formats are preserved. If an unmanaged destination blocks a rename, its prior managed path is also
+preserved. A limited sync never removes files because its expected identity set is incomplete.
+
 ## Atomic refresh publication
 
 An ordinary schema-v7 refresh publishes one incremental projection transaction; it does not copy or
