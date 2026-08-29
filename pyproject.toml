@@ -66,6 +66,12 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"scripts/smoke-release-asset.py" = [
+  "N818",
+  "S202",
+  "S603",
+  "S608",
+]
 "src/meetily_memory/cli/app.py" = [
   "FBT002",
 ]

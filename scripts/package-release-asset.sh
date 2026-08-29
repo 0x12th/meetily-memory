@@ -15,6 +15,7 @@ package_dir="$release_root/$name"
 archive="$release_root/$name.tar.gz"
 
 test -x dist/mm/mm
+test -d dist/mm/_internal
 
 rm -rf "$package_dir" "$archive"
 mkdir -p "$package_dir"
@@ -24,10 +25,5 @@ cp README.md "$package_dir/README.md"
 cp CHANGELOG.md "$package_dir/CHANGELOG.md"
 cp LICENSE "$package_dir/LICENSE"
 
-tar -C "$release_root" -czf "$archive" "$name"
-
-if command -v shasum >/dev/null 2>&1; then
-  shasum -a 256 "$archive"
-else
-  sha256sum "$archive"
-fi
+COPYFILE_DISABLE=1 tar -C "$release_root" -czf "$archive" "$name"
+printf '%s\n' "$archive"

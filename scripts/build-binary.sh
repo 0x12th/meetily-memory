@@ -9,6 +9,7 @@ uv run pyinstaller \
   --onedir \
   --name "$name" \
   --clean \
+  --copy-metadata meetily-memory \
   --distpath dist \
   --workpath build/pyinstaller \
   --specpath build/pyinstaller \

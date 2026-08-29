@@ -36,6 +36,24 @@ Build the package:
 uv build
 ```
 
+Build and validate a macOS release archive:
+
+```bash
+scripts/build-binary.sh
+scripts/package-release-asset.sh v0.6.0 macos-arm64
+scripts/smoke-release-asset.py \
+  target/release-assets/meetily-memory-v0.6.0-macos-arm64.tar.gz \
+  v0.6.0
+```
+
+The release smoke always tests the exact `.tar.gz`, not `dist/`. It extracts into an empty
+system temporary directory, runs `mm` from a clean working directory without the checkout or
+virtual-environment import paths, and uses a synthetic SQLite source plus an isolated
+`MEETILY_MEMORY_DATA_DIR`. The adjacent `.tar.gz.smoke.json` file records the machine-readable
+result. Generate and upload checksums only after this command succeeds. Release CI preserves the
+architecture-specific smoke JSON even when smoke fails, but a failed smoke blocks checksum
+creation, release-asset upload, and the publish job.
+
 Repository boundary:
 
 `IndexRepository` is a compatibility facade for the public core API and legacy

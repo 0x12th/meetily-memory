@@ -28,6 +28,9 @@ jobs:
   build-macos:
     name: Build ${{ matrix.suffix }}
     needs: test
+    env:
+      ASSET_SUFFIX: ${{ matrix.suffix }}
+      RELEASE_TAG: ${{ github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -44,33 +47,83 @@ jobs:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --dev --python 3.12
-      - run: scripts/build-binary.sh
-      - run: scripts/package-release-asset.sh "${{ github.ref_name }}" "${{ matrix.suffix }}"
-      - uses: actions/upload-artifact@v4
+      - name: Validate release tag
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'unsupported release tag: %s\n' "$RELEASE_TAG" >&2
+            exit 2
+          fi
+          case "$ASSET_SUFFIX" in
+            macos-arm64|macos-x86_64) ;;
+            *)
+              printf 'unsupported asset suffix: %s\n' "$ASSET_SUFFIX" >&2
+              exit 2
+              ;;
+          esac
+      - name: Build binary
+        run: scripts/build-binary.sh
+      - name: Package exact release archive
+        run: scripts/package-release-asset.sh "$RELEASE_TAG" "$ASSET_SUFFIX"
+      - name: Smoke packaged release archive
+        run: |
+          archive="target/release-assets/meetily-memory-${RELEASE_TAG}-${ASSET_SUFFIX}.tar.gz"
+          result="target/release-assets/packaged-binary-${ASSET_SUFFIX}.smoke.json"
+          scripts/smoke-release-asset.py "$archive" "$RELEASE_TAG" --result "$result"
+      - name: Preserve packaged smoke result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
         with:
-          name: meetily-memory-${{ github.ref_name }}-${{ matrix.suffix }}
-          path: target/release-assets/meetily-memory-${{ github.ref_name }}-${{ matrix.suffix }}.tar.gz
+          name: meetily-memory-smoke-${{ env.ASSET_SUFFIX }}
+          path: target/release-assets/packaged-binary-${{ env.ASSET_SUFFIX }}.smoke.json
+          if-no-files-found: warn
+      - name: Generate asset checksum
+        if: ${{ success() }}
+        working-directory: target/release-assets
+        run: |
+          archive="meetily-memory-${RELEASE_TAG}-${ASSET_SUFFIX}.tar.gz"
+          checksum="${archive}.sha256"
+          shasum -a 256 "$archive" > "$checksum"
+      - name: Preserve smoke-approved release asset
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetily-memory-${{ env.RELEASE_TAG }}-${{ env.ASSET_SUFFIX }}
+          path: |
+            target/release-assets/meetily-memory-${{ env.RELEASE_TAG }}-${{ env.ASSET_SUFFIX }}.tar.gz
+            target/release-assets/meetily-memory-${{ env.RELEASE_TAG }}-${{ env.ASSET_SUFFIX }}.tar.gz.sha256
           if-no-files-found: error
 
   publish-release:
     name: Publish GitHub Release
     needs: build-macos
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Validate release tag
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'unsupported release tag: %s\n' "$RELEASE_TAG" >&2
+            exit 2
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: target/release-assets
           merge-multiple: true
-      - name: Generate checksums
+      - name: Assemble smoke-approved checksums
+        working-directory: target/release-assets
         run: |
-          cd target/release-assets
-          sha256sum *.tar.gz > SHA256SUMS
+          cat \
+            "meetily-memory-${RELEASE_TAG}-macos-arm64.tar.gz.sha256" \
+            "meetily-memory-${RELEASE_TAG}-macos-x86_64.tar.gz.sha256" \
+            > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           body_path: CHANGELOG.md
           files: |
-            target/release-assets/*.tar.gz
+            target/release-assets/meetily-memory-${{ env.RELEASE_TAG }}-macos-arm64.tar.gz
+            target/release-assets/meetily-memory-${{ env.RELEASE_TAG }}-macos-x86_64.tar.gz
             target/release-assets/SHA256SUMS
