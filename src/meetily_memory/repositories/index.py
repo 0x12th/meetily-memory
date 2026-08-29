@@ -144,7 +144,7 @@ class IndexRepository:
             KnowledgeContext(
                 index_path=self.index_path,
                 connection=self.connection,
-                search_meetings=self.search,
+                search_meetings=self.search_repo.search_in_snapshot,
                 chunk_rows=self.meetings.chunk_rows,
                 meeting_people_rows=self.meetings.meeting_people_rows,
                 structured_entity_rows=self.meetings.structured_entity_rows,
@@ -162,8 +162,6 @@ class IndexRepository:
                 now=utc_now,
             )
         )
-        if not self.read_only and not self.requires_rebuild:
-            self.knowledge.project_topic_aliases()
 
     @classmethod
     def open_existing(
@@ -666,6 +664,13 @@ class IndexRepository:
         aliases: Iterable[str] = (),
     ) -> dict[str, Any]:
         return self.knowledge.ensure_topic(title, aliases=aliases)
+
+    def add_topic_aliases(
+        self,
+        title: str,
+        aliases: Iterable[str],
+    ) -> dict[str, Any]:
+        return self.knowledge.add_topic_aliases(title, aliases)
 
     def remove_topic_aliases(self, aliases: Iterable[str]) -> tuple[str, ...]:
         return self.knowledge.remove_topic_aliases(aliases)

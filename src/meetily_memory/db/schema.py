@@ -28,7 +28,7 @@ def missing_user_state_message(state_path: Path) -> str:
         "projected by the current index. For an intentional identity reset, first move or remove "
         "the disposable `index.sqlite`, then run `mm init` or `mm scan --source PATH`. Manual "
         "tags, task statuses, and task notes cannot be recovered without the original "
-        "`state.sqlite`."
+        "`state.sqlite`. Manual topic aliases cannot be recovered either."
     )
 
 

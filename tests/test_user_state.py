@@ -25,6 +25,7 @@ from meetily_memory.user_state import (
     USER_STATE_SCHEMA,
     AmbiguousSourceIdentityError,
     SourcePathClaim,
+    StoredTopic,
     UserStateRepository,
 )
 
@@ -501,6 +502,40 @@ def test_pending_binding_and_topic_alias_schema_upgrades_are_atomic_and_retryabl
             "topic_alias_imports",
             "index_generations",
         }
+
+
+def test_topic_namespace_conflict_is_prevalidated_before_any_state_row(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    state = UserStateRepository(state_path)
+    beta = StoredTopic(
+        stable_key="topic:beta",
+        title="Beta",
+        normalized_title="beta",
+        created_at="beta-created",
+        updated_at="beta-updated",
+        raw_metadata_json='{"owner":"beta"}',
+    )
+    alpha = StoredTopic(
+        stable_key="topic:alpha",
+        title="Alpha",
+        normalized_title="alpha",
+        created_at="alpha-created",
+        updated_at="alpha-updated",
+        raw_metadata_json='{"owner":"alpha"}',
+    )
+    assert state.add_topic_aliases(beta, ["bee"], now="beta-alias") == ("bee",)
+    before = state_path.read_bytes()
+
+    added = state.add_topic_aliases(alpha, ["alpha-free", "  BETA  "], now="conflict")
+
+    assert added == ()
+    assert state_path.read_bytes() == before
+    assert state.topic_for_query("beta") == beta
+    assert state.topic_for_query("Alpha") is None
+    assert state.topic_for_query("alpha-free") is None
+    assert state.list_topics() == (beta,)
 
 
 def test_v6_alias_import_ledger_migrates_to_generation_and_path_key(tmp_path: Path) -> None:

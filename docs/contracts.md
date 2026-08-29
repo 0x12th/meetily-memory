@@ -45,16 +45,23 @@ lookup. Evidence resolution is one unique-index lookup. Context windows reuse on
 and bounded SQL batches, while context entities are selected directly by `source_chunk_id IN (...)`
 in bounded batches.
 
-`MeetilyMemoryCore`, CLI search/context/open/list operations, MCP reads, and offline retrieval reads
-open an already-existing current index and state with SQLite `mode=ro`. This mode never creates a
-directory or database, migrates a schema, registers a source, heals a projection, or projects topic
-aliases. A missing or legacy disposable index fails with refresh/scan guidance. A missing
+`MeetilyMemoryCore`, CLI search/context/open/list/topic operations, Core graph reads, MCP reads, and
+offline retrieval reads open an already-existing current index and state with SQLite `mode=ro`. This
+mode never creates a directory or database, migrates a schema, registers a source, heals a
+projection, or projects topic aliases. Topic and graph resolve canonical titles and aliases from
+state, then resolve the canonical stable key and compute current structured matches on one pinned
+index connection inside one explicit read snapshot; a generation-local topic ID never crosses an
+index connection or rebuild boundary. Topic term searches share that snapshot and deduplicate only
+by stable `evidence_id`, never by local chunk ID. An unknown query creates neither a topic row nor an
+edge. A missing or legacy disposable index fails with refresh/scan guidance. A missing
 `state.sqlite` instead requires restoring that authoritative database: refresh alone cannot recover
 a UUID already projected by a current index. An intentional identity reset first moves/removes the
 disposable index and then explicitly runs init/scan, with the understood loss of manual tags, task
-statuses, and task notes. Writer setup, scan/refresh, rebind, manual tag/task mutations, and the
-still-experimental topic materialization path use the explicit writer repository. Making topic/graph
-reads non-materializing remains separate topic work.
+statuses, task notes, and topic aliases. Scan/refresh, rebind, and manual tag/task mutations use an
+explicit writer repository. Topic alias mutations reopen only the already-validated physical state
+identity with SQLite `mode=rw`: they do not create a directory/database or migrate a schema. A
+missing, replaced, or retargeted state path fails with restore-state guidance before commit instead
+of writing a new database or another workspace/global state.
 
 ## User state migration
 
@@ -176,11 +183,31 @@ stable marker unrelated to source UUIDs and are registered as state-owned before
 projection; a state-owned generation never imports its derived rows back. Legacy v5 and old
 unmarked v6 aliases are imported once while a normal read-write connection holds `BEGIN IMMEDIATE`:
 hot rollback recovery and future-version rejection happen before state writes, and exact count plus
-digest are rechecked before the state transaction commits. Manual add and delete mutate state first,
-and topic resolution reads state first. The index `topic_aliases` table remains a derived
-compatibility projection. Rebuilds recreate it from state and verify every topic/alias metadata row
-exactly before replacement, so deletion, projection failure, and recreation of `index.sqlite` cannot
-resurrect a stale alias.
+digest are rechecked before the state transaction commits. Manual add and delete mutate only state;
+they do not commit a derived topic node, alias row, or `belongs_to` edge. Canonical topic keys and
+aliases share one casefold/whitespace-normalized namespace. Resolution checks canonical identity
+before aliases, and `BEGIN IMMEDIATE` prevalidates the complete alias batch before creating a topic
+or alias row. A cross-owner conflict adds nothing atomically; duplicate/empty/failed additions do
+not leave an orphan topic definition. Unicode casefold behavior, including `Straße`/`STRASSE`, is
+unchanged. When only an index canonical exists, reads preserve its title, stable key, metadata, and
+timestamps; an explicit alias add seeds state from that exact canonical descriptor rather than the
+query's casing or synthetic null metadata.
+
+Topic and graph resolution read canonical ownership from state and compute current matches without
+`ensure_topic()`, relinking, or commits. The index `topic_aliases` table remains a derived
+compatibility projection that is updated only by scan/rebuild lifecycle work. Topic listings include
+an index topic only when it still has a current knowledge relationship or a current state definition;
+an alias-only node left by deletion is ignored, matching a full rebuild. Rebuilds recreate the
+projection from state and verify every topic/alias metadata row exactly before replacement, so
+deletion, projection failure, and recreation of `index.sqlite` cannot resurrect a stale alias.
+
+The experimental topic contract uses the projected generation-local topic ID when one exists. A
+non-materialized topic receives a deterministic nonzero negative request-local ID derived from its
+canonical stable key. IDs are allocated in a range disjoint from computed edge IDs and checked for
+collisions against every topic ID in that result; a deterministic salted retry resolves a collision.
+Computed `belongs_to` graph edges use request-local negative IDs and `created_at = null`, and every
+edge endpoint names one unique node in the same result. All such IDs are presentation handles, not
+persistent identity, and must not be stored across calls.
 
 Read-only local diagnostics pin the physical index and state targets together before the first
 schema read. The same pinned targets and immutable read-only connections serve schema,

@@ -128,6 +128,7 @@ class MeetilySQLiteScanner:
                 analyze=analyze,
                 finalize=finalize,
             )
+            repo.project_topic_aliases()
         if finalize:
             self._discard_confirmed_backup()
         return result

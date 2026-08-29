@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -5,23 +6,26 @@ from pathlib import Path
 from typing import Any
 
 from meetily_memory.db.rows import rows_to_dicts
-from meetily_memory.db.schema import IndexConnectionFactory
+from meetily_memory.db.schema import IndexConnectionFactory, sqlite_read_snapshot
 from meetily_memory.memory.entities import ENTITY_NODE_TYPES, structured_entity_sort_key
 from meetily_memory.memory.keys import (
     entity_stable_key,
     normalize_key,
     row_matches_terms,
     topic_stable_key,
-    without_added_aliases,
 )
 from meetily_memory.user_state import StoredTopic, UserStateRepository
 
-SearchMeetings = Callable[[str, int], list[dict[str, Any]]]
+SearchMeetings = Callable[[sqlite3.Connection, str, int], list[dict[str, Any]]]
 ChunkRows = Callable[[sqlite3.Connection, int], list[sqlite3.Row]]
 PeopleRows = Callable[[sqlite3.Connection, int], list[sqlite3.Row]]
 StructuredRows = Callable[[sqlite3.Connection, int], list[dict[str, Any]]]
 AllStructuredRows = Callable[[sqlite3.Connection, int], list[dict[str, Any]]]
 NowProvider = Callable[[], str]
+
+TOPIC_MATCH_CANDIDATE_LIMIT = 500
+VIRTUAL_TOPIC_ID_HIGH_BIT = 1 << 62
+VIRTUAL_TOPIC_ID_VALUE_MASK = VIRTUAL_TOPIC_ID_HIGH_BIT - 1
 
 
 @dataclass(frozen=True)
@@ -311,66 +315,86 @@ class KnowledgeRepository:
         *,
         aliases: Iterable[str] = (),
     ) -> dict[str, Any]:
-        now = self.context.now()
-        topic = self.context.user_state.topic_for_query(title)
-        if topic is None:
-            with self.context.connection(self.context.index_path) as conn:
-                row = conn.execute(
-                    """
-                    SELECT *
-                    FROM knowledge_nodes
-                    WHERE type = 'Topic' AND stable_key = ?
-                    """,
-                    (topic_stable_key(title),),
-                ).fetchone()
-            topic = (
-                _stored_topic_from_row(row)
-                if row is not None
-                else StoredTopic(
-                    stable_key=topic_stable_key(title),
-                    title=title,
-                    normalized_title=normalize_key(title),
-                    created_at=now,
-                    updated_at=now,
-                    raw_metadata_json=None,
-                )
-            )
-        added_aliases = self.context.user_state.add_topic_aliases(
-            topic,
-            list(aliases),
-            now=now,
-        )
-        self.project_topic_aliases()
-        with self.context.connection(self.context.index_path) as conn:
-            topic_row = conn.execute(
-                """
-                SELECT id
-                FROM knowledge_nodes
-                WHERE type = 'Topic' AND stable_key = ?
-                """,
-                (topic.stable_key,),
-            ).fetchone()
-            topic_id = (
-                int(topic_row["id"])
-                if topic_row is not None
-                else self.upsert_knowledge_node(
-                    conn,
-                    "Topic",
-                    topic.stable_key,
-                    topic.title,
-                    now,
-                )
-            )
-            self.link_topic_matches(conn, topic_id, now)
-            conn.commit()
-            payload = self.topic_payload(conn, topic_id)
-            payload["added_aliases"] = list(added_aliases)
-            return payload
+        return self.add_topic_aliases(title, aliases)
+
+    def add_topic_aliases(
+        self,
+        title: str,
+        aliases: Iterable[str],
+    ) -> dict[str, Any]:
+        with self.context.connection(self.context.index_path) as conn, sqlite_read_snapshot(conn):
+            topic, topic_id, has_definition = self.resolve_topic(conn, title)
+            alias_values = list(aliases)
+            added_aliases: tuple[str, ...] = ()
+            state = self.context.user_state
+            if alias_values:
+                now = self.context.now()
+                if not has_definition:
+                    topic = StoredTopic(
+                        stable_key=topic.stable_key,
+                        title=topic.title,
+                        normalized_title=topic.normalized_title,
+                        created_at=now,
+                        updated_at=now,
+                        raw_metadata_json=topic.raw_metadata_json,
+                    )
+                state = self.writable_user_state()
+                added_aliases = state.add_topic_aliases(topic, alias_values, now=now)
+            payload = self.topic_definition_payload(topic, topic_id, state=state)
+        payload["added_aliases"] = list(added_aliases)
+        return payload
 
     def remove_topic_aliases(self, aliases: Iterable[str]) -> tuple[str, ...]:
-        removed = self.context.user_state.delete_topic_aliases(list(aliases))
-        self.project_topic_aliases()
-        return removed
+        return self.writable_user_state().delete_topic_aliases(list(aliases))
+
+    def writable_user_state(self) -> UserStateRepository:
+        return self.context.user_state.open_existing_writer()
+
+    def resolve_topic(
+        self,
+        conn: sqlite3.Connection,
+        title: str,
+    ) -> tuple[StoredTopic, int, bool]:
+        state_topic = self.context.user_state.topic_for_query(title)
+        stable_key = state_topic.stable_key if state_topic is not None else topic_stable_key(title)
+        row = conn.execute(
+            """
+            SELECT *
+            FROM knowledge_nodes
+            WHERE type = 'Topic' AND stable_key = ?
+            """,
+            (stable_key,),
+        ).fetchone()
+        if state_topic is not None:
+            topic = state_topic
+        elif row is not None:
+            topic = _stored_topic_from_row(row)
+        else:
+            topic = StoredTopic(
+                stable_key=stable_key,
+                title=title,
+                normalized_title=normalize_key(title),
+                created_at="",
+                updated_at="",
+                raw_metadata_json=None,
+            )
+        topic_id = (
+            int(row["id"])
+            if row is not None
+            else _request_local_topic_ids((topic.stable_key,))[topic.stable_key]
+        )
+        return topic, topic_id, state_topic is not None or row is not None
+
+    def topic_definition_payload(
+        self,
+        topic: StoredTopic,
+        topic_id: int,
+        *,
+        state: UserStateRepository | None = None,
+    ) -> dict[str, Any]:
+        state = state or self.context.user_state
+        aliases = [alias.alias for alias in state.list_topic_aliases(topic.stable_key)]
+        return {"id": topic_id, "title": topic.title, "aliases": aliases}
 
     def project_topic_aliases(self) -> None:
         aliases = self.context.user_state.list_topic_aliases()
@@ -439,20 +463,29 @@ class KnowledgeRepository:
             conn.commit()
 
     def topic_memory(self, title: str, limit: int = 10) -> dict[str, Any]:
-        topic = self.ensure_topic(title)
-        topic_terms = [str(topic["title"]), *(str(alias) for alias in topic["aliases"])]
-        evidence = search_topic_evidence(self.context.search_meetings, topic_terms, limit)
-        with self.context.connection(self.context.index_path) as conn:
-            rows = self.list_topic_entity_details(conn, int(topic["id"]), limit)
-            related_people = self.list_topic_people(conn, int(topic["id"]), limit)
-        language = dominant_language(
-            [
-                *(meeting.get("language") for meeting in evidence),
-                *(row.get("meeting_language") for row in rows),
+        with self.context.connection(self.context.index_path) as conn, sqlite_read_snapshot(conn):
+            topic, topic_id, _has_definition = self.resolve_topic(conn, title)
+            topic_payload = self.topic_definition_payload(topic, topic_id)
+            topic_terms = [
+                str(topic_payload["title"]),
+                *(str(alias) for alias in topic_payload["aliases"]),
             ]
-        )
+            evidence = search_topic_evidence(
+                self.context.search_meetings,
+                conn,
+                topic_terms,
+                limit,
+            )
+            rows = self.topic_entity_details_for_terms(conn, topic_terms, limit)
+            related_people = self.list_topic_people_for_rows(conn, rows, limit)
+            language = dominant_language(
+                [
+                    *(meeting.get("language") for meeting in evidence),
+                    *(row.get("meeting_language") for row in rows),
+                ]
+            )
         return {
-            "topic": without_added_aliases(topic),
+            "topic": topic_payload,
             "language": language,
             "query_terms": topic_terms,
             "meetings": evidence,
@@ -462,226 +495,209 @@ class KnowledgeRepository:
         }
 
     def list_topics(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self.context.connection(self.context.index_path) as conn:
-            rows = conn.execute(
+        state_topics = {topic.stable_key: topic for topic in self.context.user_state.list_topics()}
+        state_aliases: dict[str, list[str]] = {}
+        for alias in self.context.user_state.list_topic_aliases():
+            state_aliases.setdefault(alias.topic_stable_key, []).append(alias.alias)
+        with self.context.connection(self.context.index_path) as conn, sqlite_read_snapshot(conn):
+            index_rows = conn.execute(
                 """
-                SELECT *
-                FROM knowledge_nodes
-                WHERE type = 'Topic'
-                ORDER BY updated_at DESC, title ASC
-                LIMIT ?
-                """,
-                (limit,),
+                SELECT
+                  n.*,
+                  EXISTS (
+                    SELECT 1
+                    FROM knowledge_edges e
+                    WHERE e.from_node_id = n.id OR e.to_node_id = n.id
+                  ) AS has_knowledge_relationship
+                FROM knowledge_nodes n
+                WHERE n.type = 'Topic'
+                """
             ).fetchall()
-            return [self.topic_payload(conn, int(row["id"])) for row in rows]
+
+        eligible_index_rows = [
+            row
+            for row in index_rows
+            if str(row["stable_key"]) in state_topics or bool(row["has_knowledge_relationship"])
+        ]
+        projected_keys = {str(row["stable_key"]) for row in eligible_index_rows}
+        state_only_keys = tuple(
+            stable_key for stable_key in state_topics if stable_key not in projected_keys
+        )
+        virtual_ids = _request_local_topic_ids(
+            state_only_keys,
+            occupied_ids=(int(row["id"]) for row in eligible_index_rows),
+        )
+
+        entries: list[tuple[str, str, dict[str, Any]]] = []
+        for row in eligible_index_rows:
+            stable_key = str(row["stable_key"])
+            definition = state_topics.get(stable_key) or _stored_topic_from_row(row)
+            entries.append(
+                (
+                    definition.updated_at,
+                    definition.title,
+                    {
+                        "id": int(row["id"]),
+                        "title": definition.title,
+                        "aliases": state_aliases.get(stable_key, []),
+                    },
+                )
+            )
+        for stable_key in state_only_keys:
+            definition = state_topics[stable_key]
+            entries.append(
+                (
+                    definition.updated_at,
+                    definition.title,
+                    {
+                        "id": virtual_ids[stable_key],
+                        "title": definition.title,
+                        "aliases": state_aliases.get(stable_key, []),
+                    },
+                )
+            )
+        entries.sort(key=lambda entry: entry[1].casefold())
+        entries.sort(key=lambda entry: entry[0], reverse=True)
+        return [entry[2] for entry in entries[:limit]]
 
     def graph_for_topic(self, title: str, limit: int = 50) -> dict[str, Any]:
-        topic = self.ensure_topic(title)
-        topic_id = int(topic["id"])
-        with self.context.connection(self.context.index_path) as conn:
-            linked_entity_rows = conn.execute(
-                """
-                SELECT from_node_id
-                FROM knowledge_edges
-                WHERE relation = 'belongs_to' AND to_node_id = ?
-                LIMIT ?
-                """,
-                (topic_id, limit),
-            ).fetchall()
-            linked_entity_ids = [int(row["from_node_id"]) for row in linked_entity_rows]
-            edge_rows = self.graph_edge_rows(conn, topic_id, linked_entity_ids, limit)
+        with self.context.connection(self.context.index_path) as conn, sqlite_read_snapshot(conn):
+            topic, topic_id, _has_definition = self.resolve_topic(conn, title)
+            topic_payload = self.topic_definition_payload(topic, topic_id)
+            topic_terms = [
+                str(topic_payload["title"]),
+                *(str(alias) for alias in topic_payload["aliases"]),
+            ]
+            rows = self.topic_entity_details_for_terms(conn, topic_terms, max(limit, 0))
+            linked_entities = self.topic_entity_nodes(conn, rows)
+            computed_edges = self.computed_topic_edges(linked_entities, topic_id)
+            remaining = max(limit - len(computed_edges), 0)
+            persisted_edges = self.related_entity_edge_rows(
+                conn,
+                [node_id for node_id, _row in linked_entities],
+                remaining,
+            )
+            edges = [*computed_edges, *rows_to_dicts(persisted_edges)]
             node_ids = sorted(
-                {topic_id}
-                | {int(row["from_node_id"]) for row in edge_rows}
-                | {int(row["to_node_id"]) for row in edge_rows}
+                {
+                    node_id
+                    for edge in edges
+                    for node_id in (int(edge["from_node_id"]), int(edge["to_node_id"]))
+                    if node_id != topic_id
+                }
             )
             nodes = self.knowledge_nodes_by_id(conn, node_ids)
-            edges = rows_to_dicts(edge_rows)
-        return {
-            "topic": without_added_aliases(topic),
-            "nodes": nodes,
-            "edges": edges,
-        }
+            nodes.append({"id": topic_id, "type": "Topic", "title": topic.title})
+            nodes.sort(key=lambda node: (str(node["type"]), str(node["title"]), int(node["id"])))
+            _validate_graph_identities(nodes, edges)
+        return {"topic": topic_payload, "nodes": nodes, "edges": edges}
 
-    def resolve_topic_id(self, conn: sqlite3.Connection, title: str) -> int | None:
-        state_topic = self.context.user_state.topic_for_query(title)
-        if state_topic is not None:
-            state_row = conn.execute(
-                """
-                SELECT id
-                FROM knowledge_nodes
-                WHERE type = 'Topic' AND stable_key = ?
-                """,
-                (state_topic.stable_key,),
-            ).fetchone()
-            if state_row is not None:
-                return int(state_row["id"])
-        normalized = normalize_key(title)
-        alias_row = conn.execute(
-            """
-            SELECT topic_node_id
-            FROM topic_aliases
-            WHERE normalized_alias = ?
-            """,
-            (normalized,),
-        ).fetchone()
-        if alias_row:
-            return int(alias_row["topic_node_id"])
-        node_row = conn.execute(
-            """
-            SELECT id
-            FROM knowledge_nodes
-            WHERE type = 'Topic' AND stable_key = ?
-            """,
-            (topic_stable_key(title),),
-        ).fetchone()
-        return int(node_row["id"]) if node_row else None
-
-    def topic_payload(self, conn: sqlite3.Connection, topic_id: int) -> dict[str, Any]:
-        topic = conn.execute(
-            "SELECT * FROM knowledge_nodes WHERE id = ?",
-            (topic_id,),
-        ).fetchone()
-        if topic is None:
-            message = f"Topic node not found: {topic_id}"
-            raise ValueError(message)
-        aliases = [
-            alias.alias
-            for alias in self.context.user_state.list_topic_aliases(str(topic["stable_key"]))
-        ]
-        return {**dict(topic), "aliases": aliases}
-
-    def link_topic_matches(
+    def topic_entity_details_for_terms(
         self,
         conn: sqlite3.Connection,
-        topic_id: int,
-        now: str,
-    ) -> None:
-        topic = self.topic_payload(conn, topic_id)
-        terms = [str(topic["title"]), *(str(alias) for alias in topic["aliases"])]
-        for row in self.context.all_structured_entity_details(conn, 500):
-            if not row_matches_terms(row, terms):
-                continue
-            kind = str(row["kind"])
-            entity_node_id = self.upsert_knowledge_node(
-                conn,
-                ENTITY_NODE_TYPES[kind],
-                entity_stable_key(row),
-                str(row["text"]),
-                now,
-            )
-            self.upsert_knowledge_edge(
-                conn,
-                entity_node_id,
-                "belongs_to",
-                topic_id,
-                0.7,
-                source_meeting_id=int(row["meeting_id"]),
-                source_chunk_id=optional_int(row.get("source_chunk_id")),
-                extraction_method="topic_query",
-                now=now,
-            )
-
-    def list_topic_entity_details(
-        self,
-        conn: sqlite3.Connection,
-        topic_id: int,
+        terms: Iterable[str],
         limit: int,
     ) -> list[dict[str, Any]]:
-        linked_keys = {
-            (str(row["type"]), str(row["stable_key"]))
-            for row in conn.execute(
-                """
-                SELECT n.type, n.stable_key
-                FROM knowledge_edges e
-                JOIN knowledge_nodes n ON n.id = e.from_node_id
-                WHERE e.relation = 'belongs_to' AND e.to_node_id = ?
-                """,
-                (topic_id,),
-            ).fetchall()
-        }
         rows = [
             row
-            for row in self.context.all_structured_entity_details(conn, limit * 8)
-            if (
-                ENTITY_NODE_TYPES[str(row["kind"])],
-                entity_stable_key(row),
+            for row in self.context.all_structured_entity_details(
+                conn,
+                TOPIC_MATCH_CANDIDATE_LIMIT,
             )
-            in linked_keys
+            if row_matches_terms(row, terms)
         ]
         rows.sort(key=structured_entity_sort_key, reverse=True)
         return rows[:limit]
 
-    def list_topic_people(
+    def list_topic_people_for_rows(
         self,
         conn: sqlite3.Connection,
-        topic_id: int,
+        rows: Iterable[dict[str, Any]],
         limit: int,
     ) -> list[dict[str, Any]]:
-        rows = conn.execute(
-            """
+        meeting_ids = sorted({int(row["meeting_id"]) for row in rows})
+        if not meeting_ids or limit <= 0:
+            return []
+        placeholders = ",".join("?" for _ in meeting_ids)
+        people_sql = f"""
             SELECT DISTINCT p.id, p.display_name, p.normalized_name
-            FROM knowledge_edges topic_edge
-            JOIN knowledge_edges meeting_edge
-              ON meeting_edge.to_node_id = topic_edge.from_node_id
-             AND meeting_edge.relation = 'contains'
-            JOIN meeting_people mp ON mp.meeting_id = meeting_edge.source_meeting_id
+            FROM meeting_people mp
             JOIN people p ON p.id = mp.person_id
-            WHERE topic_edge.relation = 'belongs_to'
-              AND topic_edge.to_node_id = ?
+            WHERE mp.meeting_id IN ({placeholders})
             ORDER BY p.display_name
             LIMIT ?
-            """,
-            (topic_id, limit),
-        ).fetchall()
-        return rows_to_dicts(rows)
+            """
+        return rows_to_dicts(conn.execute(people_sql, (*meeting_ids, limit)).fetchall())
 
-    def graph_edge_rows(
+    def topic_entity_nodes(
         self,
         conn: sqlite3.Connection,
+        rows: Iterable[dict[str, Any]],
+    ) -> list[tuple[int, dict[str, Any]]]:
+        linked_entities: list[tuple[int, dict[str, Any]]] = []
+        seen_node_ids: set[int] = set()
+        for row in rows:
+            node = conn.execute(
+                """
+                SELECT id
+                FROM knowledge_nodes
+                WHERE type = ? AND stable_key = ?
+                """,
+                (ENTITY_NODE_TYPES[str(row["kind"])], entity_stable_key(row)),
+            ).fetchone()
+            if node is None:
+                continue
+            node_id = int(node["id"])
+            if node_id in seen_node_ids:
+                continue
+            seen_node_ids.add(node_id)
+            linked_entities.append((node_id, row))
+        return linked_entities
+
+    def computed_topic_edges(
+        self,
+        linked_entities: Iterable[tuple[int, dict[str, Any]]],
         topic_id: int,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": -ordinal,
+                "from_node_id": node_id,
+                "relation": "belongs_to",
+                "to_node_id": topic_id,
+                "confidence": 0.7,
+                "source_meeting_id": int(row["meeting_id"]),
+                "source_chunk_id": optional_int(row.get("source_chunk_id")),
+                "extraction_method": "topic_query",
+                "created_at": None,
+            }
+            for ordinal, (node_id, row) in enumerate(linked_entities, start=1)
+        ]
+
+    def related_entity_edge_rows(
+        self,
+        conn: sqlite3.Connection,
         linked_entity_ids: list[int],
         limit: int,
     ) -> list[sqlite3.Row]:
-        edge_ids: set[int] = set()
-        topic_edges = conn.execute(
-            """
-            SELECT *
-            FROM knowledge_edges
-            WHERE from_node_id = ? OR to_node_id = ?
-            LIMIT ?
-            """,
-            (topic_id, topic_id, limit),
-        ).fetchall()
-        edge_ids.update(int(row["id"]) for row in topic_edges)
-        if linked_entity_ids:
-            placeholders = ",".join("?" for _ in linked_entity_ids)
-            expanded_edges_sql = f"""
-                SELECT *
-                FROM knowledge_edges
-                WHERE from_node_id IN ({placeholders})
-                   OR to_node_id IN ({placeholders})
-                LIMIT ?
-                """
-            expanded_edges = conn.execute(
-                expanded_edges_sql,
-                (*linked_entity_ids, *linked_entity_ids, limit),
-            ).fetchall()
-            edge_ids.update(int(row["id"]) for row in expanded_edges)
-        if not edge_ids:
+        if not linked_entity_ids or limit <= 0:
             return []
-        placeholders = ",".join("?" for _ in edge_ids)
+        placeholders = ",".join("?" for _ in linked_entity_ids)
         edge_rows_sql = f"""
             SELECT *
             FROM knowledge_edges
-            WHERE id IN ({placeholders})
+            WHERE relation <> 'belongs_to'
+              AND (
+                from_node_id IN ({placeholders})
+                OR to_node_id IN ({placeholders})
+              )
             ORDER BY relation, id
             LIMIT ?
             """
         return list(
             conn.execute(
                 edge_rows_sql,
-                (*sorted(edge_ids), limit),
+                (*linked_entity_ids, *linked_entity_ids, limit),
             ).fetchall()
         )
 
@@ -701,6 +717,47 @@ class KnowledgeRepository:
             """
         rows = conn.execute(nodes_sql, tuple(node_ids)).fetchall()
         return rows_to_dicts(rows)
+
+
+def _request_local_topic_ids(
+    stable_keys: Iterable[str],
+    *,
+    occupied_ids: Iterable[int] = (),
+) -> dict[str, int]:
+    occupied = set(occupied_ids)
+    assigned: dict[str, int] = {}
+    for stable_key in sorted(set(stable_keys)):
+        collision_index = 0
+        while True:
+            identity = stable_key if collision_index == 0 else f"{stable_key}\0{collision_index}"
+            digest_value = int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big")
+            topic_id = -(VIRTUAL_TOPIC_ID_HIGH_BIT | (digest_value & VIRTUAL_TOPIC_ID_VALUE_MASK))
+            if topic_id not in occupied:
+                occupied.add(topic_id)
+                assigned[stable_key] = topic_id
+                break
+            collision_index += 1
+    return assigned
+
+
+def _validate_graph_identities(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> None:
+    node_ids = [int(node["id"]) for node in nodes]
+    if len(node_ids) != len(set(node_ids)):
+        message = "Topic graph contains duplicate node IDs."
+        raise RuntimeError(message)
+    edge_ids = [int(edge["id"]) for edge in edges]
+    if len(edge_ids) != len(set(edge_ids)):
+        message = "Topic graph contains duplicate edge IDs."
+        raise RuntimeError(message)
+    endpoints = {
+        int(edge[endpoint]) for edge in edges for endpoint in ("from_node_id", "to_node_id")
+    }
+    if not endpoints.issubset(node_ids):
+        message = "Topic graph edge endpoint is missing from the node result."
+        raise RuntimeError(message)
 
 
 def _stored_topic_from_row(row: sqlite3.Row) -> StoredTopic:
@@ -743,18 +800,21 @@ def dominant_language(values: Iterable[object]) -> str | None:
 
 def search_topic_evidence(
     search_meetings: SearchMeetings,
+    conn: sqlite3.Connection,
     topic_terms: Iterable[str],
     limit: int,
 ) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
     rows: list[dict[str, Any]] = []
-    seen_chunk_ids: set[int] = set()
+    seen_evidence_ids: set[str] = set()
     for term in topic_terms:
-        for row in search_meetings(term, limit):
-            chunk_id = int(row["chunk_id"])
-            if chunk_id in seen_chunk_ids:
+        for row in search_meetings(conn, term, limit):
+            evidence_id = str(row["evidence_id"])
+            if evidence_id in seen_evidence_ids:
                 continue
             rows.append(row)
-            seen_chunk_ids.add(chunk_id)
+            seen_evidence_ids.add(evidence_id)
             if len(rows) >= limit:
                 return rows
     return rows

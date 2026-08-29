@@ -259,6 +259,13 @@ class StoredTopic:
 
 
 @dataclass(frozen=True)
+class UserStateFileIdentity:
+    physical_path: Path
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
 class StoredTopicAlias:
     topic_stable_key: str
     topic_title: str
@@ -319,22 +326,46 @@ class LegacyMigrationOutcome:
 
 
 class UserStateRepository:
-    def __init__(self, state_path: Path, *, _read_only: bool = False) -> None:
+    def __init__(
+        self,
+        state_path: Path,
+        *,
+        _read_only: bool = False,
+        _expected_identity: UserStateFileIdentity | None = None,
+    ) -> None:
         self.state_path = Path(state_path)
         self.read_only = _read_only
-        if self.read_only:
-            if not self.state_path.is_file():
-                raise IndexReadError(missing_user_state_message(self.state_path))
-            with self._connect() as conn:
-                validate_existing_user_state_schema(conn)
+        self._state_identity: UserStateFileIdentity | None = None
+        if self.read_only or _expected_identity is not None:
+            self._state_identity = _require_user_state_identity(
+                self.state_path,
+                expected=_expected_identity,
+            )
+            with self._connect():
+                pass
             return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             ensure_user_state_schema(conn)
+        self._state_identity = _require_user_state_identity(
+            self.state_path,
+            expected=None,
+        )
 
     @classmethod
     def open_existing(cls, state_path: Path) -> "UserStateRepository":
         return cls(state_path, _read_only=True)
+
+    def open_existing_writer(self) -> "UserStateRepository":
+        if not self.read_only:
+            return self
+        if self._state_identity is None:
+            message = "A validated user-state identity is required for writable access."
+            raise RuntimeError(message)
+        return type(self)(
+            self.state_path,
+            _expected_identity=self._state_identity,
+        )
 
     def get_or_create_source(self, kind: str, path: str, *, now: str) -> str:
         with self._connect() as conn:
@@ -847,26 +878,39 @@ class UserStateRepository:
             row = conn.execute(
                 """
                 SELECT
-                  t.stable_key, t.title, t.normalized_title,
-                  t.created_at, t.updated_at, t.raw_metadata_json
-                FROM topic_aliases a
-                JOIN topic_alias_topics t ON t.stable_key = a.topic_stable_key
-                WHERE a.normalized_alias = ?
+                  stable_key, title, normalized_title,
+                  created_at, updated_at, raw_metadata_json
+                FROM topic_alias_topics
+                WHERE stable_key = ?
                 """,
-                (normalized,),
+                (_topic_stable_key(query),),
             ).fetchone()
             if row is None:
                 row = conn.execute(
                     """
                     SELECT
-                      stable_key, title, normalized_title,
-                      created_at, updated_at, raw_metadata_json
-                    FROM topic_alias_topics
-                    WHERE stable_key = ?
+                      t.stable_key, t.title, t.normalized_title,
+                      t.created_at, t.updated_at, t.raw_metadata_json
+                    FROM topic_aliases a
+                    JOIN topic_alias_topics t ON t.stable_key = a.topic_stable_key
+                    WHERE a.normalized_alias = ?
                     """,
-                    (_topic_stable_key(query),),
+                    (normalized,),
                 ).fetchone()
         return _stored_topic(row) if row is not None else None
+
+    def list_topics(self) -> tuple[StoredTopic, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  stable_key, title, normalized_title,
+                  created_at, updated_at, raw_metadata_json
+                FROM topic_alias_topics
+                ORDER BY updated_at DESC, title ASC
+                """
+            ).fetchall()
+        return tuple(_stored_topic(row) for row in rows)
 
     def list_topic_aliases(
         self,
@@ -923,54 +967,69 @@ class UserStateRepository:
         normalized_aliases = _normalized_alias_values(aliases)
         if not normalized_aliases:
             return ()
-        added: list[str] = []
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            _insert_stored_topic(conn, topic)
-            for alias, normalized_alias in normalized_aliases:
-                cursor = conn.execute(
+            try:
+                aliases_to_add = _topic_alias_add_plan(conn, topic, normalized_aliases)
+                if not aliases_to_add:
+                    conn.rollback()
+                    return ()
+                _insert_stored_topic(conn, topic)
+                conn.executemany(
                     """
-                    INSERT OR IGNORE INTO topic_aliases (
+                    INSERT INTO topic_aliases (
                       normalized_alias, topic_stable_key, alias, created_at
                     ) VALUES (?, ?, ?, ?)
                     """,
-                    (normalized_alias, topic.stable_key, alias, now),
+                    [
+                        (normalized_alias, topic.stable_key, alias, now)
+                        for alias, normalized_alias in aliases_to_add
+                    ],
                 )
-                if cursor.rowcount:
-                    added.append(alias)
-            conn.commit()
-        return tuple(added)
+                self._commit_topic_alias_mutation(conn)
+            except BaseException:
+                conn.rollback()
+                raise
+        return tuple(alias for alias, _normalized_alias in aliases_to_add)
 
     def delete_topic_aliases(self, aliases: list[str]) -> tuple[str, ...]:
         normalized_aliases = _normalized_alias_values(aliases)
         removed: list[str] = []
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            for alias, normalized_alias in normalized_aliases:
-                row = conn.execute(
-                    "SELECT topic_stable_key, alias FROM topic_aliases WHERE normalized_alias = ?",
-                    (normalized_alias,),
-                ).fetchone()
-                if row is None:
-                    continue
-                conn.execute(
-                    "DELETE FROM topic_aliases WHERE normalized_alias = ?",
-                    (normalized_alias,),
-                )
-                removed.append(str(row["alias"]) or alias)
-                conn.execute(
-                    """
-                    DELETE FROM topic_alias_topics
-                    WHERE stable_key = ?
-                      AND NOT EXISTS (
-                        SELECT 1
+            try:
+                for alias, normalized_alias in normalized_aliases:
+                    row = conn.execute(
+                        """
+                        SELECT topic_stable_key, alias
                         FROM topic_aliases
-                        WHERE topic_stable_key = topic_alias_topics.stable_key
-                      )
-                    """,
-                    (str(row["topic_stable_key"]),),
-                )
-            conn.commit()
+                        WHERE normalized_alias = ?
+                        """,
+                        (normalized_alias,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    conn.execute(
+                        "DELETE FROM topic_aliases WHERE normalized_alias = ?",
+                        (normalized_alias,),
+                    )
+                    removed.append(str(row["alias"]) or alias)
+                    conn.execute(
+                        """
+                        DELETE FROM topic_alias_topics
+                        WHERE stable_key = ?
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM topic_aliases
+                            WHERE topic_stable_key = topic_alias_topics.stable_key
+                          )
+                        """,
+                        (str(row["topic_stable_key"]),),
+                    )
+                self._commit_topic_alias_mutation(conn)
+            except BaseException:
+                conn.rollback()
+                raise
         return tuple(removed)
 
     def register_index_generation(
@@ -1031,6 +1090,7 @@ class UserStateRepository:
                 if imported is not None:
                     conn.commit()
                     return False
+                _validate_topic_alias_import_namespace(conn, aliases)
                 for alias in aliases:
                     _insert_stored_topic(conn, alias.topic)
                     conn.execute(
@@ -1278,11 +1338,28 @@ class UserStateRepository:
                 conn.execute("SELECT * FROM task_states WHERE orphaned = 1 ORDER BY id")
             )
 
+    def _commit_topic_alias_mutation(self, conn: sqlite3.Connection) -> None:
+        _topic_alias_mutation_checkpoint("before_identity_recheck")
+        if self._state_identity is not None:
+            _require_user_state_identity(
+                self.state_path,
+                expected=self._state_identity,
+            )
+        conn.commit()
+
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        if self.read_only:
-            physical_path = self.state_path.resolve(strict=True)
-            connection = sqlite3.connect(f"{physical_path.as_uri()}?mode=ro", uri=True)
+        if self._state_identity is not None:
+            identity = _require_user_state_identity(
+                self.state_path,
+                expected=self._state_identity,
+            )
+            mode = "ro" if self.read_only else "rw"
+            uri = f"{identity.physical_path.as_uri()}?mode={mode}"
+            try:
+                connection = sqlite3.connect(uri, uri=True)
+            except sqlite3.Error as exc:
+                raise IndexReadError(_changed_user_state_message(self.state_path)) from exc
         else:
             connection = sqlite3.connect(self.state_path)
         with closing(connection) as conn:
@@ -1290,7 +1367,53 @@ class UserStateRepository:
             conn.execute("PRAGMA foreign_keys=ON")
             if self.read_only:
                 conn.execute("PRAGMA query_only=ON")
+            if self._state_identity is not None:
+                validate_existing_user_state_schema(conn)
+                _require_user_state_identity(
+                    self.state_path,
+                    expected=self._state_identity,
+                )
             yield conn
+
+
+def _require_user_state_identity(
+    state_path: Path,
+    *,
+    expected: UserStateFileIdentity | None,
+) -> UserStateFileIdentity:
+    try:
+        physical_path = Path(state_path).resolve(strict=True)
+        path_stat = physical_path.stat()
+    except OSError as exc:
+        message = (
+            _changed_user_state_message(state_path)
+            if expected is not None
+            else missing_user_state_message(state_path)
+        )
+        raise IndexReadError(message) from exc
+    if not physical_path.is_file():
+        message = (
+            _changed_user_state_message(state_path)
+            if expected is not None
+            else missing_user_state_message(state_path)
+        )
+        raise IndexReadError(message)
+    identity = UserStateFileIdentity(
+        physical_path=physical_path,
+        device=path_stat.st_dev,
+        inode=path_stat.st_ino,
+    )
+    if expected is not None and identity != expected:
+        raise IndexReadError(_changed_user_state_message(state_path))
+    return identity
+
+
+def _changed_user_state_message(state_path: Path) -> str:
+    return (
+        f"Meetily Memory user state no longer matches the database validated at {state_path}. "
+        "Restore the authoritative `state.sqlite` from backup; refusing to create, migrate, or "
+        "write a missing, replaced, or retargeted state database."
+    )
 
 
 def recover_and_validate_index(index_path: Path) -> int | None:
@@ -1786,6 +1909,119 @@ def _normalized_alias_values(aliases: list[str]) -> tuple[tuple[str, str], ...]:
     return tuple(values)
 
 
+def _topic_alias_add_plan(
+    conn: sqlite3.Connection,
+    topic: StoredTopic,
+    aliases: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    canonical_namespace = _validate_stored_topic_identity(topic)
+    canonical_owners, alias_owners = _topic_namespace_owners(conn)
+    owner = topic.stable_key
+    if canonical_owners.get(canonical_namespace, owner) != owner:
+        return ()
+    if alias_owners.get(canonical_namespace, owner) != owner:
+        return ()
+
+    existing_topic = conn.execute(
+        "SELECT normalized_title FROM topic_alias_topics WHERE stable_key = ?",
+        (owner,),
+    ).fetchone()
+    if (
+        existing_topic is not None
+        and _normalize_topic_key(str(existing_topic["normalized_title"])) != canonical_namespace
+    ):
+        message = f"Stored topic metadata conflicts with canonical identity {owner}."
+        raise RuntimeError(message)
+
+    planned: list[tuple[str, str]] = []
+    for alias, normalized_alias in aliases:
+        if normalized_alias == canonical_namespace:
+            continue
+        canonical_owner = canonical_owners.get(normalized_alias)
+        if canonical_owner is not None and canonical_owner != owner:
+            return ()
+        alias_owner = alias_owners.get(normalized_alias)
+        if alias_owner is not None:
+            if alias_owner != owner:
+                return ()
+            continue
+        planned.append((alias, normalized_alias))
+    return tuple(planned)
+
+
+def _validate_topic_alias_import_namespace(
+    conn: sqlite3.Connection,
+    aliases: tuple[StoredTopicAlias, ...],
+) -> None:
+    canonical_owners, alias_owners = _topic_namespace_owners(conn)
+    for alias in aliases:
+        canonical_namespace = _validate_stored_topic_identity(alias.topic)
+        owner = alias.topic_stable_key
+        canonical_owner = canonical_owners.get(canonical_namespace)
+        if canonical_owner is not None and canonical_owner != owner:
+            _raise_topic_namespace_conflict(canonical_namespace)
+        alias_owner = alias_owners.get(canonical_namespace)
+        if alias_owner is not None and alias_owner != owner:
+            _raise_topic_namespace_conflict(canonical_namespace)
+        canonical_owners[canonical_namespace] = owner
+
+    for alias in aliases:
+        normalized_alias = _normalize_topic_key(alias.normalized_alias)
+        owner = alias.topic_stable_key
+        canonical_owner = canonical_owners.get(normalized_alias)
+        if canonical_owner is not None and canonical_owner != owner:
+            _raise_topic_namespace_conflict(normalized_alias)
+        alias_owner = alias_owners.get(normalized_alias)
+        if alias_owner is not None and alias_owner != owner:
+            _raise_topic_namespace_conflict(normalized_alias)
+        alias_owners[normalized_alias] = owner
+
+
+def _topic_namespace_owners(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, str], dict[str, str]]:
+    canonical_owners: dict[str, str] = {}
+    for row in conn.execute(
+        "SELECT stable_key, normalized_title FROM topic_alias_topics"
+    ).fetchall():
+        namespace = _normalize_topic_key(str(row["normalized_title"]))
+        owner = str(row["stable_key"])
+        existing_owner = canonical_owners.setdefault(namespace, owner)
+        if existing_owner != owner:
+            _raise_topic_namespace_conflict(namespace)
+
+    alias_owners: dict[str, str] = {}
+    for row in conn.execute(
+        "SELECT normalized_alias, topic_stable_key FROM topic_aliases"
+    ).fetchall():
+        namespace = _normalize_topic_key(str(row["normalized_alias"]))
+        owner = str(row["topic_stable_key"])
+        existing_owner = alias_owners.setdefault(namespace, owner)
+        if existing_owner != owner:
+            _raise_topic_namespace_conflict(namespace)
+        canonical_owner = canonical_owners.get(namespace)
+        if canonical_owner is not None and canonical_owner != owner:
+            _raise_topic_namespace_conflict(namespace)
+    return canonical_owners, alias_owners
+
+
+def _validate_stored_topic_identity(topic: StoredTopic) -> str:
+    canonical_namespace = _normalize_topic_key(topic.normalized_title)
+    if (
+        not canonical_namespace
+        or _normalize_topic_key(topic.title) != canonical_namespace
+        or topic.stable_key != _topic_stable_key(canonical_namespace)
+    ):
+        message = f"Invalid canonical topic identity: {topic.stable_key}."
+        raise ValueError(message)
+    return canonical_namespace
+
+
+def _raise_topic_namespace_conflict(namespace: str) -> None:
+    message = f"Topic canonical/alias namespace has conflicting owners for {namespace!r}."
+    raise RuntimeError(message)
+
+
 def _stored_topic(row: sqlite3.Row) -> StoredTopic:
     return StoredTopic(
         stable_key=str(row["stable_key"]),
@@ -1990,6 +2226,10 @@ def _state_transfer_checkpoint(_name: str) -> None:
 
 
 def _topic_alias_import_checkpoint(_name: str) -> None:
+    return
+
+
+def _topic_alias_mutation_checkpoint(_name: str) -> None:
     return
 
 

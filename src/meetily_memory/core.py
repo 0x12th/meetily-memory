@@ -202,8 +202,7 @@ class MeetilyMemoryCore:
         return person_memory(self._repository, name, limit)
 
     def topic(self, query: str, limit: int = 10) -> TopicMemory:
-        # Topic reads still materialize derived knowledge until task 09 removes that debt.
-        payload = self._writer_repository().topic_memory(query, limit)
+        payload = self._repository.topic_memory(query, limit)
         return TopicMemory(
             topic=topic_from_row(payload["topic"]),
             language=optional_str(payload.get("language")),
@@ -220,15 +219,14 @@ class MeetilyMemoryCore:
         return tuple(topic_from_row(row) for row in self._repository.list_topics(limit))
 
     def add_topic_alias(self, query: str, aliases: list[str]) -> TopicAliasResult:
-        payload = self._writer_repository().ensure_topic(query, aliases=aliases)
+        payload = self._repository.add_topic_aliases(query, aliases)
         return TopicAliasResult(
             topic=topic_from_row(payload),
             added_aliases=tuple(str(alias) for alias in payload["added_aliases"]),
         )
 
     def graph(self, query: str, limit: int = 50) -> TopicGraph:
-        # Graph lookup shares the task-09 topic materialization path for now.
-        payload = self._writer_repository().graph_for_topic(query, limit)
+        payload = self._repository.graph_for_topic(query, limit)
         return TopicGraph(
             topic=topic_from_row(payload["topic"]),
             nodes=tuple(graph_node_from_row(row) for row in payload["nodes"]),

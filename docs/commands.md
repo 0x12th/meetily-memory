@@ -103,16 +103,38 @@ that remains open through the final context/entity SELECT, and its `MeetingRef` 
 missing or mismatched hit fails closed and asks the caller to repeat the search instead of
 substituting whichever chunk currently owns the old integer ID.
 
-`mm t` expands stored topic aliases. Manual aliases are authoritative in `state.sqlite`; the index
-table is only a derived retrieval projection, so aliases survive full index deletion and rebuild.
-Legacy v5 and old unmarked v6 aliases are imported once under a locked, digest-checked snapshot.
-Every current v7 generation has a stable generation marker; fresh and rebuilt generations are
-registered as state-owned before projection and never import their derived aliases back. Add aliases
-explicitly with repeated `--alias` options, for example:
+`mm t` resolves canonical topic titles and aliases from `state.sqlite`, then resolves the canonical
+stable key and builds evidence/structured matches on one pinned index connection in one explicit
+read snapshot. Topic evidence is deduplicated by stable `evidence_id`, not local chunk ID. Known and
+unknown topic reads do not create topic nodes, relink entities, commit aliases, or otherwise
+materialize the index. Manual aliases are authoritative in `state.sqlite`; the index table is only a
+derived retrieval projection, so aliases survive full index deletion and rebuild. Topic listings
+ignore an index topic left only by a deleted alias projection, but retain topics backed by a current
+knowledge relationship or state definition. Legacy v5 and old unmarked v6 aliases are imported once
+under a locked,
+count-and-digest-checked snapshot. Every current v7 generation has a stable generation marker; fresh
+and rebuilt generations are registered as state-owned before projection and never import their
+derived aliases back. Add aliases explicitly with repeated `--alias` options, for example:
 
 ```bash
 mm t "kafka" --alias "кафка" --alias "broker"
 ```
+
+`--alias` writes only the persistent definition and normalized aliases to `state.sqlite`; it does
+not update `index.sqlite` on the command path. Canonical keys resolve before aliases and share the
+same Unicode-casefold/whitespace-normalized namespace. The complete batch is conflict-checked before
+any definition is created, so a cross-topic conflict adds nothing and leaves no orphan topic. If the
+canonical exists only in the index, its original title, key, metadata, and timestamps seed state;
+query casing does not replace them. The mutation reopens the validated physical state with SQLite
+`mode=rw` and refuses a missing, replaced, or retargeted path instead of creating/migrating a DB or
+writing another workspace/global state. The same command can immediately read the new alias because
+topic resolution is state-first. The disposable projection is synchronized during the next scan or
+rebuild.
+
+A topic without a projected index node has a deterministic nonzero negative ID derived from its
+canonical stable key. Collisions are checked within each result, including graph node/edge
+endpoints. These negative IDs and projected positive IDs are request-local presentation handles;
+do not persist either across refreshes or calls.
 
 There is no built-in domain dictionary for specific terms. Future expansion
 should come from user aliases, indexed aliases, extracted aliases, or semantic

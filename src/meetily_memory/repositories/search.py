@@ -96,23 +96,47 @@ class SearchRepository:
         context: int = 0,
         filters: MeetingSearchFilters | None = None,
     ) -> list[dict[str, Any]]:
+        if not build_fts_query(query):
+            return []
+        with self._connection(self.index_path) as conn, sqlite_read_snapshot(conn):
+            return self.search_in_snapshot(
+                conn,
+                query,
+                limit,
+                meeting_id=meeting_id,
+                context=context,
+                filters=filters,
+            )
+
+    def search_in_snapshot(  # noqa: PLR0913
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        limit: int = 10,
+        *,
+        meeting_id: int | None = None,
+        context: int = 0,
+        filters: MeetingSearchFilters | None = None,
+    ) -> list[dict[str, Any]]:
+        if not conn.in_transaction:
+            message = "Search connection must be inside an explicit read snapshot."
+            raise RuntimeError(message)
         fts_query = build_fts_query(query)
         if not fts_query:
             return []
         strict_fts_query = build_strict_fts_query(query)
         context = max(context, 0)
-        with self._connection(self.index_path) as conn, sqlite_read_snapshot(conn):
-            rows = self._search_with_fallback(
-                conn,
-                fts_query,
-                strict_fts_query,
-                limit,
-                meeting_id=meeting_id,
-                filters=filters,
-            )
-            if context == 0:
-                return rows
-            return self._expand_context(conn, rows, context)
+        rows = self._search_with_fallback(
+            conn,
+            fts_query,
+            strict_fts_query,
+            limit,
+            meeting_id=meeting_id,
+            filters=filters,
+        )
+        if context == 0:
+            return rows
+        return self._expand_context(conn, rows, context)
 
     def _search_with_fallback(  # noqa: PLR0913
         self,

@@ -2101,7 +2101,10 @@ def test_existing_v6_topic_alias_imports_before_rebuildable_index_is_deleted(
     assert _index_topic_alias_rows(index_path) == [expected]
 
 
-@pytest.mark.parametrize("checkpoint", ["before_commit", "committed"])
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["row", "before_recheck", "before_commit", "committed"],
+)
 def test_topic_alias_import_crash_retry_is_atomic_and_idempotent(
     meetily_db: Path,
     tmp_path: Path,
@@ -2129,7 +2132,7 @@ def test_topic_alias_import_crash_retry_is_atomic_and_idempotent(
     with pytest.raises(RuntimeError, match="injected alias import crash"):
         IndexRepository(index_path, state_path=state_path)
 
-    if checkpoint == "before_commit":
+    if checkpoint != "committed":
         assert _state_topic_alias_rows(state_path) == []
         with sqlite3.connect(state_path) as conn:
             assert conn.execute("SELECT COUNT(*) FROM topic_alias_imports").fetchone()[0] == 0
@@ -2144,7 +2147,12 @@ def test_topic_alias_import_crash_retry_is_atomic_and_idempotent(
     with sqlite3.connect(state_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM topic_aliases").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM topic_alias_topics").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM topic_alias_imports").fetchone()[0] == 1
+        ledger = conn.execute(
+            "SELECT source_alias_count, source_digest FROM topic_alias_imports"
+        ).fetchone()
+        assert ledger is not None
+        assert ledger[0] == 1
+        assert len(ledger[1]) == 64
 
 
 def test_rebind_at_before_backup_aborts_stale_swap_and_retry_uses_new_projection(
@@ -2666,6 +2674,8 @@ def test_state_owned_generation_does_not_resurrect_alias_deleted_before_projecti
     state_path = tmp_path / "state.sqlite"
     scan = MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     MeetilyMemoryCore(index_path, state_path=state_path).add_topic_alias("migration", ["move"])
+    projection = IndexRepository(index_path, state_path=state_path)
+    projection.project_topic_aliases()
     with sqlite3.connect(index_path) as conn:
         generation_before = conn.execute(
             "SELECT generation_id, alias_owner FROM index_generation"
@@ -2678,8 +2688,11 @@ def test_state_owned_generation_does_not_resurrect_alias_deleted_before_projecti
     assert state.delete_topic_aliases(["move"]) == ("move",)
     assert _state_topic_alias_rows(state_path) == []
     assert len(_index_topic_alias_rows(index_path)) == 1
+    stale_projection_read = MeetilyMemoryCore(index_path, state_path=state_path).topic("move")
+    assert stale_projection_read.topic.title == "move"
+    assert stale_projection_read.topic.aliases == ()
 
-    IndexRepository(index_path, state_path=state_path)
+    projection.project_topic_aliases()
 
     assert _state_topic_alias_rows(state_path) == []
     assert _index_topic_alias_rows(index_path) == []
