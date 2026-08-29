@@ -29,7 +29,6 @@ cat > "$formula" <<EOF
 class MeetilyMemory < Formula
   desc "Local-first Meetily history index and CLI"
   homepage "https://github.com/0x12th/meetily-memory"
-  version "$version"
   license "Apache-2.0"
 
   on_macos do
