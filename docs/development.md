@@ -40,10 +40,10 @@ Build and validate a macOS release archive:
 
 ```bash
 scripts/build-binary.sh
-scripts/package-release-asset.sh v0.6.0 macos-arm64
+scripts/package-release-asset.sh v0.7.0 macos-arm64
 scripts/smoke-release-asset.py \
-  target/release-assets/meetily-memory-v0.6.0-macos-arm64.tar.gz \
-  v0.6.0
+  target/release-assets/meetily-memory-v0.7.0-macos-arm64.tar.gz \
+  v0.7.0
 ```
 
 The release smoke always tests the exact `.tar.gz`, not `dist/`. It extracts into an empty

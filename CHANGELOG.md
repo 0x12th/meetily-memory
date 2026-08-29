@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.0 - 2026-08-29
+
+- Make meeting and evidence identity source-aware, canonicalize source paths, and rebuild disposable
+  indexes safely when adopting the new source UUID and materialized evidence formats.
+- Make search, context, topic, graph, status, and doctor use bounded read-only snapshots without
+  creating databases, migrating schemas, or mutating user state.
+- Persist manual topic aliases and source/task/tag ownership in `state.sqlite` so explicit user
+  intent survives index deletion, incompatible rebuilds, interruptions, and concurrent retries.
+- Publish incremental refreshes atomically, keep readers on the previous completed snapshot until
+  commit, and report settings or Obsidian failures separately from a successful index update.
+- Give generated Obsidian notes stable typed identities, collision-resistant filenames, exact
+  managed markers, and safe preflight reconciliation across duplicate and Unicode titles.
+- Add an exact-archive release smoke for both macOS architectures that proves version, SQLite/FTS,
+  `init`, source-backed search, and read-only diagnostics before checksums or GitHub upload.
+
 ## 0.6.0 - 2026-08-28
 
 - Collapse Core search to one typed meeting-level contract and add consistent `--since`,
