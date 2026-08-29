@@ -1,10 +1,13 @@
 import hashlib
 import sqlite3
 import uuid
+from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from meetily_memory.config.paths import canonical_source_path
 from meetily_memory.db.migration_identity import (
     MIGRATION_REPORT_SCHEMA_VERSION,
     LegacyTaskState,
@@ -18,7 +21,14 @@ from meetily_memory.db.migration_identity import (
     task_state_identity_digest,
     verified_migration_report,
 )
-from meetily_memory.db.migrations import execute_sql_statements
+from meetily_memory.db.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    INDEX_ALIAS_OWNER_LEGACY,
+    INDEX_ALIAS_OWNER_STATE,
+    ensure_index_generation_marker,
+    execute_sql_statements,
+    read_index_generation_marker,
+)
 from meetily_memory.db.rows import rows_to_dicts
 
 USER_STATE_SCHEMA = """
@@ -118,11 +128,155 @@ CREATE TABLE migration_report_items (
 CREATE INDEX idx_migration_report_items_task_state
 ON migration_report_items(task_state_id);
 """
-CURRENT_USER_STATE_SCHEMA_VERSION = MIGRATION_REPORT_SCHEMA_VERSION
+SOURCE_REVISION_SCHEMA_VERSION = MIGRATION_REPORT_SCHEMA_VERSION + 1
+SOURCE_REVISION_SCHEMA = """
+ALTER TABLE sources
+ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0);
+"""
+PENDING_SOURCE_BINDING_SCHEMA_VERSION = SOURCE_REVISION_SCHEMA_VERSION + 1
+PENDING_SOURCE_BINDING_SCHEMA = """
+ALTER TABLE sources ADD COLUMN projected_path TEXT;
+ALTER TABLE sources
+ADD COLUMN pending_revision INTEGER CHECK (pending_revision IS NULL OR pending_revision >= 0);
+
+UPDATE sources
+SET projected_path = current_path
+WHERE projected_path IS NULL;
+
+CREATE UNIQUE INDEX idx_sources_kind_projected_path
+ON sources(kind, projected_path)
+WHERE projected_path IS NOT NULL;
+"""
+TOPIC_ALIAS_STATE_SCHEMA_VERSION = PENDING_SOURCE_BINDING_SCHEMA_VERSION + 1
+TOPIC_ALIAS_STATE_SCHEMA = """
+CREATE TABLE topic_alias_topics (
+  stable_key TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  normalized_title TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  raw_metadata_json TEXT
+);
+
+CREATE TABLE topic_aliases (
+  normalized_alias TEXT PRIMARY KEY,
+  topic_stable_key TEXT NOT NULL
+    REFERENCES topic_alias_topics(stable_key) ON DELETE CASCADE,
+  alias TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_state_topic_aliases_topic
+ON topic_aliases(topic_stable_key, normalized_alias);
+
+CREATE TABLE topic_alias_imports (
+  index_path TEXT PRIMARY KEY,
+  source_schema_version INTEGER NOT NULL,
+  source_alias_count INTEGER NOT NULL CHECK (source_alias_count >= 0),
+  source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
+  imported_at TEXT NOT NULL
+);
+"""
+INDEX_GENERATION_STATE_SCHEMA_VERSION = TOPIC_ALIAS_STATE_SCHEMA_VERSION + 1
+INDEX_GENERATION_STATE_SCHEMA = """
+ALTER TABLE topic_alias_imports RENAME TO topic_alias_imports_v6;
+
+CREATE TABLE index_generations (
+  generation_id TEXT NOT NULL,
+  index_path TEXT NOT NULL,
+  alias_owner TEXT NOT NULL CHECK (alias_owner IN ('state', 'legacy')),
+  registered_at TEXT NOT NULL,
+  PRIMARY KEY (generation_id, index_path)
+);
+
+CREATE TABLE topic_alias_imports (
+  generation_id TEXT NOT NULL,
+  index_path TEXT NOT NULL,
+  source_schema_version INTEGER NOT NULL,
+  source_alias_count INTEGER NOT NULL CHECK (source_alias_count >= 0),
+  source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
+  imported_at TEXT NOT NULL,
+  PRIMARY KEY (generation_id, index_path),
+  FOREIGN KEY (generation_id, index_path)
+    REFERENCES index_generations(generation_id, index_path) ON DELETE CASCADE
+);
+
+INSERT INTO index_generations (
+  generation_id, index_path, alias_owner, registered_at
+)
+SELECT 'legacy-import:' || source_digest, index_path, 'legacy', imported_at
+FROM topic_alias_imports_v6;
+
+INSERT INTO topic_alias_imports (
+  generation_id, index_path, source_schema_version,
+  source_alias_count, source_digest, imported_at
+)
+SELECT
+  'legacy-import:' || source_digest, index_path, source_schema_version,
+  source_alias_count, source_digest, imported_at
+FROM topic_alias_imports_v6;
+
+DROP TABLE topic_alias_imports_v6;
+"""
+CURRENT_USER_STATE_SCHEMA_VERSION = INDEX_GENERATION_STATE_SCHEMA_VERSION
 TAG_STATE_SCHEMA_VERSION = 2
 LEGACY_INDEX_SCHEMA_VERSION = 3
 DUPLICATE_LEGACY_IDENTITY_REASON = "duplicate legacy strict identity"
 LEGACY_STATE_CONFLICT_REASON = "legacy status conflicts with persistent state"
+MISSING_STATE_SOURCE_REASON = "legacy source identity is absent from persistent state"
+
+
+class AmbiguousSourceIdentityError(RuntimeError):
+    def __init__(self, message: str, *, source_uuids: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.source_uuids = source_uuids
+
+
+@dataclass(frozen=True)
+class SourcePathClaim:
+    source_uuid: str
+    kind: str
+    previous_path: str
+    projected_path: str
+    claimed_path: str
+    previous_updated_at: str
+    previous_pending_revision: int | None
+    claimed_revision: int
+    resumed: bool
+
+
+@dataclass(frozen=True)
+class StoredTopic:
+    stable_key: str
+    title: str
+    normalized_title: str
+    created_at: str
+    updated_at: str
+    raw_metadata_json: str | None
+
+
+@dataclass(frozen=True)
+class StoredTopicAlias:
+    topic_stable_key: str
+    topic_title: str
+    topic_normalized_title: str
+    topic_created_at: str
+    topic_updated_at: str
+    topic_raw_metadata_json: str | None
+    alias: str
+    normalized_alias: str
+    alias_created_at: str
+
+    @property
+    def topic(self) -> StoredTopic:
+        return StoredTopic(
+            stable_key=self.topic_stable_key,
+            title=self.topic_title,
+            normalized_title=self.topic_normalized_title,
+            created_at=self.topic_created_at,
+            updated_at=self.topic_updated_at,
+            raw_metadata_json=self.topic_raw_metadata_json,
+        )
 
 
 @dataclass(frozen=True)
@@ -181,19 +335,347 @@ class UserStateRepository:
                 )
                 conn.commit()
                 return str(row["uuid"])
+            projected_owner = conn.execute(
+                """
+                SELECT uuid
+                FROM sources
+                WHERE kind = ? AND projected_path = ?
+                """,
+                (kind, path),
+            ).fetchone()
+            if projected_owner is not None:
+                message = (
+                    "Source path is still reserved by a pending index projection for UUID "
+                    f"{projected_owner['uuid']}."
+                )
+                raise AmbiguousSourceIdentityError(
+                    message,
+                    source_uuids=(str(projected_owner["uuid"]),),
+                )
             source_uuid = str(uuid.uuid4())
             conn.execute(
                 """
-                INSERT INTO sources (uuid, kind, current_path, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sources (
+                  uuid, kind, current_path, created_at, updated_at, projected_path
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (source_uuid, kind, path, now, now),
+                (source_uuid, kind, path, now, now, path),
             )
             conn.commit()
             return source_uuid
 
-    def source_uuid(self, kind: str, path: str, *, now: str) -> str:
-        return self.get_or_create_source(kind, path, now=now)
+    def resolve_source(self, kind: str, path: Path, *, now: str) -> str:
+        canonical_path = canonical_source_path(path)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = _canonical_source_match(conn, kind, canonical_path)
+            if row is not None:
+                source_uuid = str(row["uuid"])
+                conn.execute(
+                    "UPDATE sources SET updated_at = ? WHERE uuid = ?",
+                    (now, source_uuid),
+                )
+                conn.commit()
+                return source_uuid
+            _require_unreserved_projection_path(conn, kind, canonical_path)
+            source_uuid = str(uuid.uuid4())
+            canonical_string = str(canonical_path)
+            conn.execute(
+                """
+                INSERT INTO sources (
+                  uuid, kind, current_path, created_at, updated_at, projected_path
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (source_uuid, kind, canonical_string, now, now, canonical_string),
+            )
+            conn.commit()
+            return source_uuid
+
+    def get_source_by_canonical_path(self, kind: str, path: Path) -> dict[str, Any] | None:
+        canonical_path = canonical_source_path(path)
+        with self._connect() as conn:
+            row = _canonical_source_match(conn, kind, canonical_path)
+            return dict(row) if row is not None else None
+
+    def validate_source_path_claim(
+        self,
+        source_uuid: str,
+        kind: str,
+        path: Path,
+    ) -> None:
+        canonical_path = canonical_source_path(path)
+        with self._connect() as conn:
+            source = _require_source_binding(conn, source_uuid, kind)
+            _require_available_claim_target(conn, source_uuid, kind, canonical_path)
+            if str(source["kind"]) != kind:
+                message = f"Source UUID {source_uuid} has an incompatible source kind."
+                raise ValueError(message)
+
+    def claim_source_path(
+        self,
+        source_uuid: str,
+        kind: str,
+        path: Path,
+        *,
+        now: str,
+    ) -> SourcePathClaim:
+        canonical_path = canonical_source_path(path)
+        claimed_path = str(canonical_path)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            source = _require_source_binding(conn, source_uuid, kind)
+            _require_available_claim_target(conn, source_uuid, kind, canonical_path)
+            previous_path = str(source["current_path"])
+            projected_path = str(source["projected_path"] or previous_path)
+            previous_updated_at = str(source["updated_at"])
+            previous_revision = int(source["revision"])
+            pending_revision = optional_int(source["pending_revision"])
+            if pending_revision is not None:
+                if previous_path != claimed_path:
+                    message = (
+                        f"Source UUID {source_uuid} still has a pending projection to "
+                        f"{previous_path}; repair it before claiming {claimed_path}."
+                    )
+                    raise RuntimeError(message)
+                claimed_revision = previous_revision + 1
+                cursor = conn.execute(
+                    """
+                    UPDATE sources
+                    SET updated_at = ?, revision = ?, pending_revision = ?
+                    WHERE uuid = ?
+                      AND current_path = ?
+                      AND revision = ?
+                      AND pending_revision = ?
+                    """,
+                    (
+                        now,
+                        claimed_revision,
+                        claimed_revision,
+                        source_uuid,
+                        previous_path,
+                        previous_revision,
+                        pending_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    message = f"Pending source claim changed while retrying UUID {source_uuid}."
+                    raise RuntimeError(message)
+                conn.commit()
+                return SourcePathClaim(
+                    source_uuid=source_uuid,
+                    kind=kind,
+                    previous_path=previous_path,
+                    projected_path=projected_path,
+                    claimed_path=claimed_path,
+                    previous_updated_at=previous_updated_at,
+                    previous_pending_revision=pending_revision,
+                    claimed_revision=claimed_revision,
+                    resumed=True,
+                )
+
+            claimed_revision = previous_revision + 1
+            cursor = conn.execute(
+                """
+                UPDATE sources
+                SET current_path = ?, updated_at = ?, revision = ?, pending_revision = ?
+                WHERE uuid = ?
+                  AND current_path = ?
+                  AND revision = ?
+                  AND pending_revision IS NULL
+                """,
+                (
+                    claimed_path,
+                    now,
+                    claimed_revision,
+                    claimed_revision,
+                    source_uuid,
+                    previous_path,
+                    previous_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                message = f"Source path changed while claiming UUID {source_uuid}."
+                raise RuntimeError(message)
+            conn.commit()
+        return SourcePathClaim(
+            source_uuid=source_uuid,
+            kind=kind,
+            previous_path=previous_path,
+            projected_path=projected_path,
+            claimed_path=claimed_path,
+            previous_updated_at=previous_updated_at,
+            previous_pending_revision=None,
+            claimed_revision=claimed_revision,
+            resumed=False,
+        )
+
+    def is_source_path_claim_current(self, claim: SourcePathClaim) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM sources
+                WHERE uuid = ?
+                  AND kind = ?
+                  AND current_path = ?
+                  AND projected_path = ?
+                  AND revision = ?
+                  AND pending_revision = ?
+                """,
+                (
+                    claim.source_uuid,
+                    claim.kind,
+                    claim.claimed_path,
+                    claim.projected_path,
+                    claim.claimed_revision,
+                    claim.claimed_revision,
+                ),
+            ).fetchone()
+            return row is not None
+
+    def finalize_source_path_claim(self, claim: SourcePathClaim) -> bool:
+        return self.finalize_source_path_claims((claim,))
+
+    def finalize_source_path_claims(self, claims: tuple[SourcePathClaim, ...]) -> bool:
+        if not claims:
+            return True
+        source_uuids = [claim.source_uuid for claim in claims]
+        if len(source_uuids) != len(set(source_uuids)):
+            message = "A source path claim batch cannot contain duplicate source UUIDs."
+            raise ValueError(message)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for claim in claims:
+                    current = conn.execute(
+                        """
+                        SELECT 1
+                        FROM sources
+                        WHERE uuid = ?
+                          AND kind = ?
+                          AND current_path = ?
+                          AND projected_path = ?
+                          AND revision = ?
+                          AND pending_revision = ?
+                        """,
+                        (
+                            claim.source_uuid,
+                            claim.kind,
+                            claim.claimed_path,
+                            claim.projected_path,
+                            claim.claimed_revision,
+                            claim.claimed_revision,
+                        ),
+                    ).fetchone()
+                    if current is None:
+                        conn.rollback()
+                        return False
+                for claim in claims:
+                    cursor = conn.execute(
+                        """
+                        UPDATE sources
+                        SET projected_path = current_path, pending_revision = NULL
+                        WHERE uuid = ?
+                          AND kind = ?
+                          AND current_path = ?
+                          AND projected_path = ?
+                          AND revision = ?
+                          AND pending_revision = ?
+                        """,
+                        (
+                            claim.source_uuid,
+                            claim.kind,
+                            claim.claimed_path,
+                            claim.projected_path,
+                            claim.claimed_revision,
+                            claim.claimed_revision,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        conn.rollback()
+                        return False
+                    _source_claim_finalize_checkpoint("row")
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        _source_claim_finalize_checkpoint("committed")
+        return True
+
+    def begin_source_path_rollback(
+        self,
+        claim: SourcePathClaim,
+        *,
+        now: str,
+    ) -> SourcePathClaim | None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                """
+                SELECT
+                  kind, current_path, projected_path, updated_at,
+                  revision, pending_revision
+                FROM sources
+                WHERE uuid = ?
+                """,
+                (claim.source_uuid,),
+            ).fetchone()
+            if (
+                current is None
+                or str(current["kind"]) != claim.kind
+                or str(current["current_path"]) != claim.claimed_path
+                or str(current["projected_path"]) != claim.projected_path
+                or int(current["revision"]) != claim.claimed_revision
+                or optional_int(current["pending_revision"]) != claim.claimed_revision
+            ):
+                conn.rollback()
+                return None
+            rollback_revision = claim.claimed_revision + 1
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE sources
+                    SET current_path = ?, projected_path = ?, updated_at = ?,
+                        revision = ?, pending_revision = ?
+                    WHERE uuid = ?
+                      AND kind = ?
+                      AND current_path = ?
+                      AND projected_path = ?
+                      AND revision = ?
+                      AND pending_revision = ?
+                    """,
+                    (
+                        claim.projected_path,
+                        claim.claimed_path,
+                        now,
+                        rollback_revision,
+                        rollback_revision,
+                        claim.source_uuid,
+                        claim.kind,
+                        claim.claimed_path,
+                        claim.projected_path,
+                        claim.claimed_revision,
+                        claim.claimed_revision,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                return None
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return None
+            conn.commit()
+        return SourcePathClaim(
+            source_uuid=claim.source_uuid,
+            kind=claim.kind,
+            previous_path=claim.claimed_path,
+            projected_path=claim.claimed_path,
+            claimed_path=claim.projected_path,
+            previous_updated_at=str(current["updated_at"]),
+            previous_pending_revision=claim.claimed_revision,
+            claimed_revision=rollback_revision,
+            resumed=True,
+        )
 
     def get_source(self, source_uuid: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -203,28 +685,381 @@ class UserStateRepository:
             ).fetchone()
             return dict(row) if row else None
 
-    def get_source_by_path(self, kind: str, path: str) -> dict[str, Any] | None:
+    def get_source_binding(self, source_uuid: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
+                """
+                SELECT
+                  uuid, kind, current_path, revision,
+                  projected_path, pending_revision, updated_at
+                FROM sources
+                WHERE uuid = ?
+                """,
+                (source_uuid,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_pending_source_path_claim(self, source_uuid: str) -> SourcePathClaim | None:
+        binding = self.get_source_binding(source_uuid)
+        if binding is None or binding["pending_revision"] is None:
+            return None
+        projected_path = str(binding["projected_path"] or binding["current_path"])
+        return SourcePathClaim(
+            source_uuid=source_uuid,
+            kind=str(binding["kind"]),
+            previous_path=projected_path,
+            projected_path=projected_path,
+            claimed_path=str(binding["current_path"]),
+            previous_updated_at=str(binding["updated_at"]),
+            previous_pending_revision=int(binding["pending_revision"]),
+            claimed_revision=int(binding["pending_revision"]),
+            resumed=True,
+        )
+
+    def list_pending_source_path_claims(self) -> tuple[SourcePathClaim, ...]:
+        with self._connect() as conn:
+            source_uuids = [
+                str(row["uuid"])
+                for row in conn.execute(
+                    "SELECT uuid FROM sources WHERE pending_revision IS NOT NULL ORDER BY uuid"
+                ).fetchall()
+            ]
+        return tuple(
+            claim
+            for source_uuid in source_uuids
+            if (claim := self.get_pending_source_path_claim(source_uuid)) is not None
+        )
+
+    def get_sources_by_path(self, kind: str, path: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
                 """
                 SELECT uuid, kind, current_path
                 FROM sources
                 WHERE kind = ? AND current_path = ?
+                ORDER BY uuid
                 """,
                 (kind, path),
-            ).fetchone()
-            return dict(row) if row else None
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_source_by_path(self, kind: str, path: str) -> dict[str, Any] | None:
+        sources = self.get_sources_by_path(kind, path)
+        return sources[0] if len(sources) == 1 else None
+
+    def get_sources_by_projected_path(self, kind: str, path: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  uuid, kind, current_path, revision,
+                  projected_path, pending_revision, updated_at
+                FROM sources
+                WHERE kind = ? AND projected_path = ?
+                ORDER BY uuid
+                """,
+                (kind, path),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_sources_for_settings_path(self, kind: str, raw_path: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  uuid, kind, current_path, revision,
+                  projected_path, pending_revision, updated_at
+                FROM sources
+                WHERE kind = ?
+                  AND (
+                    current_path = ?
+                    OR (pending_revision IS NOT NULL AND projected_path = ?)
+                  )
+                ORDER BY uuid
+                """,
+                (kind, raw_path, raw_path),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_source_for_index_projection(
+        self,
+        kind: str,
+        path: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  uuid, kind, current_path, revision,
+                  projected_path, pending_revision, updated_at
+                FROM sources
+                WHERE kind = ? AND (current_path = ? OR projected_path = ?)
+                ORDER BY uuid
+                """,
+                (kind, path, path),
+            ).fetchall()
+        unique_rows = {str(row["uuid"]): row for row in rows}
+        if len(unique_rows) > 1:
+            source_uuids = tuple(unique_rows)
+            message = (
+                f"Index projection path {path} is claimed by multiple source UUIDs: "
+                f"{', '.join(source_uuids)}."
+            )
+            raise AmbiguousSourceIdentityError(message, source_uuids=source_uuids)
+        row = next(iter(unique_rows.values()), None)
+        return dict(row) if row is not None else None
 
     def update_source_path(self, source_uuid: str, path: str, *, now: str) -> None:
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE sources SET current_path = ?, updated_at = ? WHERE uuid = ?",
-                (path, now, source_uuid),
+                """
+                UPDATE sources
+                SET current_path = ?, projected_path = ?, pending_revision = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE uuid = ?
+                """,
+                (path, path, now, source_uuid),
             )
             if cursor.rowcount != 1:
                 message = f"Persistent source not found: {source_uuid}"
                 raise ValueError(message)
             conn.commit()
+
+    def topic_for_query(self, query: str) -> StoredTopic | None:
+        normalized = _normalize_topic_key(query)
+        if not normalized:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  t.stable_key, t.title, t.normalized_title,
+                  t.created_at, t.updated_at, t.raw_metadata_json
+                FROM topic_aliases a
+                JOIN topic_alias_topics t ON t.stable_key = a.topic_stable_key
+                WHERE a.normalized_alias = ?
+                """,
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    """
+                    SELECT
+                      stable_key, title, normalized_title,
+                      created_at, updated_at, raw_metadata_json
+                    FROM topic_alias_topics
+                    WHERE stable_key = ?
+                    """,
+                    (_topic_stable_key(query),),
+                ).fetchone()
+        return _stored_topic(row) if row is not None else None
+
+    def list_topic_aliases(
+        self,
+        topic_stable_key: str | None = None,
+    ) -> tuple[StoredTopicAlias, ...]:
+        with self._connect() as conn:
+            if topic_stable_key is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                      t.stable_key AS topic_stable_key,
+                      t.title AS topic_title,
+                      t.normalized_title AS topic_normalized_title,
+                      t.created_at AS topic_created_at,
+                      t.updated_at AS topic_updated_at,
+                      t.raw_metadata_json AS topic_raw_metadata_json,
+                      a.alias,
+                      a.normalized_alias,
+                      a.created_at AS alias_created_at
+                    FROM topic_aliases a
+                    JOIN topic_alias_topics t ON t.stable_key = a.topic_stable_key
+                    ORDER BY a.normalized_alias
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT
+                      t.stable_key AS topic_stable_key,
+                      t.title AS topic_title,
+                      t.normalized_title AS topic_normalized_title,
+                      t.created_at AS topic_created_at,
+                      t.updated_at AS topic_updated_at,
+                      t.raw_metadata_json AS topic_raw_metadata_json,
+                      a.alias,
+                      a.normalized_alias,
+                      a.created_at AS alias_created_at
+                    FROM topic_aliases a
+                    JOIN topic_alias_topics t ON t.stable_key = a.topic_stable_key
+                    WHERE a.topic_stable_key = ?
+                    ORDER BY a.normalized_alias
+                    """,
+                    (topic_stable_key,),
+                ).fetchall()
+        return tuple(_stored_topic_alias(row) for row in rows)
+
+    def add_topic_aliases(
+        self,
+        topic: StoredTopic,
+        aliases: list[str],
+        *,
+        now: str,
+    ) -> tuple[str, ...]:
+        normalized_aliases = _normalized_alias_values(aliases)
+        if not normalized_aliases:
+            return ()
+        added: list[str] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _insert_stored_topic(conn, topic)
+            for alias, normalized_alias in normalized_aliases:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO topic_aliases (
+                      normalized_alias, topic_stable_key, alias, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (normalized_alias, topic.stable_key, alias, now),
+                )
+                if cursor.rowcount:
+                    added.append(alias)
+            conn.commit()
+        return tuple(added)
+
+    def delete_topic_aliases(self, aliases: list[str]) -> tuple[str, ...]:
+        normalized_aliases = _normalized_alias_values(aliases)
+        removed: list[str] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for alias, normalized_alias in normalized_aliases:
+                row = conn.execute(
+                    "SELECT topic_stable_key, alias FROM topic_aliases WHERE normalized_alias = ?",
+                    (normalized_alias,),
+                ).fetchone()
+                if row is None:
+                    continue
+                conn.execute(
+                    "DELETE FROM topic_aliases WHERE normalized_alias = ?",
+                    (normalized_alias,),
+                )
+                removed.append(str(row["alias"]) or alias)
+                conn.execute(
+                    """
+                    DELETE FROM topic_alias_topics
+                    WHERE stable_key = ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM topic_aliases
+                        WHERE topic_stable_key = topic_alias_topics.stable_key
+                      )
+                    """,
+                    (str(row["topic_stable_key"]),),
+                )
+            conn.commit()
+        return tuple(removed)
+
+    def register_index_generation(
+        self,
+        generation_id: str,
+        index_path: Path,
+        alias_owner: str,
+        *,
+        now: str,
+    ) -> bool:
+        canonical_index_path = canonical_database_path(index_path)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                inserted = _register_index_generation(
+                    conn,
+                    generation_id,
+                    canonical_index_path,
+                    alias_owner,
+                    now=now,
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return inserted
+
+    def import_topic_aliases(  # noqa: PLR0913
+        self,
+        generation_id: str,
+        index_path: Path,
+        source_schema_version: int,
+        aliases: tuple[StoredTopicAlias, ...],
+        *,
+        now: str,
+        verify_snapshot: Callable[[], bool],
+    ) -> bool:
+        canonical_index_path = canonical_database_path(index_path)
+        source_digest = _topic_alias_digest(aliases)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _register_index_generation(
+                    conn,
+                    generation_id,
+                    canonical_index_path,
+                    INDEX_ALIAS_OWNER_LEGACY,
+                    now=now,
+                )
+                imported = conn.execute(
+                    """
+                    SELECT 1
+                    FROM topic_alias_imports
+                    WHERE generation_id = ? AND index_path = ?
+                    """,
+                    (generation_id, canonical_index_path),
+                ).fetchone()
+                if imported is not None:
+                    conn.commit()
+                    return False
+                for alias in aliases:
+                    _insert_stored_topic(conn, alias.topic)
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO topic_aliases (
+                          normalized_alias, topic_stable_key, alias, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            alias.normalized_alias,
+                            alias.topic_stable_key,
+                            alias.alias,
+                            alias.alias_created_at,
+                        ),
+                    )
+                    _topic_alias_import_checkpoint("row")
+                _topic_alias_import_checkpoint("before_recheck")
+                if not verify_snapshot():
+                    message = "Index topic aliases changed during persistent-state import."
+                    raise RuntimeError(message)  # noqa: TRY301
+                conn.execute(
+                    """
+                    INSERT INTO topic_alias_imports (
+                      generation_id, index_path, source_schema_version,
+                      source_alias_count, source_digest, imported_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        generation_id,
+                        canonical_index_path,
+                        source_schema_version,
+                        len(aliases),
+                        source_digest,
+                        now,
+                    ),
+                )
+                _topic_alias_import_checkpoint("before_commit")
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        _topic_alias_import_checkpoint("committed")
+        return True
 
     def set_task_state(  # noqa: PLR0913
         self,
@@ -339,7 +1174,6 @@ class UserStateRepository:
                             conn,
                             report_id,
                             rows,
-                            now=now,
                         )
                         conn.execute(
                             """
@@ -406,6 +1240,605 @@ class UserStateRepository:
         return conn
 
 
+def recover_and_validate_index(index_path: Path) -> int | None:
+    index_path = Path(index_path)
+    if not index_path.is_file():
+        return None
+    with closing(sqlite3.connect(index_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = _supported_index_version(conn)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    return version
+
+
+def prepare_index_user_state(
+    index_path: Path,
+    state_path: Path,
+    *,
+    now: str,
+) -> UserStateRepository:
+    index_path = Path(index_path)
+    if not index_path.is_file():
+        return UserStateRepository(state_path)
+
+    with closing(sqlite3.connect(index_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = _supported_index_version(conn)
+            marker = read_index_generation_marker(conn)
+            state = UserStateRepository(state_path)
+            if marker is not None and marker[1] == INDEX_ALIAS_OWNER_STATE:
+                state.register_index_generation(
+                    marker[0],
+                    index_path,
+                    INDEX_ALIAS_OWNER_STATE,
+                    now=now,
+                )
+            elif marker is not None or _has_index_topic_alias_schema(conn):
+                aliases, alias_count, alias_digest = _index_topic_alias_snapshot(conn)
+                generation_id = (
+                    marker[0] if marker is not None else _legacy_index_generation_id(index_path)
+                )
+
+                def verify_snapshot() -> bool:
+                    current_aliases, current_count, current_digest = _index_topic_alias_snapshot(
+                        conn
+                    )
+                    return (
+                        current_count == alias_count
+                        and current_digest == alias_digest
+                        and current_aliases == aliases
+                    )
+
+                state.import_topic_aliases(
+                    generation_id,
+                    index_path,
+                    version,
+                    aliases,
+                    now=now,
+                    verify_snapshot=verify_snapshot,
+                )
+                if marker is None and version == CURRENT_SCHEMA_VERSION:
+                    ensure_index_generation_marker(
+                        conn,
+                        alias_owner=INDEX_ALIAS_OWNER_LEGACY,
+                        generation_id=generation_id,
+                    )
+            conn.commit()
+            return state  # noqa: TRY300
+        except BaseException:
+            conn.rollback()
+            raise
+
+
+def register_state_owned_index_generation(
+    index_path: Path,
+    ledger_path: Path,
+    state: UserStateRepository,
+    *,
+    now: str,
+) -> str:
+    index_path = Path(index_path)
+    with closing(sqlite3.connect(index_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _supported_index_version(conn)
+            marker = read_index_generation_marker(conn)
+            if marker is None:
+                message = "Current index is missing its stable generation marker."
+                raise RuntimeError(message)  # noqa: TRY301
+            generation_id, alias_owner = marker
+            if alias_owner != INDEX_ALIAS_OWNER_STATE:
+                message = "Only state-owned index generations can register projection paths."
+                raise RuntimeError(message)  # noqa: TRY301
+            state.register_index_generation(
+                generation_id,
+                ledger_path,
+                INDEX_ALIAS_OWNER_STATE,
+                now=now,
+            )
+            conn.commit()
+            return generation_id  # noqa: TRY300
+        except BaseException:
+            conn.rollback()
+            raise
+
+
+def _legacy_index_generation_id(index_path: Path) -> str:
+    physical_path = Path(index_path).resolve(strict=True)
+    path_stat = physical_path.stat()
+    birth_time = getattr(path_stat, "st_birthtime", None)
+    identity = f"{path_stat.st_dev}\0{path_stat.st_ino}\0{birth_time or ''}"
+    return f"legacy-fs:{hashlib.sha256(identity.encode()).hexdigest()}"
+
+
+def _supported_index_version(conn: sqlite3.Connection) -> int:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version > CURRENT_SCHEMA_VERSION:
+        message = (
+            f"Unsupported index schema version {version}; "
+            f"this binary supports {CURRENT_SCHEMA_VERSION}."
+        )
+        raise RuntimeError(message)
+    return version
+
+
+def _has_index_topic_alias_schema(conn: sqlite3.Connection) -> bool:
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    }
+    return {"knowledge_nodes", "topic_aliases"}.issubset(tables)
+
+
+def _index_topic_alias_snapshot(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[StoredTopicAlias, ...], int, str]:
+    if not _has_index_topic_alias_schema(conn):
+        aliases: tuple[StoredTopicAlias, ...] = ()
+        return aliases, 0, _topic_alias_digest(aliases)
+    alias_count = int(conn.execute("SELECT COUNT(*) FROM topic_aliases").fetchone()[0])
+    rows = conn.execute(
+        """
+        SELECT
+          n.type AS topic_type,
+          n.stable_key AS topic_stable_key,
+          n.title AS topic_title,
+          n.normalized_title AS topic_normalized_title,
+          n.created_at AS topic_created_at,
+          n.updated_at AS topic_updated_at,
+          n.raw_metadata_json AS topic_raw_metadata_json,
+          a.alias,
+          a.normalized_alias,
+          a.created_at AS alias_created_at
+        FROM topic_aliases a
+        JOIN knowledge_nodes n ON n.id = a.topic_node_id
+        ORDER BY a.normalized_alias
+        """
+    ).fetchall()
+    if len(rows) != alias_count or any(str(row["topic_type"]) != "Topic" for row in rows):
+        message = "Index topic aliases do not have a complete valid topic projection."
+        raise RuntimeError(message)
+    aliases = tuple(_stored_topic_alias(row) for row in rows)
+    return aliases, alias_count, _topic_alias_digest(aliases)
+
+
+def find_existing_source_by_uuid(
+    state_path: Path,
+    source_uuid: str,
+) -> dict[str, Any] | None:
+    state_path = Path(state_path)
+    if not state_path.is_file():
+        return None
+    uri = f"{state_path.resolve(strict=True).as_uri()}?mode=ro&immutable=1"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > CURRENT_USER_STATE_SCHEMA_VERSION:
+            message = (
+                f"Unsupported user-state schema version {version}; "
+                f"this binary supports {CURRENT_USER_STATE_SCHEMA_VERSION}."
+            )
+            raise RuntimeError(message)
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sources)").fetchall()}
+        if not {"uuid", "kind", "current_path"}.issubset(columns):
+            return None
+        row = conn.execute(
+            """
+            SELECT uuid, kind, current_path
+            FROM sources
+            WHERE uuid = ?
+            """,
+            (source_uuid,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def find_existing_source_by_canonical_path(
+    state_path: Path,
+    kind: str,
+    path: Path,
+) -> dict[str, Any] | None:
+    canonical_path = canonical_source_path(path)
+    state_path = Path(state_path)
+    if not state_path.is_file():
+        return None
+    uri = f"{state_path.resolve(strict=True).as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > CURRENT_USER_STATE_SCHEMA_VERSION:
+            message = (
+                f"Unsupported user-state schema version {version}; "
+                f"this binary supports {CURRENT_USER_STATE_SCHEMA_VERSION}."
+            )
+            raise RuntimeError(message)
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sources)").fetchall()}
+        if not {"uuid", "kind", "current_path"}.issubset(columns):
+            return None
+        rows = conn.execute(
+            """
+            SELECT uuid, kind, current_path
+            FROM sources
+            WHERE kind = ?
+            ORDER BY uuid
+            """,
+            (kind,),
+        ).fetchall()
+    exact, collision_hints = _classify_source_path_claims(rows, canonical_path)
+    row = _unique_canonical_source_match(exact, collision_hints, canonical_path)
+    return dict(row) if row is not None else None
+
+
+def find_existing_source_for_settings_path(
+    state_path: Path,
+    kind: str,
+    raw_path: str,
+) -> dict[str, Any] | None:
+    state_path = Path(state_path)
+    if not state_path.is_file():
+        return None
+    uri = f"{state_path.resolve(strict=True).as_uri()}?mode=ro&immutable=1"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > CURRENT_USER_STATE_SCHEMA_VERSION:
+            message = (
+                f"Unsupported user-state schema version {version}; "
+                f"this binary supports {CURRENT_USER_STATE_SCHEMA_VERSION}."
+            )
+            raise RuntimeError(message)
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sources)").fetchall()}
+        if not {"uuid", "kind", "current_path"}.issubset(columns):
+            return None
+        if {"projected_path", "pending_revision"}.issubset(columns):
+            rows = conn.execute(
+                """
+                SELECT uuid, kind, current_path, projected_path, pending_revision
+                FROM sources
+                WHERE kind = ?
+                  AND (
+                    current_path = ?
+                    OR (pending_revision IS NOT NULL AND projected_path = ?)
+                  )
+                ORDER BY uuid
+                """,
+                (kind, raw_path, raw_path),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT uuid, kind, current_path
+                FROM sources
+                WHERE kind = ? AND current_path = ?
+                ORDER BY uuid
+                """,
+                (kind, raw_path),
+            ).fetchall()
+    if len(rows) > 1:
+        source_uuids = tuple(str(row["uuid"]) for row in rows)
+        message = (
+            f"Legacy settings path {raw_path} maps to multiple source UUIDs: "
+            f"{', '.join(source_uuids)}."
+        )
+        raise AmbiguousSourceIdentityError(message, source_uuids=source_uuids)
+    return dict(rows[0]) if rows else None
+
+
+def _source_path_claims(
+    conn: sqlite3.Connection,
+    kind: str,
+    canonical_path: Path,
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    rows = conn.execute(
+        """
+        SELECT
+          uuid, kind, current_path, revision,
+          projected_path, pending_revision, updated_at
+        FROM sources
+        WHERE kind = ?
+        ORDER BY uuid
+        """,
+        (kind,),
+    ).fetchall()
+    return _classify_source_path_claims(rows, canonical_path)
+
+
+def _source_target_claims(
+    conn: sqlite3.Connection,
+    kind: str,
+    canonical_path: Path,
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    rows = conn.execute(
+        """
+        SELECT
+          uuid, kind, current_path, revision,
+          projected_path, pending_revision, updated_at
+        FROM sources
+        WHERE kind = ?
+        ORDER BY uuid
+        """,
+        (kind,),
+    ).fetchall()
+    canonical_string = str(canonical_path)
+    exact: dict[str, sqlite3.Row] = {}
+    collision_hints: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        stored_paths = {str(row["current_path"])}
+        if row["projected_path"] is not None:
+            stored_paths.add(str(row["projected_path"]))
+        for stored_string in stored_paths:
+            if stored_string == canonical_string:
+                exact[str(row["uuid"])] = row
+                continue
+            try:
+                resolved_stored_path = canonical_source_path(Path(stored_string))
+            except (OSError, RuntimeError):
+                continue
+            if resolved_stored_path == canonical_path:
+                collision_hints[str(row["uuid"])] = row
+    return list(exact.values()), list(collision_hints.values())
+
+
+def _require_source_binding(
+    conn: sqlite3.Connection,
+    source_uuid: str,
+    kind: str,
+) -> sqlite3.Row:
+    source = conn.execute(
+        """
+        SELECT
+          uuid, kind, current_path, updated_at, revision,
+          projected_path, pending_revision
+        FROM sources
+        WHERE uuid = ?
+        """,
+        (source_uuid,),
+    ).fetchone()
+    if source is None:
+        message = f"Source UUID not found in user state: {source_uuid}."
+        raise ValueError(message)
+    if str(source["kind"]) != kind:
+        message = f"Source UUID {source_uuid} has an incompatible source kind."
+        raise ValueError(message)
+    return source
+
+
+def _require_available_claim_target(
+    conn: sqlite3.Connection,
+    source_uuid: str,
+    kind: str,
+    canonical_path: Path,
+) -> None:
+    exact, collision_hints = _source_target_claims(conn, kind, canonical_path)
+    conflicts = {
+        str(row["uuid"]): row
+        for row in (*exact, *collision_hints)
+        if str(row["uuid"]) != source_uuid
+    }
+    if not conflicts:
+        return
+    conflicting_uuids = tuple(conflicts)
+    source_uuids = ", ".join(conflicting_uuids)
+    message = f"The rebind target is already linked to another source UUID: {source_uuids}."
+    raise AmbiguousSourceIdentityError(message, source_uuids=conflicting_uuids)
+
+
+def _require_unreserved_projection_path(
+    conn: sqlite3.Connection,
+    kind: str,
+    canonical_path: Path,
+) -> None:
+    exact, collision_hints = _source_target_claims(conn, kind, canonical_path)
+    conflicts = {str(row["uuid"]): row for row in (*exact, *collision_hints)}
+    if not conflicts:
+        return
+    conflicting_uuids = tuple(conflicts)
+    message = (
+        f"Source path {canonical_path} is reserved by source UUID(s) "
+        f"{', '.join(conflicting_uuids)}."
+    )
+    raise AmbiguousSourceIdentityError(message, source_uuids=conflicting_uuids)
+
+
+def _classify_source_path_claims(
+    rows: list[sqlite3.Row],
+    canonical_path: Path,
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    canonical_string = str(canonical_path)
+    exact: list[sqlite3.Row] = []
+    collision_hints: list[sqlite3.Row] = []
+    for row in rows:
+        stored_string = str(row["current_path"])
+        if stored_string == canonical_string:
+            exact.append(row)
+            continue
+        try:
+            resolved_stored_path = canonical_source_path(Path(stored_string))
+        except (OSError, RuntimeError):
+            continue
+        if resolved_stored_path == canonical_path:
+            collision_hints.append(row)
+    return exact, collision_hints
+
+
+def _canonical_source_match(
+    conn: sqlite3.Connection,
+    kind: str,
+    canonical_path: Path,
+) -> sqlite3.Row | None:
+    exact, collision_hints = _source_path_claims(conn, kind, canonical_path)
+    return _unique_canonical_source_match(exact, collision_hints, canonical_path)
+
+
+def _unique_canonical_source_match(
+    exact: list[sqlite3.Row],
+    collision_hints: list[sqlite3.Row],
+    canonical_path: Path,
+) -> sqlite3.Row | None:
+    if collision_hints:
+        conflicting_uuids = tuple(str(row["uuid"]) for row in collision_hints)
+        source_uuids = ", ".join(conflicting_uuids)
+        message = (
+            f"Source path {canonical_path} has an ambiguous collision with non-canonical "
+            f"user-state path(s) for UUID(s) {source_uuids}. Automatic reuse or duplicate "
+            "registration is unsafe; run `mm config source NEW_PATH --rebind --source-uuid UUID`."
+        )
+        raise AmbiguousSourceIdentityError(message, source_uuids=conflicting_uuids)
+    if len(exact) > 1:
+        conflicting_uuids = tuple(str(row["uuid"]) for row in exact)
+        source_uuids = ", ".join(conflicting_uuids)
+        message = (
+            f"Canonical source path is ambiguous in user state: {canonical_path}. "
+            f"Conflicting source UUIDs: {source_uuids}."
+        )
+        raise AmbiguousSourceIdentityError(message, source_uuids=conflicting_uuids)
+    return exact[0] if exact else None
+
+
+def optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, str)):
+        return int(value)
+    message = f"Expected integer-compatible value, got {type(value).__name__}."
+    raise TypeError(message)
+
+
+def _normalize_topic_key(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _topic_stable_key(title: str) -> str:
+    return f"topic:{_normalize_topic_key(title)}"
+
+
+def _normalized_alias_values(aliases: list[str]) -> tuple[tuple[str, str], ...]:
+    values: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        normalized = _normalize_topic_key(alias)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append((alias, normalized))
+    return tuple(values)
+
+
+def _stored_topic(row: sqlite3.Row) -> StoredTopic:
+    return StoredTopic(
+        stable_key=str(row["stable_key"]),
+        title=str(row["title"]),
+        normalized_title=str(row["normalized_title"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        raw_metadata_json=(
+            str(row["raw_metadata_json"]) if row["raw_metadata_json"] is not None else None
+        ),
+    )
+
+
+def _stored_topic_alias(row: sqlite3.Row) -> StoredTopicAlias:
+    return StoredTopicAlias(
+        topic_stable_key=str(row["topic_stable_key"]),
+        topic_title=str(row["topic_title"]),
+        topic_normalized_title=str(row["topic_normalized_title"]),
+        topic_created_at=str(row["topic_created_at"]),
+        topic_updated_at=str(row["topic_updated_at"]),
+        topic_raw_metadata_json=(
+            str(row["topic_raw_metadata_json"])
+            if row["topic_raw_metadata_json"] is not None
+            else None
+        ),
+        alias=str(row["alias"]),
+        normalized_alias=str(row["normalized_alias"]),
+        alias_created_at=str(row["alias_created_at"]),
+    )
+
+
+def _register_index_generation(
+    conn: sqlite3.Connection,
+    generation_id: str,
+    canonical_index_path: str,
+    alias_owner: str,
+    *,
+    now: str,
+) -> bool:
+    if alias_owner not in {INDEX_ALIAS_OWNER_STATE, INDEX_ALIAS_OWNER_LEGACY}:
+        message = f"Unsupported index alias owner: {alias_owner}."
+        raise ValueError(message)
+    existing = conn.execute(
+        """
+        SELECT alias_owner
+        FROM index_generations
+        WHERE generation_id = ? AND index_path = ?
+        """,
+        (generation_id, canonical_index_path),
+    ).fetchone()
+    if existing is not None:
+        if str(existing["alias_owner"]) != alias_owner:
+            message = "Index generation alias ownership conflicts with its persistent-state ledger."
+            raise RuntimeError(message)
+        return False
+    conn.execute(
+        """
+        INSERT INTO index_generations (
+          generation_id, index_path, alias_owner, registered_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (generation_id, canonical_index_path, alias_owner, now),
+    )
+    return True
+
+
+def _insert_stored_topic(conn: sqlite3.Connection, topic: StoredTopic) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO topic_alias_topics (
+          stable_key, title, normalized_title,
+          created_at, updated_at, raw_metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            topic.stable_key,
+            topic.title,
+            topic.normalized_title,
+            topic.created_at,
+            topic.updated_at,
+            topic.raw_metadata_json,
+        ),
+    )
+
+
+def _topic_alias_digest(aliases: tuple[StoredTopicAlias, ...]) -> str:
+    digest = hashlib.sha256()
+    for alias in aliases:
+        values = (
+            alias.topic_stable_key,
+            alias.topic_title,
+            alias.topic_normalized_title,
+            alias.topic_created_at,
+            alias.topic_updated_at,
+            alias.topic_raw_metadata_json,
+            alias.alias,
+            alias.normalized_alias,
+            alias.alias_created_at,
+        )
+        for value in values:
+            encoded = (value if value is not None else "\0").encode()
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
 def task_identity(
     source_uuid: str,
     meeting_external_id: str,
@@ -438,6 +1871,10 @@ def ensure_user_state_schema(conn: sqlite3.Connection) -> None:
         (1, USER_STATE_SCHEMA),
         (TAG_STATE_SCHEMA_VERSION, TAG_STATE_SCHEMA),
         (MIGRATION_REPORT_SCHEMA_VERSION, MIGRATION_REPORT_SCHEMA),
+        (SOURCE_REVISION_SCHEMA_VERSION, SOURCE_REVISION_SCHEMA),
+        (PENDING_SOURCE_BINDING_SCHEMA_VERSION, PENDING_SOURCE_BINDING_SCHEMA),
+        (TOPIC_ALIAS_STATE_SCHEMA_VERSION, TOPIC_ALIAS_STATE_SCHEMA),
+        (INDEX_GENERATION_STATE_SCHEMA_VERSION, INDEX_GENERATION_STATE_SCHEMA),
     )
     for target_version, script in migrations:
         if version < target_version:
@@ -479,6 +1916,14 @@ def _apply_user_state_schema_migration(
 
 def _state_transfer_checkpoint(_name: str) -> None:
     # A narrow no-op seam lets tests interrupt the cross-database handoff.
+    return
+
+
+def _topic_alias_import_checkpoint(_name: str) -> None:
+    return
+
+
+def _source_claim_finalize_checkpoint(_name: str) -> None:
     return
 
 
@@ -699,10 +2144,15 @@ def _exact_historical_source_uuid(
     path: str,
 ) -> str | None:
     sources = conn.execute(
-        "SELECT uuid FROM sources WHERE kind = ? AND current_path = ?",
-        (kind, path),
+        """
+        SELECT uuid
+        FROM sources
+        WHERE kind = ? AND (current_path = ? OR projected_path = ?)
+        """,
+        (kind, path, path),
     ).fetchall()
-    return str(sources[0]["uuid"]) if len(sources) == 1 else None
+    unique_uuids = {str(source["uuid"]) for source in sources}
+    return next(iter(unique_uuids)) if len(unique_uuids) == 1 else None
 
 
 def _exact_historical_active_id(
@@ -838,10 +2288,8 @@ def _write_legacy_task_states(
     conn: sqlite3.Connection,
     report_id: int,
     rows: list[LegacyTaskState],
-    *,
-    now: str,
 ) -> tuple[int, int]:
-    source_uuids: dict[tuple[str, str], str] = {}
+    source_uuids: dict[tuple[str, str], str | None] = {}
     claimed_identities: set[TaskIdentity] = set()
     migrated = 0
     orphaned = 0
@@ -849,13 +2297,14 @@ def _write_legacy_task_states(
         source_uuid: str | None = None
         if row.source_kind is not None and row.source_path is not None:
             source_key = (row.source_kind, row.source_path)
-            source_uuid = source_uuids.get(source_key)
-            if source_uuid is None:
-                source_uuid = _get_or_create_source(conn, *source_key, now=now)
-                source_uuids[source_key] = source_uuid
+            if source_key not in source_uuids:
+                source_uuids[source_key] = _find_existing_source(conn, *source_key)
                 _state_transfer_checkpoint("source")
+            source_uuid = source_uuids[source_key]
 
         orphaned_reason = row.orphaned_reason()
+        if orphaned_reason is None and source_uuid is None:
+            orphaned_reason = MISSING_STATE_SOURCE_REASON
         if orphaned_reason is not None:
             task_state_id = _upsert_legacy_orphan(
                 conn,
@@ -929,33 +2378,24 @@ def _write_legacy_task_states(
     return migrated, orphaned
 
 
-def _get_or_create_source(
+def _find_existing_source(
     conn: sqlite3.Connection,
     kind: str,
     path: str,
-    *,
-    now: str,
-) -> str:
-    row = conn.execute(
-        "SELECT uuid FROM sources WHERE kind = ? AND current_path = ?",
-        (kind, path),
-    ).fetchone()
-    if row is not None:
-        source_uuid = str(row["uuid"])
-        conn.execute(
-            "UPDATE sources SET updated_at = ? WHERE uuid = ?",
-            (now, source_uuid),
-        )
-        return source_uuid
-    source_uuid = str(uuid.uuid4())
-    conn.execute(
+) -> str | None:
+    rows = conn.execute(
         """
-        INSERT INTO sources (uuid, kind, current_path, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        SELECT uuid
+        FROM sources
+        WHERE kind = ? AND (current_path = ? OR projected_path = ?)
         """,
-        (source_uuid, kind, path, now, now),
-    )
-    return source_uuid
+        (kind, path, path),
+    ).fetchall()
+    unique_uuids = {str(row["uuid"]) for row in rows}
+    if len(unique_uuids) > 1:
+        message = f"Legacy source path {path} maps to multiple persistent source UUIDs."
+        raise AmbiguousSourceIdentityError(message, source_uuids=tuple(unique_uuids))
+    return next(iter(unique_uuids), None)
 
 
 def _required_legacy_identity(
@@ -1172,7 +2612,7 @@ def _write_index_ready_marker(
     index_path: Path,
     transfer: LegacyStateTransfer,
 ) -> None:
-    with sqlite3.connect(index_path) as conn:
+    with closing(sqlite3.connect(index_path)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("BEGIN IMMEDIATE")
@@ -1231,7 +2671,7 @@ def _write_index_ready_marker(
 def _legacy_index_snapshot(
     index_path: Path,
 ) -> tuple[str, list[LegacyTaskState]] | None:
-    with sqlite3.connect(index_path) as conn:
+    with closing(sqlite3.connect(index_path)) as conn:
         conn.execute("BEGIN")
         snapshot: tuple[str, list[LegacyTaskState]] | None = None
         try:

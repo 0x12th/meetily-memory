@@ -7,7 +7,7 @@ from typing import Any
 from meetily_memory.db.fts import NO_MATCH_FTS_QUERY, build_fts_query
 from meetily_memory.db.rows import last_insert_id, row_to_dict, rows_to_dicts
 from meetily_memory.db.schema import index_connection
-from meetily_memory.domain import MeetingSearchFilters
+from meetily_memory.domain import AmbiguousMeetingError, MeetingRef, MeetingSearchFilters
 from meetily_memory.json_codec import dumps_json
 from meetily_memory.meeting_structure import ENTITY_KINDS
 from meetily_memory.memory.entities import ENTITY_COUNT_SQL, ENTITY_DELETE_SQL, ENTITY_SELECT_SQL
@@ -30,44 +30,71 @@ class MeetingsRepository:
         self.context = context
         self.index_path = context.index_path
 
-    def upsert_source(self, kind: str, path: str, now: str, label: str | None = None) -> int:
+    def upsert_source(
+        self,
+        source_uuid: str,
+        kind: str,
+        path: str,
+        now: str,
+        label: str | None = None,
+    ) -> int:
         with index_connection(self.index_path) as conn:
-            source_id = self._upsert_source(conn, kind, path, now, label)
+            source_id = self._upsert_source(conn, source_uuid, kind, path, now, label)
             conn.commit()
             return source_id
 
-    def _upsert_source(
+    def _upsert_source(  # noqa: PLR0913
         self,
         conn: sqlite3.Connection,
+        source_uuid: str,
         kind: str,
         path: str,
         now: str,
         label: str | None = None,
     ) -> int:
         existing = conn.execute(
-            "SELECT * FROM sources WHERE kind = ? AND path = ?",
+            "SELECT * FROM sources WHERE source_uuid = ?",
+            (source_uuid,),
+        ).fetchone()
+        path_owner = conn.execute(
+            "SELECT source_uuid FROM sources WHERE kind = ? AND path = ?",
             (kind, path),
         ).fetchone()
+        if path_owner is not None and str(path_owner["source_uuid"]) != source_uuid:
+            message = "The canonical source path is already projected with a different UUID."
+            raise ValueError(message)
         if existing:
+            if str(existing["kind"]) != kind:
+                message = f"Source UUID {source_uuid} is registered with a different kind."
+                raise ValueError(message)
+            source_id = int(existing["id"])
             conn.execute(
                 """
                 UPDATE sources
-                SET last_seen_at = ?, updated_at = ?, label = ?
+                SET path = ?, last_seen_at = ?, updated_at = ?, label = ?
                 WHERE id = ?
                 """,
-                (now, now, label or existing["label"], existing["id"]),
+                (path, now, now, label or existing["label"], source_id),
             )
-            return int(existing["id"])
+            conn.execute(
+                """
+                UPDATE meetings
+                SET source_path = ?
+                WHERE source_id = ? AND (source_path IS NULL OR source_path != ?)
+                """,
+                (path, source_id, path),
+            )
+            return source_id
 
         cursor = conn.execute(
             """
             INSERT INTO sources (
-              kind, path, label, external_app, external_version,
+              source_uuid, kind, path, label, external_app, external_version,
               last_seen_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, 'Meetily', NULL, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'Meetily', NULL, ?, ?, ?)
             """,
-            (kind, path, label, now, now, now),
+            (source_uuid, kind, path, label, now, now, now),
         )
         return last_insert_id(cursor)
 
@@ -79,7 +106,15 @@ class MeetingsRepository:
             ).fetchone()
             return row_to_dict(row)
 
-    def get_meeting_by_external_id(
+    def get_source_by_uuid(self, source_uuid: str) -> dict[str, Any] | None:
+        with index_connection(self.index_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM sources WHERE source_uuid = ?",
+                (source_uuid,),
+            ).fetchone()
+            return row_to_dict(row)
+
+    def get_meeting_by_source_id(
         self,
         source_id: int,
         external_id: str,
@@ -88,7 +123,12 @@ class MeetingsRepository:
     ) -> dict[str, Any] | None:
         time_sql, time_params = meeting_time_predicate(filters)
         with index_connection(self.index_path) as conn:
-            sql = f"SELECT * FROM meetings m WHERE source_id = ? AND external_id = ? AND {time_sql}"
+            sql = f"""
+                SELECT m.*, s.source_uuid
+                FROM meetings m
+                JOIN sources s ON s.id = m.source_id
+                WHERE m.source_id = ? AND m.external_id = ? AND {time_sql}
+            """
             row = conn.execute(
                 sql,
                 (source_id, external_id, *time_params),
@@ -346,8 +386,10 @@ class MeetingsRepository:
             sql = """
                 SELECT
                   m.*,
+                  s.source_uuid,
                   COUNT(c.id) AS chunk_count
                 FROM meetings m
+                JOIN sources s ON s.id = m.source_id
                 LEFT JOIN chunks c ON c.meeting_id = m.id
                 WHERE (
                   EXISTS (
@@ -372,8 +414,10 @@ class MeetingsRepository:
             sql = """
                 SELECT
                   m.*,
+                  s.source_uuid,
                   COUNT(c.id) AS chunk_count
                 FROM meetings m
+                JOIN sources s ON s.id = m.source_id
                 LEFT JOIN chunks c ON c.meeting_id = m.id
                 GROUP BY m.id
                 ORDER BY COALESCE(m.updated_at, m.created_at, m.indexed_at) DESC
@@ -385,25 +429,71 @@ class MeetingsRepository:
             rows = conn.execute(sql, params).fetchall()
             return rows_to_dicts(rows)
 
-    def get_meeting(
+    def get_meeting_by_local_id(
         self,
-        external_or_internal_id: str,
+        meeting_id: int,
         *,
         filters: MeetingSearchFilters | None = None,
     ) -> dict[str, Any] | None:
         time_sql, time_params = meeting_time_predicate(filters)
         with index_connection(self.index_path) as conn:
-            if external_or_internal_id.isdigit():
-                row = conn.execute(
-                    f"SELECT * FROM meetings m WHERE id = ? AND {time_sql}",
-                    (int(external_or_internal_id), *time_params),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    f"SELECT * FROM meetings m WHERE external_id = ? AND {time_sql}",
-                    (external_or_internal_id, *time_params),
-                ).fetchone()
+            row = conn.execute(
+                f"""
+                SELECT m.*, s.source_uuid
+                FROM meetings m
+                JOIN sources s ON s.id = m.source_id
+                WHERE m.id = ? AND {time_sql}
+                """,
+                (meeting_id, *time_params),
+            ).fetchone()
             return row_to_dict(row)
+
+    def get_meeting_by_ref(
+        self,
+        ref: MeetingRef,
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> dict[str, Any] | None:
+        time_sql, time_params = meeting_time_predicate(filters)
+        with index_connection(self.index_path) as conn:
+            row = conn.execute(
+                f"""
+                SELECT m.*, s.source_uuid
+                FROM meetings m
+                JOIN sources s ON s.id = m.source_id
+                WHERE s.source_uuid = ? AND m.external_id = ? AND {time_sql}
+                """,
+                (ref.source_uuid, ref.external_id, *time_params),
+            ).fetchone()
+            return row_to_dict(row)
+
+    def get_meeting_by_external_id(
+        self,
+        external_id: str,
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> dict[str, Any] | None:
+        time_sql, time_params = meeting_time_predicate(filters)
+        with index_connection(self.index_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT m.*, s.source_uuid
+                FROM meetings m
+                JOIN sources s ON s.id = m.source_id
+                WHERE m.external_id = ? AND {time_sql}
+                ORDER BY s.source_uuid
+                LIMIT 2
+                """,
+                (external_id, *time_params),
+            ).fetchall()
+        if len(rows) > 1:
+            source_uuids = ", ".join(str(row["source_uuid"]) for row in rows)
+            message = (
+                f"Meeting external ID is ambiguous across sources: {external_id}. "
+                f"Use MeetingRef with one of these source UUIDs: {source_uuids}."
+            )
+            raise AmbiguousMeetingError(message)
+        return row_to_dict(rows[0]) if rows else None
 
     def dominant_meeting_language(self) -> str | None:
         with index_connection(self.index_path) as conn:
@@ -419,9 +509,15 @@ class MeetingsRepository:
             ).fetchone()
             return str(row["language"]) if row else None
 
-    def begin_source_scan(self, kind: str, path: str, started_at: str) -> tuple[int, int]:
+    def begin_source_scan(
+        self,
+        source_uuid: str,
+        kind: str,
+        path: str,
+        started_at: str,
+    ) -> tuple[int, int]:
         with index_connection(self.index_path) as conn:
-            source_id = self._upsert_source(conn, kind, path, started_at)
+            source_id = self._upsert_source(conn, source_uuid, kind, path, started_at)
             self._fail_running_scan_runs(conn, started_at)
             cursor = conn.execute(
                 """

@@ -212,6 +212,7 @@ def semantic_search(
             SELECT
               m.id AS meeting_id,
               m.external_id AS meeting_external_id,
+              s.source_uuid AS source_uuid,
               m.title AS title,
               m.created_at AS created_at,
               m.updated_at AS updated_at,
@@ -233,6 +234,7 @@ def semantic_search(
             FROM matches
             JOIN chunks c ON c.id = matches.chunk_id
             JOIN meetings m ON m.id = c.meeting_id
+            JOIN sources s ON s.id = m.source_id
             JOIN chunk_embeddings e
               ON e.chunk_id = c.id
              AND e.embedding_provider = ?

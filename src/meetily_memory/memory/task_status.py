@@ -37,7 +37,7 @@ class TaskStatusRepository:
                 """
                 SELECT e.*, m.external_id AS meeting_external_id,
                        c.external_id AS chunk_external_id,
-                       s.kind AS source_kind, s.path AS source_path
+                       s.source_uuid AS source_uuid
                 FROM action_items e
                 JOIN meetings m ON m.id = e.meeting_id
                 JOIN sources s ON s.id = m.source_id
@@ -49,11 +49,7 @@ class TaskStatusRepository:
             if task is None:
                 message = f"Task not found: {action_item_id}"
                 raise ValueError(message)
-            source_uuid = self.context.user_state.source_uuid(
-                str(task["source_kind"]),
-                str(task["source_path"]),
-                now=now,
-            )
+            source_uuid = str(task["source_uuid"])
             identity = task_identity(
                 source_uuid,
                 str(task["meeting_external_id"]),

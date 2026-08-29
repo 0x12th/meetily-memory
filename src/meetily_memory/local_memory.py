@@ -1,6 +1,7 @@
 from typing import Any, cast
 
 from meetily_memory.domain import (
+    MeetingRef,
     MemoryStats,
     PersonMemory,
     ProjectMemory,
@@ -112,7 +113,10 @@ def structured_signal_from_row(row: Row) -> StructuredSignal:
         status_source=optional_str(row.get("status_source")),
         status_updated_at=optional_str(row.get("status_updated_at")),
         meeting_id=int(row["meeting_id"]),
-        meeting_external_id=str(row["meeting_external_id"]),
+        meeting_ref=MeetingRef(
+            source_uuid=str(row["source_uuid"]),
+            external_id=str(row["meeting_external_id"]),
+        ),
         meeting_title=str(row["meeting_title"]),
         meeting_language=optional_str(row.get("meeting_language")),
         meeting_date=optional_str(row.get("meeting_date")),

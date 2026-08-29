@@ -1,3 +1,4 @@
+import secrets
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -13,7 +14,17 @@ from meetily_memory.db.migration_identity import (
     verified_migration_report,
 )
 
-CURRENT_SCHEMA_VERSION = 5
+LATEST_IN_PLACE_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
+INDEX_ALIAS_OWNER_STATE = "state"
+INDEX_ALIAS_OWNER_LEGACY = "legacy"
+INDEX_GENERATION_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS index_generation (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  generation_id TEXT NOT NULL UNIQUE,
+  alias_owner TEXT NOT NULL CHECK (alias_owner IN ('state', 'legacy'))
+);
+"""
 
 STRUCTURED_ENTITIES_SQL = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -146,7 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_topic_aliases_normalized
 ON topic_aliases(normalized_alias);
 """
 
-BASE_SCHEMA_SQL = """
+LEGACY_SOURCE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sources (
   id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL,
@@ -159,7 +170,26 @@ CREATE TABLE IF NOT EXISTS sources (
   updated_at TEXT NOT NULL,
   UNIQUE(kind, path)
 );
+"""
 
+CURRENT_SOURCE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS sources (
+  id INTEGER PRIMARY KEY,
+  source_uuid TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  path TEXT NOT NULL,
+  label TEXT,
+  external_app TEXT,
+  external_version TEXT,
+  last_seen_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(kind, path)
+);
+"""
+
+BASE_SCHEMA_SQL = f"""
+{LEGACY_SOURCE_SCHEMA_SQL}
 CREATE TABLE IF NOT EXISTS meetings (
   id INTEGER PRIMARY KEY,
   source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -270,6 +300,30 @@ CREATE INDEX IF NOT EXISTS idx_chunks_fingerprint ON chunks(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_people_normalized_name ON people(normalized_name);
 """
 
+CURRENT_STRUCTURED_ENTITIES_SQL = STRUCTURED_ENTITIES_SQL.replace(
+    "source_chunk_id INTEGER REFERENCES chunks(id) ON DELETE SET NULL",
+    "source_chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE",
+)
+CURRENT_KNOWLEDGE_SCHEMA_SQL = KNOWLEDGE_SCHEMA_SQL.replace(
+    """CREATE TABLE IF NOT EXISTS task_status_overrides (
+  action_item_id INTEGER PRIMARY KEY REFERENCES action_items(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  note TEXT,
+  source TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+""",
+    "",
+)
+CURRENT_INDEX_SCHEMA_SQL = (
+    BASE_SCHEMA_SQL.replace(LEGACY_SOURCE_SCHEMA_SQL, CURRENT_SOURCE_SCHEMA_SQL)
+    + CURRENT_STRUCTURED_ENTITIES_SQL
+    + CURRENT_KNOWLEDGE_SCHEMA_SQL
+    + INDEX_GENERATION_SCHEMA_SQL
+)
+
 
 def execute_sql_statements(conn: sqlite3.Connection, script: str) -> None:
     """Execute a static SQL script without sqlite3's implicit executescript commit."""
@@ -325,6 +379,94 @@ def _run_atomic_migration(
         _migration_checkpoint(f"v{target_version}:before_user_version")
         conn.execute(f"PRAGMA user_version = {target_version}")
         _migration_checkpoint(f"v{target_version}:after_user_version")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def ensure_index_generation_marker(
+    conn: sqlite3.Connection,
+    *,
+    alias_owner: str,
+    generation_id: str | None = None,
+) -> str:
+    if alias_owner not in {INDEX_ALIAS_OWNER_STATE, INDEX_ALIAS_OWNER_LEGACY}:
+        message = f"Unsupported index alias owner: {alias_owner}."
+        raise ValueError(message)
+    execute_sql_statements(conn, INDEX_GENERATION_SCHEMA_SQL)
+    rows = conn.execute(
+        "SELECT generation_id, alias_owner FROM index_generation ORDER BY singleton"
+    ).fetchall()
+    if len(rows) > 1:
+        message = "Index generation marker must contain at most one row."
+        raise RuntimeError(message)
+    if rows:
+        stored_generation_id = str(rows[0][0])
+        stored_owner = str(rows[0][1])
+        if not stored_generation_id or stored_owner not in {
+            INDEX_ALIAS_OWNER_STATE,
+            INDEX_ALIAS_OWNER_LEGACY,
+        }:
+            message = "Index generation marker is invalid."
+            raise RuntimeError(message)
+        if generation_id is not None and generation_id != stored_generation_id:
+            message = "Index generation marker conflicts with the requested generation ID."
+            raise RuntimeError(message)
+        return stored_generation_id
+    generation_id = generation_id or f"gen-{secrets.token_hex(16)}"
+    conn.execute(
+        """
+        INSERT INTO index_generation (singleton, generation_id, alias_owner)
+        VALUES (1, ?, ?)
+        """,
+        (generation_id, alias_owner),
+    )
+    return generation_id
+
+
+def read_index_generation_marker(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    table = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'index_generation'
+        """
+    ).fetchone()
+    if table is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT singleton, generation_id, alias_owner FROM index_generation"
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        message = "Index generation marker is not readable."
+        raise RuntimeError(message) from exc
+    if len(rows) != 1 or int(rows[0][0]) != 1:
+        message = "Index generation marker must contain exactly one row."
+        raise RuntimeError(message)
+    generation_id = str(rows[0][1])
+    alias_owner = str(rows[0][2])
+    if not generation_id or alias_owner not in {
+        INDEX_ALIAS_OWNER_STATE,
+        INDEX_ALIAS_OWNER_LEGACY,
+    }:
+        message = "Index generation marker is invalid."
+        raise RuntimeError(message)
+    return generation_id, alias_owner
+
+
+def initialize_current_schema(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        msg = "Index schema initialization requires a clean connection."
+        raise RuntimeError(msg)
+
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        execute_sql_statements(conn, CURRENT_INDEX_SCHEMA_SQL)
+        ensure_index_generation_marker(conn, alias_owner=INDEX_ALIAS_OWNER_STATE)
+        conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -467,8 +609,9 @@ def _require_durable_state_report(  # noqa: PLR0913
     except sqlite3.Error as exc:
         msg = "The persistent legacy migration report could not be read."
         raise RuntimeError(msg) from exc
+    # The marker pins the migration-report contract; later additive state schemas remain valid.
     if (
-        actual_version != state_schema_version
+        actual_version < state_schema_version
         or report is None
         or report.report_id != report_id
         or report.migrated != migrated

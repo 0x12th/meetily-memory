@@ -14,6 +14,7 @@ from meetily_memory.memory.keys import (
     topic_stable_key,
     without_added_aliases,
 )
+from meetily_memory.user_state import StoredTopic, UserStateRepository
 
 SearchMeetings = Callable[[str, int], list[dict[str, Any]]]
 ChunkRows = Callable[[sqlite3.Connection, int], list[sqlite3.Row]]
@@ -31,6 +32,7 @@ class KnowledgeContext:
     meeting_people_rows: PeopleRows
     structured_entity_rows: StructuredRows
     all_structured_entity_details: AllStructuredRows
+    user_state: UserStateRepository
     now: NowProvider
 
 
@@ -309,37 +311,131 @@ class KnowledgeRepository:
         aliases: Iterable[str] = (),
     ) -> dict[str, Any]:
         now = self.context.now()
+        topic = self.context.user_state.topic_for_query(title)
+        if topic is None:
+            with index_connection(self.context.index_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM knowledge_nodes
+                    WHERE type = 'Topic' AND stable_key = ?
+                    """,
+                    (topic_stable_key(title),),
+                ).fetchone()
+            topic = (
+                _stored_topic_from_row(row)
+                if row is not None
+                else StoredTopic(
+                    stable_key=topic_stable_key(title),
+                    title=title,
+                    normalized_title=normalize_key(title),
+                    created_at=now,
+                    updated_at=now,
+                    raw_metadata_json=None,
+                )
+            )
+        added_aliases = self.context.user_state.add_topic_aliases(
+            topic,
+            list(aliases),
+            now=now,
+        )
+        self.project_topic_aliases()
         with index_connection(self.context.index_path) as conn:
-            topic_id = self.resolve_topic_id(conn, title)
-            if topic_id is None:
-                topic_id = self.upsert_knowledge_node(
+            topic_row = conn.execute(
+                """
+                SELECT id
+                FROM knowledge_nodes
+                WHERE type = 'Topic' AND stable_key = ?
+                """,
+                (topic.stable_key,),
+            ).fetchone()
+            topic_id = (
+                int(topic_row["id"])
+                if topic_row is not None
+                else self.upsert_knowledge_node(
                     conn,
                     "Topic",
-                    topic_stable_key(title),
-                    title,
+                    topic.stable_key,
+                    topic.title,
                     now,
                 )
-            added_aliases: list[str] = []
-            for alias in aliases:
-                normalized_alias = normalize_key(alias)
-                if not normalized_alias:
-                    continue
-                cursor = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO topic_aliases (
-                      topic_node_id, alias, normalized_alias, created_at
-                    )
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (topic_id, alias, normalized_alias, now),
-                )
-                if cursor.rowcount:
-                    added_aliases.append(alias)
+            )
             self.link_topic_matches(conn, topic_id, now)
             conn.commit()
             payload = self.topic_payload(conn, topic_id)
-            payload["added_aliases"] = added_aliases
+            payload["added_aliases"] = list(added_aliases)
             return payload
+
+    def remove_topic_aliases(self, aliases: Iterable[str]) -> tuple[str, ...]:
+        removed = self.context.user_state.delete_topic_aliases(list(aliases))
+        self.project_topic_aliases()
+        return removed
+
+    def project_topic_aliases(self) -> None:
+        aliases = self.context.user_state.list_topic_aliases()
+        with index_connection(self.context.index_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for alias in aliases:
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_nodes (
+                      type, stable_key, title, normalized_title,
+                      created_at, updated_at, raw_metadata_json
+                    ) VALUES ('Topic', ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(type, stable_key) DO UPDATE SET
+                      title = excluded.title,
+                      normalized_title = excluded.normalized_title,
+                      created_at = excluded.created_at,
+                      updated_at = excluded.updated_at,
+                      raw_metadata_json = excluded.raw_metadata_json
+                    """,
+                    (
+                        alias.topic_stable_key,
+                        alias.topic_title,
+                        alias.topic_normalized_title,
+                        alias.topic_created_at,
+                        alias.topic_updated_at,
+                        alias.topic_raw_metadata_json,
+                    ),
+                )
+                topic = conn.execute(
+                    """
+                    SELECT id
+                    FROM knowledge_nodes
+                    WHERE type = 'Topic' AND stable_key = ?
+                    """,
+                    (alias.topic_stable_key,),
+                ).fetchone()
+                if topic is None:
+                    message = "State-owned topic could not be projected into the index."
+                    raise RuntimeError(message)
+                conn.execute(
+                    """
+                    INSERT INTO topic_aliases (
+                      topic_node_id, alias, normalized_alias, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(normalized_alias) DO UPDATE SET
+                      topic_node_id = excluded.topic_node_id,
+                      alias = excluded.alias,
+                      created_at = excluded.created_at
+                    """,
+                    (
+                        int(topic["id"]),
+                        alias.alias,
+                        alias.normalized_alias,
+                        alias.alias_created_at,
+                    ),
+                )
+            normalized_aliases = [alias.normalized_alias for alias in aliases]
+            if normalized_aliases:
+                placeholders = ",".join("?" for _ in normalized_aliases)
+                conn.execute(
+                    f"DELETE FROM topic_aliases WHERE normalized_alias NOT IN ({placeholders})",
+                    normalized_aliases,
+                )
+            else:
+                conn.execute("DELETE FROM topic_aliases")
+            conn.commit()
 
     def topic_memory(self, title: str, limit: int = 10) -> dict[str, Any]:
         topic = self.ensure_topic(title)
@@ -407,6 +503,18 @@ class KnowledgeRepository:
         }
 
     def resolve_topic_id(self, conn: sqlite3.Connection, title: str) -> int | None:
+        state_topic = self.context.user_state.topic_for_query(title)
+        if state_topic is not None:
+            state_row = conn.execute(
+                """
+                SELECT id
+                FROM knowledge_nodes
+                WHERE type = 'Topic' AND stable_key = ?
+                """,
+                (state_topic.stable_key,),
+            ).fetchone()
+            if state_row is not None:
+                return int(state_row["id"])
         normalized = normalize_key(title)
         alias_row = conn.execute(
             """
@@ -433,17 +541,12 @@ class KnowledgeRepository:
             "SELECT * FROM knowledge_nodes WHERE id = ?",
             (topic_id,),
         ).fetchone()
+        if topic is None:
+            message = f"Topic node not found: {topic_id}"
+            raise ValueError(message)
         aliases = [
-            str(row["alias"])
-            for row in conn.execute(
-                """
-                SELECT alias
-                FROM topic_aliases
-                WHERE topic_node_id = ?
-                ORDER BY alias
-                """,
-                (topic_id,),
-            ).fetchall()
+            alias.alias
+            for alias in self.context.user_state.list_topic_aliases(str(topic["stable_key"]))
         ]
         return {**dict(topic), "aliases": aliases}
 
@@ -597,6 +700,19 @@ class KnowledgeRepository:
             """
         rows = conn.execute(nodes_sql, tuple(node_ids)).fetchall()
         return rows_to_dicts(rows)
+
+
+def _stored_topic_from_row(row: sqlite3.Row) -> StoredTopic:
+    return StoredTopic(
+        stable_key=str(row["stable_key"]),
+        title=str(row["title"]),
+        normalized_title=str(row["normalized_title"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        raw_metadata_json=(
+            str(row["raw_metadata_json"]) if row["raw_metadata_json"] is not None else None
+        ),
+    )
 
 
 def optional_int(value: object) -> int | None:

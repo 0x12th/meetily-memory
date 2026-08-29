@@ -16,10 +16,24 @@ ENTITY_KIND_MAP: dict[str, MemoryEntityKind] = {
 }
 
 
+class AmbiguousMeetingError(LookupError):
+    pass
+
+
+@dataclass(frozen=True)
+class MeetingRef:
+    source_uuid: str
+    external_id: str
+
+    @property
+    def meeting_external_id(self) -> str:
+        return self.external_id
+
+
 @dataclass(frozen=True)
 class Meeting:
     id: int
-    external_id: str
+    ref: MeetingRef
     title: str
     started_at: str | None
     ended_at: str | None
@@ -29,10 +43,14 @@ class Meeting:
     summary_text: str | None = None
     chunk_count: int | None = None
 
+    @property
+    def external_id(self) -> str:
+        return self.ref.external_id
+
 
 @dataclass(frozen=True)
 class SourceExcerpt:
-    meeting_external_id: str
+    meeting_ref: MeetingRef
     chunk_external_id: str | None
     kind: str
     ordinal: int
@@ -41,6 +59,10 @@ class SourceExcerpt:
     starts_at_seconds: float | None
     ends_at_seconds: float | None
     timestamp_label: str | None
+
+    @property
+    def meeting_external_id(self) -> str:
+        return self.meeting_ref.external_id
 
 
 @dataclass(frozen=True)
@@ -151,7 +173,7 @@ class StructuredSignal:
     status_source: str | None
     status_updated_at: str | None
     meeting_id: int
-    meeting_external_id: str
+    meeting_ref: MeetingRef
     meeting_title: str
     meeting_language: str | None
     meeting_date: str | None
@@ -159,6 +181,10 @@ class StructuredSignal:
     chunk_kind: str
     chunk_speaker: str | None
     chunk_timestamp_label: str | None
+
+    @property
+    def meeting_external_id(self) -> str:
+        return self.meeting_ref.external_id
 
 
 @dataclass(frozen=True)

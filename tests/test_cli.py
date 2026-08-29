@@ -268,7 +268,7 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert "# Relevant meetings" in context.stdout
     assert "## Meeting: Dobrynya Follow-up" in context.stdout
     assert "Date: 2026-07-02T09:30:00Z" in context.stdout
-    assert "Source: meeting-2 / transcript-2" in context.stdout
+    assert "/meeting-2 / transcript-2" in context.stdout
     assert "### Relevant excerpt" in context.stdout
     assert "Dobrynya agreed to send migration risks by Friday." in context.stdout
     assert "Evidence role: neighboring context" in expanded_context.stdout
@@ -291,7 +291,17 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert "decisions:" in doctor.stdout
     assert "action items:" in doctor.stdout
 
-    opened = runner.invoke(app, ["--index", str(index_path), "open", "meeting-2", "--print-path"])
+    opened = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "open",
+            "--external-id",
+            "meeting-2",
+            "--print-path",
+        ],
+    )
     assert opened.exit_code == 0
     assert opened.stdout.strip() == str(tmp_path / "Dobrynya Follow-up")
 
@@ -405,7 +415,7 @@ def test_cli_topic_shows_structured_memory_with_source_evidence(
     assert topic.exit_code == 0
     assert "What we know: migration" in topic.stdout
     assert "Dobrynya Follow-up" in topic.stdout
-    assert "Source: meeting-2 / transcript-2" in topic.stdout
+    assert "/meeting-2 / transcript-2" in topic.stdout
     assert "Dobrynya agreed to send migration risks by Friday." in topic.stdout
 
 
@@ -654,7 +664,7 @@ def test_cli_refresh_skips_unproven_structured_analysis(meetily_db: Path, tmp_pa
     assert topic.exit_code == 0
     assert "Supporting excerpts" in topic.stdout
     assert "Dobrynya agreed to send migration risks by Friday." in topic.stdout
-    assert "Source: meeting-2 / transcript-2" in topic.stdout
+    assert "/meeting-2 / transcript-2" in topic.stdout
 
     refresh = runner.invoke(
         app,
@@ -715,7 +725,9 @@ def test_cli_update_reports_homebrew_failure(tmp_path: Path) -> None:
     assert "Homebrew was not found" in update.output
 
 
-def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
+def test_cli_db_status_reports_missing_schema_without_creating_databases(
+    tmp_path: Path,
+) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
 
@@ -723,9 +735,13 @@ def test_cli_db_status_reports_schema_version(tmp_path: Path) -> None:
 
     assert status.exit_code == 0
     assert f"index path: {index_path}" in status.stdout
-    assert f"schema version: {CURRENT_SCHEMA_VERSION}" in status.stdout
+    assert "schema version: missing" in status.stdout
     assert f"current schema version: {CURRENT_SCHEMA_VERSION}" in status.stdout
-    assert "orphaned tag assignments: 0" in status.stdout
+    assert "schema status: missing" in status.stdout
+    assert "orphaned tag assignments: unavailable" in status.stdout
+    assert "user-state database status is missing" in status.stdout
+    assert not index_path.exists()
+    assert not index_path.with_name("state.sqlite").exists()
 
 
 def test_cli_db_status_reports_orphaned_tag_assignments(tmp_path: Path) -> None:
@@ -739,7 +755,7 @@ def test_cli_db_status_reports_orphaned_tag_assignments(tmp_path: Path) -> None:
     TagRepository(repo.state_path).assign(
         source_uuid,
         ("missing-meeting",),
-        ("Сбер",),
+        ("Сбер", "Собес"),
         now="2",
     )
     runner = CliRunner()
@@ -751,8 +767,8 @@ def test_cli_db_status_reports_orphaned_tag_assignments(tmp_path: Path) -> None:
     )
 
     assert status.exit_code == 0
-    assert "orphaned tag assignments: 1" in status.stdout
-    assert json.loads(json_status.stdout)["orphaned_tag_assignments"] == 1
+    assert "orphaned tag assignments: 2" in status.stdout
+    assert json.loads(json_status.stdout)["orphaned_tag_assignments"] == 2
 
 
 def test_cli_mcp_serve_is_real_subcommand() -> None:
@@ -947,7 +963,7 @@ def test_cli_v5_topic_graph_alias_and_task_status_memory(meetily_db: Path, tmp_p
     assert "What we know: migration" in topic.stdout
     assert "Possible tasks" in topic.stdout
     assert "Dobrynya agreed to send migration risks by Friday." in topic.stdout
-    assert "Source: meeting-2 / transcript-2" in topic.stdout
+    assert "/meeting-2 / transcript-2" in topic.stdout
 
     alias = runner.invoke(
         app,

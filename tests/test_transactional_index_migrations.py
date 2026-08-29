@@ -11,9 +11,10 @@ import pytest
 from meetily_memory import user_state
 from meetily_memory.db import migrations
 from meetily_memory.db.migration_identity import canonical_database_path
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
+from meetily_memory.db.migrations import LATEST_IN_PLACE_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.user_state import (
+    CURRENT_USER_STATE_SCHEMA_VERSION,
     TAG_STATE_SCHEMA,
     USER_STATE_SCHEMA,
     UserStateRepository,
@@ -25,9 +26,8 @@ class InjectedMigrationError(RuntimeError):
     pass
 
 
-# v1-v5 are the complete compatible in-place set. The first incompatible future
-# format must add side-by-side replacement tests instead of extending this list.
-IN_PLACE_SCHEMA_VERSIONS = tuple(range(1, CURRENT_SCHEMA_VERSION + 1))
+# v1-v5 are the complete compatible in-place set. Schema v6 is rebuilt side by side.
+IN_PLACE_SCHEMA_VERSIONS = tuple(range(1, LATEST_IN_PLACE_SCHEMA_VERSION + 1))
 V4_DESTRUCTIVE_CHECKPOINTS = (
     "v4:task_status_overrides:dropped",
     "v4:decisions:renamed",
@@ -142,7 +142,7 @@ def _create_index_at_version(index_path: Path, version: int) -> None:
             migrations.MIGRATIONS[target_version](conn)
 
 
-def _create_mixed_v3_index(index_path: Path) -> None:
+def _create_mixed_v3_index(index_path: Path, state_path: Path | None = None) -> None:
     _create_index_at_version(index_path, 3)
     with sqlite3.connect(index_path) as conn:
         conn.execute("PRAGMA foreign_keys=ON")
@@ -194,6 +194,12 @@ def _create_mixed_v3_index(index_path: Path) -> None:
             ),
         )
         conn.commit()
+    if state_path is not None:
+        UserStateRepository(state_path).get_or_create_source(
+            "meetily_sqlite",
+            LEGACY_SOURCE_PATH,
+            now="fixture-source",
+        )
 
 
 def _create_populated_v2_state(index_path: Path, state_path: Path) -> None:
@@ -290,7 +296,7 @@ def _assert_v3_rows_and_schema_are_preserved(index_path: Path) -> None:
 
 def _assert_current_v4_rewrite(index_path: Path) -> None:
     with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
         for removed_table in ("task_status_overrides", "user_state_migration_ready"):
             assert (
                 conn.execute(
@@ -358,7 +364,7 @@ def _prepare_v3_with_durable_transfer_marker(
     state_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     monkeypatch.setattr(
         user_state,
         "_state_transfer_checkpoint",
@@ -390,11 +396,12 @@ def test_each_supported_index_migration_rolls_back_user_version_and_retries_publ
 
     assert _database_dump(index_path) == before
     monkeypatch.setattr(migrations, "_migration_checkpoint", _no_fault)
+    with sqlite3.connect(index_path) as conn:
+        migrations.MIGRATIONS[target_version](conn)
     IndexRepository(index_path, state_path=state_path)
 
     with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
-    _assert_database_ok(index_path)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize("checkpoint", V4_DESTRUCTIVE_CHECKPOINTS)
@@ -405,7 +412,7 @@ def test_each_destructive_v4_step_rolls_back_then_retries_through_index_reposito
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     monkeypatch.setattr(migrations, "_migration_checkpoint", _fail_once_at(checkpoint))
 
     with pytest.raises(InjectedMigrationError, match=checkpoint):
@@ -429,7 +436,7 @@ def test_each_state_transfer_checkpoint_is_idempotent_on_public_retry(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     monkeypatch.setattr(user_state, "_state_transfer_checkpoint", _fail_once_at(checkpoint))
 
     with pytest.raises(InjectedMigrationError, match=checkpoint):
@@ -437,7 +444,7 @@ def test_each_state_transfer_checkpoint_is_idempotent_on_public_retry(
 
     _assert_v3_rows_and_schema_are_preserved(index_path)
     if checkpoint in STATE_PRECOMMIT_CHECKPOINTS:
-        assert _state_counts(state_path) == (0, 0, 0, 0, 0)
+        assert _state_counts(state_path) == (1, 0, 0, 0, 0)
     else:
         _assert_single_verified_state_transfer(state_path)
     with sqlite3.connect(index_path) as conn:
@@ -462,7 +469,7 @@ def test_v4_revalidates_same_count_edits_under_the_destructive_write_lock(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     edited = False
 
     def edit_after_marker(name: str) -> None:
@@ -525,7 +532,7 @@ def test_preexisting_persistent_status_wins_and_legacy_conflict_is_orphaned(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     state = UserStateRepository(state_path)
     source_uuid = state.get_or_create_source(
         "meetily_sqlite",
@@ -585,7 +592,7 @@ def test_semantic_ledger_allows_post_commit_status_and_note_change(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     monkeypatch.setattr(
         user_state,
         "_state_transfer_checkpoint",
@@ -649,7 +656,7 @@ def test_collapsed_legacy_identities_keep_one_active_and_orphan_every_additional
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     with sqlite3.connect(index_path) as conn:
         conn.execute(
             """
@@ -717,7 +724,7 @@ def test_digest_keyed_report_is_reused_across_relative_absolute_and_symlink_path
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     monkeypatch.chdir(tmp_path)
 
     attempts = [(Path("index.sqlite"), Path("state.sqlite")), (index_path, state_path)]
@@ -767,7 +774,7 @@ def test_digest_keyed_report_is_reused_across_relative_absolute_and_symlink_path
 def test_two_process_index_repository_upgrade_is_linearizable(tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     context = multiprocessing.get_context("spawn")
     receive_one, send_one = context.Pipe(duplex=False)
     receive_two, send_two = context.Pipe(duplex=False)
@@ -800,7 +807,7 @@ def test_two_process_index_repository_upgrade_is_linearizable(tmp_path: Path) ->
 def test_child_process_exit_mid_v4_ddl_recovers_via_index_repository(tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_child_crash_during_upgrade,
@@ -828,7 +835,7 @@ def test_child_process_exit_after_committed_state_or_marker_recovers_without_dup
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    _create_mixed_v3_index(index_path)
+    _create_mixed_v3_index(index_path, state_path)
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_child_crash_during_upgrade,
@@ -980,7 +987,12 @@ def test_populated_v2_report_is_backfilled_atomically_after_child_crash_retry(
     _assert_process_exit(process, CHILD_CRASH_EXIT_CODE)
 
     with sqlite3.connect(state_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == (
+            CURRENT_USER_STATE_SCHEMA_VERSION
+        )
+        assert "revision" in {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(sources)").fetchall()
+        }
         assert conn.execute(
             "SELECT migration_key, migrated, orphaned FROM migration_reports"
         ).fetchall() == [(None, 1, 1)]

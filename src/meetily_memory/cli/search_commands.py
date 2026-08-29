@@ -18,7 +18,7 @@ from meetily_memory.cli.common import (
 from meetily_memory.cli.renderers import print_topic_memory
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, ContextRenderer
 from meetily_memory.db.repository import IndexRepository
-from meetily_memory.domain import MeetingSearchFilters
+from meetily_memory.domain import AmbiguousMeetingError, MeetingRef, MeetingSearchFilters
 from meetily_memory.serializers import (
     meeting_search_result_payload,
     topic_alias_payload,
@@ -121,7 +121,7 @@ def print_search_results(results: list[dict[str, object]]) -> None:
 
 
 def print_search_meeting_header(result: dict[str, object]) -> None:
-    meeting_id = result["meeting_id"]
+    meeting_id = result["meeting_local_id"]
     meeting = cast("dict[str, object]", result["meeting"])
     date = compact_date(meeting.get("updated_at") or meeting.get("created_at"))
     suffix = f" ({date})" if date else ""
@@ -193,23 +193,54 @@ app.command("topic", hidden=True)(topic_memory)
 @app.command("open")
 def open_command(
     ctx: typer.Context,
-    meeting_id: str,
+    meeting_id: Annotated[
+        int | None,
+        typer.Argument(help="Generation-local integer meeting ID."),
+    ] = None,
     source: Annotated[bool, typer.Option("--source", help="Open the indexed source path.")] = False,
     print_path: Annotated[
         bool,
         typer.Option("--print-path", help="Print the selected path without opening it."),
     ] = False,
+    source_uuid: Annotated[
+        str | None,
+        typer.Option("--source-uuid", help="Stable source UUID for --external-id."),
+    ] = None,
+    external_id: Annotated[
+        str | None,
+        typer.Option("--external-id", help="Stable or unique bare external meeting ID."),
+    ] = None,
 ) -> None:
     """Open the original meeting folder."""
     repo = IndexRepository(ctx.obj["index_path"])
-    meeting = repo.get_meeting(meeting_id)
+    if meeting_id is not None and (source_uuid is not None or external_id is not None):
+        message = "Use either a local meeting ID or --external-id/--source-uuid."
+        raise typer.BadParameter(message)
+    if source_uuid is not None and external_id is None:
+        message = "--source-uuid requires --external-id."
+        raise typer.BadParameter(message)
+    if meeting_id is not None:
+        meeting = repo.get_meeting_by_local_id(meeting_id)
+        display_id = str(meeting_id)
+    elif external_id is not None and source_uuid is not None:
+        meeting = repo.get_meeting_by_ref(MeetingRef(source_uuid, external_id))
+        display_id = f"{source_uuid}/{external_id}"
+    elif external_id is not None:
+        try:
+            meeting = repo.get_meeting(external_id)
+        except AmbiguousMeetingError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        display_id = external_id
+    else:
+        message = "Provide a local meeting ID or --external-id."
+        raise typer.BadParameter(message)
     if not meeting:
-        message = f"Meeting not found: {meeting_id}"
+        message = f"Meeting not found: {display_id}"
         raise typer.BadParameter(message)
     path = meeting.get("source_path") if source else meeting.get("folder_path")
     path = path or meeting.get("folder_path") or meeting.get("source_path")
     if not path:
-        message = f"Meeting has no path: {meeting_id}"
+        message = f"Meeting has no path: {display_id}"
         raise typer.BadParameter(message)
     if print_path:
         print_text_block(str(path))

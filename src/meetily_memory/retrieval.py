@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from meetily_memory.domain import (
+    MeetingRef,
     MeetingSearchFilters,
     MeetingSearchResult,
     RetrievalSource,
@@ -19,7 +20,7 @@ if TYPE_CHECKING:
 RRF_K = 60
 HYBRID_CANDIDATE_MULTIPLIER = 4
 MAX_EVIDENCE_PER_SOURCE = 2
-MeetingKey = tuple[int, str]
+MeetingKey = tuple[int, MeetingRef]
 
 
 class RetrievalStrategy(Protocol):
@@ -120,7 +121,7 @@ class LexicalTagMeetingRetrievalStrategy:
         ordered_keys = tuple(dict.fromkeys((*exact_tag_order, *fts_ranks, *token_tag_order)))
         results: list[MeetingSearchResult] = []
         for key in ordered_keys[:limit]:
-            meeting_row = self.repository.get_meeting(str(key[0]), filters=filters)
+            meeting_row = self.repository.get_meeting_by_local_id(key[0], filters=filters)
             if meeting_row is None:
                 continue
             meeting_id = key[0]
@@ -151,11 +152,15 @@ class LexicalTagMeetingRetrievalStrategy:
 @dataclass(frozen=True)
 class RetrievalCandidateTrace:
     meeting_id: int
-    meeting_external_id: str
+    meeting_ref: MeetingRef
     fts_rank: int | None
     semantic_rank: int | None
     tag_rank: int | None
     fused_score: float
+
+    @property
+    def meeting_external_id(self) -> str:
+        return self.meeting_ref.external_id
 
 
 @dataclass(frozen=True)
@@ -223,7 +228,7 @@ class HybridRetrievalStrategy:
                 (
                     RetrievalCandidateTrace(
                         meeting_id=key[0],
-                        meeting_external_id=key[1],
+                        meeting_ref=key[1],
                         fts_rank=fts_ranks.get(key),
                         semantic_rank=semantic_ranks.get(key),
                         tag_rank=tag_ranks.get(key),
@@ -244,8 +249,11 @@ class HybridRetrievalStrategy:
         selected = traces[:limit]
         results: list[MeetingSearchResult] = []
         for trace in selected:
-            key = (trace.meeting_id, trace.meeting_external_id)
-            meeting_row = self.repository.get_meeting(str(trace.meeting_id), filters=filters)
+            key = (trace.meeting_id, trace.meeting_ref)
+            meeting_row = self.repository.get_meeting_by_local_id(
+                trace.meeting_id,
+                filters=filters,
+            )
             if meeting_row is None:
                 continue
             meeting_id = trace.meeting_id
@@ -362,14 +370,13 @@ def tag_candidates(
     token_order: list[MeetingKey] = []
     names: dict[MeetingKey, list[str]] = {}
     for match in tags.search(query):
-        meeting = repository.get_meeting_by_identity(
-            match.source_uuid,
-            match.meeting_external_id,
+        meeting = repository.get_meeting_by_ref(
+            match.meeting_ref,
             filters=filters,
         )
         if meeting is None:
             continue
-        key = (int(meeting["id"]), match.meeting_external_id)
+        key = (int(meeting["id"]), match.meeting_ref)
         order = exact_order if match.kind == "exact" else token_order
         if key not in order:
             order.append(key)
@@ -389,7 +396,7 @@ def collapse_hits_by_meeting(
     ranks: dict[MeetingKey, int] = {}
     evidence: dict[MeetingKey, list[SearchHit]] = {}
     for hit in hits:
-        key = (hit.meeting.id, hit.meeting.external_id)
+        key = (hit.meeting.id, hit.meeting.ref)
         if key not in ranks:
             ranks[key] = len(ranks) + 1
         values = evidence.setdefault(key, [])

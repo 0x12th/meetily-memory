@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from meetily_memory.integrations import MANAGED_MARKER, sync_obsidian_vault
+from meetily_memory.integrations import (
+    MANAGED_MARKER,
+    render_obsidian_meeting_note,
+    sync_obsidian_vault,
+)
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 
 
@@ -24,8 +28,30 @@ def test_obsidian_sync_creates_managed_note_network(meetily_db: Path, tmp_path: 
     task_text = task_notes[0].read_text(encoding="utf-8")
     assert MANAGED_MARKER in task_text
     assert "[[Dobrynya Follow-up]]" in task_text
-    assert "Source: meeting-2 /" in task_text
+    assert "/meeting-2 /" in task_text
     assert "Confidence:" not in task_text
+
+
+def test_obsidian_duplicate_title_commands_keep_each_stable_meeting_ref() -> None:
+    first = render_obsidian_meeting_note(
+        {
+            "local_id": 41,
+            "ref": {"source_uuid": "source-a", "external_id": "meeting-a"},
+            "title": "Duplicate title",
+        }
+    )
+    second = render_obsidian_meeting_note(
+        {
+            "local_id": 99,
+            "ref": {"source_uuid": "source-b", "external_id": "meeting-b"},
+            "title": "Duplicate title",
+        }
+    )
+
+    assert "`mm open --source-uuid source-a --external-id meeting-a`" in first
+    assert "`mm open --source-uuid source-b --external-id meeting-b`" in second
+    assert "mm open 41" not in first
+    assert "mm open 99" not in second
 
 
 def test_obsidian_sync_does_not_overwrite_unmanaged_notes(meetily_db: Path, tmp_path: Path) -> None:

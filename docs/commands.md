@@ -18,7 +18,48 @@ available for compatibility and experiments.
 | `mm tag remove 10 11 migration` | Removes a tag assignment from one or more meetings. |
 | `mm config language ru` | Stores the stable CLI UI language. Supported values are `en`, `ru`, and `auto`. |
 | `mm config source NEW_PATH` | Selects a validated Meetily DB as a new source identity. |
-| `mm config source NEW_PATH --rebind` | Explicitly moves the selected source identity after matching its Meetily schema and meeting IDs. |
+| `mm config source NEW_PATH --rebind [--source-uuid UUID]` | Explicitly asserts that a state-owned source UUID moved to a validated target, canonicalizes state/index paths, and preserves the UUID even when meeting-ID overlap is zero. Pass `--source-uuid` to repair a non-selected secondary source; targets owned by another UUID are rejected. |
+
+Ordinary `mm config source NEW_PATH` validates and selects only `NEW_PATH`; it does not migrate or
+resolve the previous settings binding, so an unrelated legacy alias cannot block creation of a new
+source identity. A legacy settings-only `source_path` is migrated to UUID only on an exact raw
+`state.current_path` match, or on an exact raw pending `state.projected_path` match whose
+`current_path` remains authoritative. It never creates an identity by itself. A
+populated v1-v5 index without that state binding stops before index migration and instructs the user
+to register the source explicitly with `mm config source PATH` or repair an existing UUID with
+`--rebind --source-uuid`.
+
+Without `--source-uuid`, rebind uses the selected UUID. For legacy settings that contain only
+`source_path`, it may recover the UUID only from an exact raw `state.current_path` match or the
+exact old `projected_path` of a pending claim; it never re-resolves that stored path as identity
+evidence. A pending match immediately selects its authoritative `current_path`. If no unique exact identity is available, the
+command stops and asks for `--source-uuid UUID`. Before constructing a mutable repository, rebind
+resolves its identity read-only from the explicit UUID, the selected settings UUID, or that exact raw
+legacy path match. Missing state, no selection, or no exact match fails without state/index creation
+or migration. UUID/kind and target ownership are then checked in state. A successful rebind makes the repaired UUID the
+selected source in settings. Refresh/rebuild, ordinary source selection, and rebind share one
+interprocess `refresh.lock`. Unknown UUIDs and targets owned by another UUID are rejected from state
+before the index is opened. A valid rebind first completes any legacy v3 task-state transfer and the
+safe in-place upgrade through v5, then claims path ownership with a monotonic pending revision.
+State retains the last confirmed projected path until the v5/v6 projection succeeds, settings are
+written, and that exact revision is finalized. A failed step first persists a fresh reverse pending
+claim (`current_path=old`, `projected_path=actual new`), then rolls back the index under that token,
+and only then clears pending state. Settings are never restored by comparing UUID/path values alone,
+so an older failure cannot undo a newer same-target selection; an incomplete rollback reports an
+explicit recovery error. After process death at any point around the forward or reverse
+claim/projection, a refresh or repeated same-target `--rebind` uses the persisted paths to repair
+legacy or v6 index paths before clearing pending metadata. A current v6 open checks every pending source,
+including secondary sources, and finalizes all verified claims in one state transaction.
+
+Read-only local diagnostics pin the physical `index.sqlite` and `state.sqlite` targets as one pair at
+the start of each snapshot. A shared logical parent is resolved once, then both child/file targets
+are repeatedly resolved as `index,state,index,state` until the pair is stable; other layouts use the
+same bounded pair-stability rule. Schema, migration-report, tag, and meeting-ref reads reuse those targets and
+immutable read-only connections. Every read is guarded independently against active
+`-wal`/`-journal` sidecars; a sidecar that appears after initial schema inspection makes the affected
+database and cross-database details explicitly unavailable instead of returning stale data.
+Retargeting a logical directory or child file symlink cannot mix databases within a report. Orphaned
+tag assignments are unavailable unless both index and user-state schemas are current and readable.
 
 ## Search And Context
 
@@ -41,13 +82,19 @@ combined; `--to` can be used by itself or as an upper bound.
 | `mm s "migration risk" --context 2` | Expands each hit with neighboring chunks before and after the match. Use this when the matching snippet is too short. |
 | `mm open 12` | Opens the meeting folder so the original Meetily record can be inspected. |
 | `mm open 12 --source` | Opens the indexed source file/path. |
-| `mm open 12 --print-path` | Prints the default meeting folder path without opening it. |
+| `mm open 12 --print-path` | Prints the default meeting folder path using a generation-local integer shortcut. |
+| `mm open --source-uuid UUID --external-id ID` | Opens a meeting by its stable source-aware reference; digit-only external IDs are supported. |
+| `mm open --external-id ID` | Convenience lookup for an external ID only when exactly one source matches. |
 | `mm c "what did we decide about migration?"` | Builds paste-ready Markdown context with sources for ChatGPT, Claude, Codex, or another LLM. Use when you want to copy context elsewhere. |
 | `mm c "what did we decide?" --context 2` | Explicitly adds two neighboring chunks around each lexical match. |
 | `mm t "migration"` | Experimental source-backed topic dossier. It starts from search evidence, labels heuristic matches as possible decisions/tasks/risks/questions, and still shows evidence when structured memory is empty. It is not an LLM answer. |
 
-`mm t` expands stored topic aliases. Add aliases explicitly with repeated
-`--alias` options, for example:
+`mm t` expands stored topic aliases. Manual aliases are authoritative in `state.sqlite`; the index
+table is only a derived retrieval projection, so aliases survive full index deletion and rebuild.
+Legacy v5 and old unmarked v6 aliases are imported once under a locked, digest-checked snapshot.
+Every current v6 generation has a stable generation marker; fresh and rebuilt generations are
+registered as state-owned before projection and never import their derived aliases back. Add aliases
+explicitly with repeated `--alias` options, for example:
 
 ```bash
 mm t "kafka" --alias "кафка" --alias "broker"
@@ -100,6 +147,10 @@ Managed notes use:
 <!-- meetily-memory:managed -->
 ```
 
+A generated meeting note persists its open command with the stable meeting reference:
+`mm open --source-uuid UUID --external-id ID`. Obsidian output never persists a generation-local
+integer meeting ID in that command.
+
 ## Automatic Refreshes
 
 | Command | Public role |
@@ -121,5 +172,5 @@ There should be no separate public watch command.
 | Command | Role |
 |---|---|
 | `mm scan` | Low-level Meetily DB indexing for debugging and tests. Ordinary users use `mm refresh`. |
-| `mm db status` | Shows schema version and local index internals. |
+| `mm db status` | Read-only inspection of missing, legacy, current, or incompatible index/state schemas, migration status, and orphaned tag assignments. It never creates or upgrades a database. |
 | `mm mcp serve` | Experimental stdio-only MCP adapter with meeting search and lookup. It is optional for pip/uv installs via `meetily-memory[mcp]`. |

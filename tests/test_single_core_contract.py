@@ -9,7 +9,7 @@ from meetily_memory.core import (
     MeetilyMemoryCore,
     MeetingNotFoundError,
 )
-from meetily_memory.domain import ContextBundle, Meeting, SearchResults
+from meetily_memory.domain import ContextBundle, Meeting, MeetingRef, SearchResults
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 
 
@@ -76,7 +76,7 @@ def test_optional_and_required_lookups_have_specific_semantics(
     assert isinstance(meeting, Meeting)
     assert core.get_meeting("missing") is None
     with pytest.raises(MeetingNotFoundError, match="Meeting not found"):
-        core.build_meeting_context("migration", "missing")
+        core.build_meeting_context("migration", MeetingRef("missing-source", "missing"))
     with pytest.raises(EvidenceNotFoundError, match="Evidence not found"):
         core.resolve_search_hit("evidence:missing")
 

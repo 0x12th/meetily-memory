@@ -181,11 +181,10 @@ def test_orphaned_tag_assignments_are_preserved_but_excluded_from_active_tags(
     state_path = tmp_path / "state.sqlite"
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     service = service_class(IndexRepository(index_path, state_path=state_path))
-    identity = service.index_repository.meeting_source_identity("1")
+    identity = service.index_repository.meeting_ref_for_local_id(1)
     assert identity is not None
-    source_uuid = identity["source_uuid"]
     service.repository.assign(
-        str(source_uuid),
+        identity.source_uuid,
         ("missing-meeting",),
         ("Сбер",),
         now="2",

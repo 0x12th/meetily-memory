@@ -8,6 +8,7 @@ from pydantic import Field
 from meetily_memory.cli.search_commands import parse_search_filters
 from meetily_memory.config.paths import default_index_path
 from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.domain import MeetingRef
 from meetily_memory.serializers import (
     envelope,
     meeting_payload,
@@ -51,9 +52,9 @@ def create_mcp_server(index_path: Path | None = None) -> FastMCP:
         )
 
     @server.tool()
-    def get_meeting(meeting_id: str) -> dict[str, object]:
-        """Get an indexed meeting by internal or external id."""
-        meeting = core.get_meeting(meeting_id)
+    def get_meeting(source_uuid: str, external_id: str) -> dict[str, object]:
+        """Get an indexed meeting by its stable source-aware reference."""
+        meeting = core.get_meeting_by_ref(MeetingRef(source_uuid, external_id))
         return envelope(
             "meeting",
             {"meeting": meeting_payload(meeting) if meeting is not None else None},

@@ -91,10 +91,16 @@ def parse_tag_arguments(values: list[str]) -> tuple[tuple[str, ...], tuple[str, 
     tag_arguments: list[str] = []
     tags_started = False
     for value in values:
-        if not tags_started and value.isdigit():
-            meeting_ids.append(value)
-            continue
-        tags_started = True
+        if not tags_started:
+            try:
+                local_meeting_id = int(value)
+            except ValueError:
+                tags_started = True
+            else:
+                if local_meeting_id > 0:
+                    meeting_ids.append(value)
+                    continue
+                tags_started = True
         tag_arguments.append(value)
     if not meeting_ids:
         message = "No meeting IDs provided."

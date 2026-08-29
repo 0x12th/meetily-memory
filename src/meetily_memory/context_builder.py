@@ -1,7 +1,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from meetily_memory.domain import ContextBundle, SearchHit
+from meetily_memory.domain import ContextBundle, MeetingRef, SearchHit
 from meetily_memory.repositories.index import IndexRepository
 
 DEFAULT_CONTEXT_LIMIT = 8
@@ -11,7 +11,7 @@ MAX_CONTEXT_EVIDENCE = 20
 
 @dataclass
 class ContextMeeting:
-    external_id: str
+    ref: MeetingRef
     title: str
     date: str
     best_rank: float
@@ -80,7 +80,8 @@ def render_context_markdown(question: str, meetings: Sequence[ContextMeeting]) -
                 f"## Meeting: {meeting.title}",
                 "",
                 f"Date: {meeting.date}",
-                f"Meeting ID: {meeting.external_id}",
+                f"Meeting ID: {meeting.ref.external_id}",
+                f"Source UUID: {meeting.ref.source_uuid}",
                 "",
                 "### Relevant excerpt",
             ]
@@ -92,25 +93,28 @@ def render_context_markdown(question: str, meetings: Sequence[ContextMeeting]) -
 
 
 def group_hits_by_meeting(hits: Sequence[SearchHit]) -> list[ContextMeeting]:
-    meetings_by_id: dict[str, ContextMeeting] = {}
+    meetings_by_id: dict[int, ContextMeeting] = {}
     for rank, hit in enumerate(hits):
-        meeting = meetings_by_id.get(hit.meeting.external_id)
+        meeting = meetings_by_id.get(hit.meeting.id)
         if meeting is None:
             meeting = ContextMeeting(
-                external_id=hit.meeting.external_id,
+                ref=hit.meeting.ref,
                 title=hit.meeting.title,
                 date=hit.meeting.updated_at or hit.meeting.created_at or "unknown",
                 best_rank=float(rank),
                 excerpts=[],
             )
-            meetings_by_id[hit.meeting.external_id] = meeting
+            meetings_by_id[hit.meeting.id] = meeting
         meeting.excerpts.append(search_hit_as_context_row(hit))
     return list(meetings_by_id.values())
 
 
 def search_hit_as_context_row(hit: SearchHit) -> dict[str, object]:
     return {
+        "meeting_id": hit.meeting.id,
+        "meeting_ref": hit.meeting.ref,
         "meeting_external_id": hit.meeting.external_id,
+        "source_uuid": hit.meeting.ref.source_uuid,
         "chunk_external_id": hit.excerpt.chunk_external_id,
         "text": hit.excerpt.text,
         "speaker": hit.excerpt.speaker,
@@ -132,7 +136,10 @@ def group_results_by_meeting(
         meeting = meetings_by_id.get(meeting_id)
         if meeting is None:
             meeting = ContextMeeting(
-                external_id=str(row["meeting_external_id"]),
+                ref=MeetingRef(
+                    source_uuid=str(row["source_uuid"]),
+                    external_id=str(row["meeting_external_id"]),
+                ),
                 title=str(row["title"]),
                 date=str(row.get("updated_at") or row.get("created_at") or "unknown"),
                 best_rank=rank_sort_value(row.get("rank")),
@@ -164,7 +171,13 @@ def format_excerpt(row: Mapping[str, object]) -> str:
 
 
 def format_source(row: Mapping[str, object]) -> str:
-    meeting_id = row.get("meeting_external_id") or row.get("meeting_id") or "unknown-meeting"
+    ref = row.get("meeting_ref")
+    if isinstance(ref, MeetingRef):
+        meeting_id = f"{ref.source_uuid}/{ref.external_id}"
+    else:
+        external_id = row.get("meeting_external_id") or row.get("meeting_id") or "unknown-meeting"
+        source_uuid = row.get("source_uuid")
+        meeting_id = f"{source_uuid}/{external_id}" if source_uuid else str(external_id)
     chunk_id = row.get("chunk_external_id") or row.get("chunk_id") or "unknown-chunk"
     return f"Source: {meeting_id} / {chunk_id}"
 

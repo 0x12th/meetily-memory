@@ -20,6 +20,10 @@ def default_state_path() -> Path:
     return default_data_dir() / "state.sqlite"
 
 
+def canonical_source_path(path: Path) -> Path:
+    return Path(path).expanduser().resolve(strict=True)
+
+
 def semantic_config_path() -> Path:
     return default_data_dir() / "config.json"
 

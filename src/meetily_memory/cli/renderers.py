@@ -89,8 +89,15 @@ def topic_labels(language: str) -> dict[str, str]:
 
 
 def entity_source(row: dict[str, object]) -> str:
+    meeting_ref = row.get("meeting_ref")
+    if isinstance(meeting_ref, dict):
+        source_uuid = str(meeting_ref.get("source_uuid") or "")
+        external_id = str(meeting_ref.get("external_id") or "")
+        meeting_source = "/".join(part for part in (source_uuid, external_id) if part)
+    else:
+        meeting_source = str(row.get("meeting_external_id") or row.get("meeting_local_id") or "")
     source_parts = [
-        str(row.get("meeting_external_id") or row.get("meeting_id") or ""),
+        meeting_source,
         str(row.get("chunk_external_id") or row.get("source_chunk_id") or ""),
     ]
     source = " / ".join(part for part in source_parts if part)
@@ -105,7 +112,7 @@ def print_search_meeting_summaries(rows: list[dict[str, object]]) -> None:
         return
     seen: set[int] = set()
     for row in rows:
-        meeting_id = int(cast("int | str", row["meeting_id"]))
+        meeting_id = int(cast("int | str", row["meeting_local_id"]))
         if meeting_id in seen:
             continue
         seen.add(meeting_id)
@@ -128,7 +135,14 @@ def print_topic_summary(
 ) -> None:
     labels = topic_labels(str(memory.get("ui_language") or "en"))
     query_terms = cast("list[str]", memory.get("query_terms", []))
-    meeting_ids = {row.get("meeting_id") for row in evidence}
+    meeting_ids = {
+        (
+            cast("dict[str, object]", row.get("meeting_ref")).get("source_uuid"),
+            cast("dict[str, object]", row.get("meeting_ref")).get("external_id"),
+        )
+        for row in evidence
+        if isinstance(row.get("meeting_ref"), dict)
+    }
     if not evidence:
         print_text_block(labels["no_topic"])
         return
@@ -260,5 +274,5 @@ def print_evidence_bullets(
         prefix = f"{' | '.join(prefix_parts)}: " if prefix_parts else ""
         print_text_block(
             f"- {prefix}{row['text']} | Source: {entity_source(row)} "
-            f"| open: mm open {row['meeting_id']}"
+            f"| open: mm open {row['meeting_local_id']}"
         )

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from meetily_memory.domain import MeetingRef
 from meetily_memory.user_state import ensure_user_state_schema
 
 if TYPE_CHECKING:
@@ -39,21 +40,22 @@ class TagMutationResult:
 
 @dataclass(frozen=True)
 class TagMatch:
-    source_uuid: str
-    meeting_external_id: str
+    meeting_ref: MeetingRef
     tag: Tag
     kind: str
 
+    @property
+    def source_uuid(self) -> str:
+        return self.meeting_ref.source_uuid
 
-@dataclass(frozen=True)
-class MeetingTagIdentity:
-    source_uuid: str
-    meeting_external_id: str
+    @property
+    def meeting_external_id(self) -> str:
+        return self.meeting_ref.external_id
 
 
 @dataclass(frozen=True)
 class TagAssignment:
-    identity: MeetingTagIdentity
+    identity: MeetingRef
     tag: Tag
 
 
@@ -87,14 +89,14 @@ class TagRepository:
         now: str,
     ) -> TagMutationResult:
         identities = tuple(
-            MeetingTagIdentity(source_uuid, meeting_external_id)
+            MeetingRef(source_uuid, meeting_external_id)
             for meeting_external_id in meeting_external_ids
         )
         return self.assign_many(identities, tag_names, now=now)
 
     def assign_many(
         self,
-        identities: tuple[MeetingTagIdentity, ...],
+        identities: tuple[MeetingRef, ...],
         tag_names: tuple[str, ...],
         *,
         now: str,
@@ -160,14 +162,14 @@ class TagRepository:
         tag_names: tuple[str, ...],
     ) -> TagMutationResult:
         identities = tuple(
-            MeetingTagIdentity(source_uuid, meeting_external_id)
+            MeetingRef(source_uuid, meeting_external_id)
             for meeting_external_id in meeting_external_ids
         )
         return self.remove_many(identities, tag_names)
 
     def remove_many(
         self,
-        identities: tuple[MeetingTagIdentity, ...],
+        identities: tuple[MeetingRef, ...],
         tag_names: tuple[str, ...],
     ) -> TagMutationResult:
         tags = normalize_tags(tag_names)
@@ -274,8 +276,10 @@ class TagRepository:
                 continue
             matches.append(
                 TagMatch(
-                    source_uuid=str(row["source_uuid"]),
-                    meeting_external_id=str(row["meeting_external_id"]),
+                    meeting_ref=MeetingRef(
+                        source_uuid=str(row["source_uuid"]),
+                        external_id=str(row["meeting_external_id"]),
+                    ),
                     tag=Tag(normalized_name, str(row["display_name"])),
                     kind=kind,
                 )
@@ -303,9 +307,9 @@ class TagRepository:
             ).fetchall()
         return tuple(
             TagAssignment(
-                identity=MeetingTagIdentity(
+                identity=MeetingRef(
                     source_uuid=str(row["source_uuid"]),
-                    meeting_external_id=str(row["meeting_external_id"]),
+                    external_id=str(row["meeting_external_id"]),
                 ),
                 tag=Tag(
                     normalized_name=str(row["normalized_name"]),
@@ -399,7 +403,7 @@ class TagService:
         embedding_provider: EmbeddingProvider | None = None,
     ) -> tuple[TagSuggestion, ...]:
         identity = self._resolve_meetings((meeting_id,))[0]
-        meeting = self.index_repository.get_meeting(meeting_id)
+        meeting = self.index_repository.get_meeting_by_ref(identity)
         if meeting is None:
             message = f"Meeting not found: {meeting_id}"
             raise ValueError(message)
@@ -416,7 +420,7 @@ class TagService:
             if item.normalized_name not in assigned
         )
         title = str(meeting["title"])
-        text = self.index_repository.meeting_transcript_text(meeting_id)
+        text = self.index_repository.meeting_transcript_text(identity)
         suggestions: list[TagSuggestion] = []
         self._append_text_suggestions(
             suggestions,
@@ -462,7 +466,7 @@ class TagService:
     def _append_semantic_suggestions(
         self,
         suggestions: list[TagSuggestion],
-        identity: MeetingTagIdentity,
+        identity: MeetingRef,
         document: str,
         provider: EmbeddingProvider,
     ) -> tuple[TagSuggestion, ...]:
@@ -506,21 +510,26 @@ class TagService:
 
     def _semantic_suggestion_source(
         self,
-        identity: MeetingTagIdentity,
+        identity: MeetingRef,
         document: str,
         provider: EmbeddingProvider,
     ) -> tuple[int, tuple[Tag, ...]] | None:
-        target_key = (identity.source_uuid, identity.meeting_external_id)
+        target_ref = identity
         try:
             batches = self._semantic_candidate_batches(document, provider)
             for rows in batches:
                 for row in rows:
                     hit = self.index_repository.search_hit_from_row(row)
-                    key = self.index_repository.source_identity_for_meeting(hit.meeting.id)
-                    if key == target_key:
+                    candidate_ref = self.index_repository.source_identity_for_meeting(
+                        hit.meeting.id
+                    )
+                    if candidate_ref == target_ref:
                         continue
-                    tags = self.repository.list_for_meeting(*key)
-                    resolved = self.index_repository.meeting_ref_by_identity(*key)
+                    tags = self.repository.list_for_meeting(
+                        candidate_ref.source_uuid,
+                        candidate_ref.external_id,
+                    )
+                    resolved = self.index_repository.meeting_by_ref(candidate_ref)
                     if tags and resolved is not None:
                         return resolved[0], tags
         except (RuntimeError, sqlite3.Error):
@@ -548,34 +557,28 @@ class TagService:
             candidate_limit *= 2
 
     def _assignment_is_active(self, assignment: TagAssignment) -> bool:
-        return (
-            self.index_repository.get_meeting_by_identity(
-                assignment.identity.source_uuid,
-                assignment.identity.meeting_external_id,
-            )
-            is not None
-        )
+        return self.index_repository.get_meeting_by_ref(assignment.identity) is not None
 
     def _resolve_meetings(
         self,
         meeting_ids: tuple[str, ...],
-    ) -> tuple[MeetingTagIdentity, ...]:
+    ) -> tuple[MeetingRef, ...]:
         if not meeting_ids:
             message = "No meeting IDs provided."
             raise ValueError(message)
-        resolved: list[MeetingTagIdentity] = []
+        resolved: list[MeetingRef] = []
         missing: list[str] = []
         for meeting_id in meeting_ids:
-            identity = self.index_repository.meeting_source_identity(meeting_id)
+            try:
+                local_id = int(meeting_id)
+            except ValueError:
+                missing.append(meeting_id)
+                continue
+            identity = self.index_repository.meeting_ref_for_local_id(local_id)
             if identity is None:
                 missing.append(meeting_id)
                 continue
-            resolved.append(
-                MeetingTagIdentity(
-                    source_uuid=str(identity["source_uuid"]),
-                    meeting_external_id=str(identity["meeting_external_id"]),
-                )
-            )
+            resolved.append(identity)
         if missing:
             message = f"Meetings not found: {', '.join(missing)}"
             raise ValueError(message)

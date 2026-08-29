@@ -68,8 +68,9 @@ def test_context_is_data_only_and_uses_canonical_memory_entities(
     assert all(entity.authoritative is False for entity in bundle.entities)
     assert all(entity.evidence_id for entity in bundle.entities)
     assert all("confidence" not in memory_entity_payload(entity) for entity in bundle.entities)
+    assert bounded.evidence
     assert len(bounded.evidence) <= 5
-    assert bounded.evidence[0].is_context is False
+    assert next(iter(bounded.evidence)).is_context is False
     assert any(hit.is_context for hit in bounded.evidence)
 
 

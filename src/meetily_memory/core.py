@@ -13,6 +13,7 @@ from meetily_memory.domain import (
     GraphNode,
     Meeting,
     MeetingChunk,
+    MeetingRef,
     MeetingSearchFilters,
     Person,
     PersonMemory,
@@ -133,14 +134,14 @@ class MeetilyMemoryCore:
     def build_meeting_context(
         self,
         question: str,
-        meeting_id: str,
+        meeting_ref: MeetingRef,
         limit: int = 8,
         *,
         context: int = DEFAULT_CONTEXT_NEIGHBORS,
     ) -> ContextBundle:
-        meeting = self._repository.get_meeting(meeting_id)
+        meeting = self._repository.get_meeting_by_ref(meeting_ref)
         if meeting is None:
-            message = f"Meeting not found: {meeting_id}"
+            message = f"Meeting not found: {meeting_ref.source_uuid}/{meeting_ref.external_id}"
             raise MeetingNotFoundError(message)
         return self._build_context_bundle(
             question,
@@ -161,8 +162,16 @@ class MeetilyMemoryCore:
         meetings = self.meetings(limit=1, person=person)
         return meetings[0] if meetings else None
 
-    def get_meeting(self, meeting_id: str) -> Meeting | None:
-        row = self._repository.get_meeting(meeting_id)
+    def get_meeting(self, external_id: str) -> Meeting | None:
+        row = self._repository.get_meeting(external_id)
+        return meeting_from_row(row) if row is not None else None
+
+    def get_meeting_by_local_id(self, meeting_id: int) -> Meeting | None:
+        row = self._repository.get_meeting_by_local_id(meeting_id)
+        return meeting_from_row(row) if row is not None else None
+
+    def get_meeting_by_ref(self, meeting_ref: MeetingRef) -> Meeting | None:
+        row = self._repository.get_meeting_by_ref(meeting_ref)
         return meeting_from_row(row) if row is not None else None
 
     def meeting_chunks(self, meeting_id: int) -> tuple[MeetingChunk, ...]:

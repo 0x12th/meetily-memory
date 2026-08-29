@@ -130,6 +130,7 @@ class SearchRepository:
             SELECT
               m.id AS meeting_id,
               m.external_id AS meeting_external_id,
+              s.source_uuid AS source_uuid,
               m.title AS title,
               m.created_at AS created_at,
               m.updated_at AS updated_at,
@@ -148,6 +149,7 @@ class SearchRepository:
             FROM chunks_fts f
             JOIN chunks c ON c.id = f.chunk_id
             JOIN meetings m ON m.id = c.meeting_id
+            JOIN sources s ON s.id = m.source_id
             WHERE chunks_fts MATCH ?
               AND (? IS NULL OR m.id = ?)
               AND {time_sql}
@@ -217,6 +219,7 @@ class SearchRepository:
                 SELECT
                   m.id AS meeting_id,
                   m.external_id AS meeting_external_id,
+                  s.source_uuid AS source_uuid,
                   m.title AS title,
                   m.created_at AS created_at,
                   m.updated_at AS updated_at,
@@ -234,6 +237,7 @@ class SearchRepository:
                   NULL AS rank
                 FROM chunks c
                 JOIN meetings m ON m.id = c.meeting_id
+                JOIN sources s ON s.id = m.source_id
                 WHERE m.id = ?
                   AND m.external_id = ?
                   AND (
@@ -267,6 +271,7 @@ class SearchRepository:
             SELECT
               m.id AS meeting_id,
               m.external_id AS meeting_external_id,
+              s.source_uuid AS source_uuid,
               m.title AS title,
               m.created_at AS created_at,
               m.updated_at AS updated_at,
@@ -284,6 +289,7 @@ class SearchRepository:
               NULL AS rank
             FROM chunks c
             JOIN meetings m ON m.id = c.meeting_id
+            JOIN sources s ON s.id = m.source_id
             WHERE c.meeting_id = ?
               AND c.ordinal BETWEEN ? AND ?
             ORDER BY c.ordinal
@@ -298,6 +304,7 @@ class SearchRepository:
                 SELECT
                   m.id AS meeting_id,
                   m.external_id AS meeting_external_id,
+                  s.source_uuid AS source_uuid,
                   m.title AS title,
                   m.created_at AS created_at,
                   m.updated_at AS updated_at,
@@ -315,6 +322,7 @@ class SearchRepository:
                   NULL AS rank
                 FROM chunks c
                 JOIN meetings m ON m.id = c.meeting_id
+                JOIN sources s ON s.id = m.source_id
                 ORDER BY m.source_id, m.external_id, c.kind, c.ordinal
                 """
             ).fetchall()

@@ -19,7 +19,8 @@ It exposes only two tools:
 
 - `search_meetings` accepts `query`, `limit`, `since`, `from`, and `to`; it uses the
   same meeting-level search and source evidence as `mm s`;
-- `get_meeting` retrieves one indexed meeting by internal or external ID.
+- `get_meeting` retrieves one indexed meeting by the stable `source_uuid` and `external_id`
+  returned by search.
 
 There is no SSE or streamable HTTP mode. The server does not expose context generation,
 topics, people, projects, graph projections, or heuristic structured entities. Returned
@@ -68,6 +69,11 @@ Managed files must include:
 ```html
 <!-- meetily-memory:managed -->
 ```
+
+Generated meeting-note open commands use
+`mm open --source-uuid UUID --external-id ID`. The persisted command payload always carries the
+source-aware `MeetingRef` and never a generation-local integer meeting ID; title-based note naming
+and wikilinks are unchanged here.
 
 The sync command may update managed files, but it must not overwrite unrelated
 user notes in the vault. A full sync also removes stale generated paths after a

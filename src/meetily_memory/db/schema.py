@@ -3,7 +3,16 @@ from collections.abc import Generator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION, MIGRATIONS
+from meetily_memory.db.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    LATEST_IN_PLACE_SCHEMA_VERSION,
+    MIGRATIONS,
+    initialize_current_schema,
+)
+
+
+class IndexRebuildRequiredError(RuntimeError):
+    pass
 
 
 @contextmanager
@@ -27,7 +36,29 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         raise RuntimeError(message)
 
-    # All formats through v5 are compatible in-place. The first incompatible future
-    # format must introduce a tested side-by-side rebuild instead of extending this loop.
-    for next_version in range(version + 1, CURRENT_SCHEMA_VERSION + 1):
+    if version == 0 and not _has_application_tables(conn):
+        initialize_current_schema(conn)
+        return
+
+    for next_version in range(version + 1, LATEST_IN_PLACE_SCHEMA_VERSION + 1):
         MIGRATIONS[next_version](conn)
+
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version < CURRENT_SCHEMA_VERSION:
+        message = (
+            f"Index schema {version} requires a source-aware rebuild to schema "
+            f"{CURRENT_SCHEMA_VERSION}. Run refresh or scan with the source database."
+        )
+        raise IndexRebuildRequiredError(message)
+
+
+def _has_application_tables(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        LIMIT 1
+        """
+    ).fetchone()
+    return row is not None

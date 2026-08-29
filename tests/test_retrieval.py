@@ -183,7 +183,8 @@ def test_context_renderer_uses_context_bundle_without_storage_rows(
 
     assert markdown.startswith("# Question\n\nWho owns migration risks?")
     assert "## Meeting: Dobrynya Follow-up" in markdown
-    assert "Source: meeting-2 / transcript-2" in markdown
+    assert f"Source UUID: {hits[0].meeting.ref.source_uuid}" in markdown
+    assert "/meeting-2 / transcript-2" in markdown
     assert "Dobrynya agreed to send migration risks by Friday." in markdown
     assert "Evidence role: neighboring context" in markdown
     assert markdown.endswith("# Question\n\nWho owns migration risks?\n")

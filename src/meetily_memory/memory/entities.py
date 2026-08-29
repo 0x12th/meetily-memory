@@ -77,6 +77,7 @@ ENTITY_DETAIL_SQL = {
           'decisions' AS kind,
           e.*,
           m.external_id AS meeting_external_id,
+          s.source_uuid AS source_uuid,
           m.title AS meeting_title,
           m.language AS meeting_language,
           COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
@@ -86,6 +87,7 @@ ENTITY_DETAIL_SQL = {
           c.timestamp_label AS chunk_timestamp_label
         FROM decisions e
         JOIN meetings m ON m.id = e.meeting_id
+        JOIN sources s ON s.id = m.source_id
         JOIN chunks c ON c.id = e.source_chunk_id
         ORDER BY meeting_date DESC, e.ordinal ASC
         LIMIT ?
@@ -99,6 +101,7 @@ ENTITY_DETAIL_SQL = {
           NULL AS status_source,
           NULL AS status_updated_at,
           m.external_id AS meeting_external_id,
+          s.source_uuid AS source_uuid,
           m.title AS meeting_title,
           m.language AS meeting_language,
           COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
@@ -108,6 +111,7 @@ ENTITY_DETAIL_SQL = {
           c.timestamp_label AS chunk_timestamp_label
         FROM action_items e
         JOIN meetings m ON m.id = e.meeting_id
+        JOIN sources s ON s.id = m.source_id
         JOIN chunks c ON c.id = e.source_chunk_id
         ORDER BY meeting_date DESC, e.ordinal ASC
         LIMIT ?
@@ -117,6 +121,7 @@ ENTITY_DETAIL_SQL = {
           'risks' AS kind,
           e.*,
           m.external_id AS meeting_external_id,
+          s.source_uuid AS source_uuid,
           m.title AS meeting_title,
           m.language AS meeting_language,
           COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
@@ -126,6 +131,7 @@ ENTITY_DETAIL_SQL = {
           c.timestamp_label AS chunk_timestamp_label
         FROM risks e
         JOIN meetings m ON m.id = e.meeting_id
+        JOIN sources s ON s.id = m.source_id
         JOIN chunks c ON c.id = e.source_chunk_id
         ORDER BY meeting_date DESC, e.ordinal ASC
         LIMIT ?
@@ -135,6 +141,7 @@ ENTITY_DETAIL_SQL = {
           'open_questions' AS kind,
           e.*,
           m.external_id AS meeting_external_id,
+          s.source_uuid AS source_uuid,
           m.title AS meeting_title,
           m.language AS meeting_language,
           COALESCE(m.updated_at, m.created_at, m.indexed_at) AS meeting_date,
@@ -144,6 +151,7 @@ ENTITY_DETAIL_SQL = {
           c.timestamp_label AS chunk_timestamp_label
         FROM open_questions e
         JOIN meetings m ON m.id = e.meeting_id
+        JOIN sources s ON s.id = m.source_id
         JOIN chunks c ON c.id = e.source_chunk_id
         ORDER BY meeting_date DESC, e.ordinal ASC
         LIMIT ?

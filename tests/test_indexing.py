@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 
 from meetily_memory.context_builder import build_context_markdown
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION, MIGRATIONS, migrate_to_v1
+from meetily_memory.db.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    LATEST_IN_PLACE_SCHEMA_VERSION,
+    MIGRATIONS,
+    migrate_to_v1,
+)
 from meetily_memory.db.repository import IndexRepository, build_fts_query
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
@@ -59,11 +64,12 @@ def test_index_schema_runs_explicit_migrations_from_v1(tmp_path: Path) -> None:
         conn.execute("PRAGMA user_version = 1")
         conn.commit()
 
-    IndexRepository(index_path)
+    repo = IndexRepository(index_path)
 
+    assert repo.requires_rebuild is True
     with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
-        for target_version in range(1, CURRENT_SCHEMA_VERSION + 1):
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
+        for target_version in range(1, LATEST_IN_PLACE_SCHEMA_VERSION + 1):
             assert target_version in MIGRATIONS
         for sql in EMPTY_ENTITY_COUNT_SQL:
             assert conn.execute(sql).fetchone()[0] == 0
@@ -98,11 +104,12 @@ def test_index_schema_adds_scan_lifecycle_columns_to_v4_database(tmp_path: Path)
         conn.execute("PRAGMA user_version = 4")
         conn.commit()
 
-    IndexRepository(index_path)
+    repo = IndexRepository(index_path)
 
+    assert repo.requires_rebuild is True
     with sqlite3.connect(index_path) as conn:
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(scan_runs)")}
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
     assert {"phase", "error_message"} <= columns
 
 
@@ -113,8 +120,9 @@ def test_index_repository_upgrades_v1_database_to_current_tables(tmp_path: Path)
         conn.execute("PRAGMA user_version = 1")
         conn.commit()
 
-    IndexRepository(index_path)
+    repo = IndexRepository(index_path)
 
+    assert repo.requires_rebuild is True
     expected_tables = {
         "decisions",
         "action_items",
@@ -136,7 +144,7 @@ def test_index_repository_upgrades_v1_database_to_current_tables(tmp_path: Path)
             )
         }
         assert expected_tables <= actual_tables
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
 
 
 def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path: Path) -> None:
@@ -152,7 +160,7 @@ def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path:
     source = repo.get_source("meetily_sqlite", str(meetily_db))
     assert source is not None
 
-    meeting = repo.get_meeting_by_external_id(source["id"], "meeting-1")
+    meeting = repo.get_meeting_by_source_id(source["id"], "meeting-1")
     assert meeting is not None
     assert meeting["title"] == "Launch Planning"
 

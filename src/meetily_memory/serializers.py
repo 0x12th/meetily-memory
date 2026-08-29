@@ -4,6 +4,7 @@ from meetily_memory.domain import (
     GraphNode,
     Meeting,
     MeetingChunk,
+    MeetingRef,
     MeetingSearchResult,
     MemoryEntity,
     MemoryStats,
@@ -32,10 +33,14 @@ def envelope(kind: str, data: JsonObject) -> JsonObject:
     return {"kind": kind, "data": data}
 
 
+def meeting_ref_payload(ref: MeetingRef) -> JsonObject:
+    return {"source_uuid": ref.source_uuid, "external_id": ref.external_id}
+
+
 def meeting_payload(meeting: Meeting) -> JsonObject:
     return {
-        "id": meeting.id,
-        "external_id": meeting.external_id,
+        "local_id": meeting.id,
+        "ref": meeting_ref_payload(meeting.ref),
         "title": meeting.title,
         "started_at": meeting.started_at,
         "ended_at": meeting.ended_at,
@@ -49,7 +54,7 @@ def meeting_payload(meeting: Meeting) -> JsonObject:
 
 def source_excerpt_payload(excerpt: SourceExcerpt) -> JsonObject:
     return {
-        "meeting_external_id": excerpt.meeting_external_id,
+        "meeting_ref": meeting_ref_payload(excerpt.meeting_ref),
         "chunk_external_id": excerpt.chunk_external_id,
         "kind": excerpt.kind,
         "ordinal": excerpt.ordinal,
@@ -72,7 +77,7 @@ def search_hit_payload(hit: SearchHit) -> JsonObject:
 
 def meeting_search_result_payload(result: MeetingSearchResult) -> JsonObject:
     return {
-        "meeting_id": result.meeting_id,
+        "meeting_local_id": result.meeting_id,
         "meeting": meeting_payload(result.meeting),
         "rank": result.rank,
         "match_sources": [source.value for source in result.match_sources],
@@ -110,7 +115,7 @@ def context_bundle_payload(bundle: ContextBundle) -> JsonObject:
 
 def meeting_chunk_payload(chunk: MeetingChunk) -> JsonObject:
     return {
-        "id": chunk.id,
+        "local_id": chunk.id,
         "external_id": chunk.external_id,
         "kind": chunk.kind,
         "ordinal": chunk.ordinal,
@@ -149,8 +154,8 @@ def ranked_excerpt_payload(value: RankedExcerpt) -> JsonObject:
     meeting = value.meeting
     excerpt = value.excerpt
     return {
-        "meeting_id": value.meeting_id,
-        "meeting_external_id": meeting.external_id,
+        "meeting_local_id": value.meeting_id,
+        "meeting_ref": meeting_ref_payload(meeting.ref),
         "title": meeting.title,
         "created_at": meeting.created_at,
         "updated_at": meeting.updated_at,
@@ -180,8 +185,8 @@ def structured_signal_payload(signal: StructuredSignal) -> JsonObject:
         "status_note": signal.status_note,
         "status_source": signal.status_source,
         "status_updated_at": signal.status_updated_at,
-        "meeting_id": signal.meeting_id,
-        "meeting_external_id": signal.meeting_external_id,
+        "meeting_local_id": signal.meeting_id,
+        "meeting_ref": meeting_ref_payload(signal.meeting_ref),
         "meeting_title": signal.meeting_title,
         "meeting_language": signal.meeting_language,
         "meeting_date": signal.meeting_date,
@@ -256,8 +261,8 @@ def graph_edge_payload(edge: GraphEdge) -> JsonObject:
         "relation": edge.relation,
         "to_node_id": edge.to_node_id,
         "confidence": edge.confidence,
-        "source_meeting_id": edge.source_meeting_id,
-        "source_chunk_id": edge.source_chunk_id,
+        "source_meeting_local_id": edge.source_meeting_id,
+        "source_chunk_local_id": edge.source_chunk_id,
         "extraction_method": edge.extraction_method,
         "created_at": edge.created_at,
     }

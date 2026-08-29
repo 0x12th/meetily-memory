@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import subprocess
 from datetime import UTC, datetime
 from locale import getlocale
@@ -17,7 +18,7 @@ from meetily_memory.cli.common import (
     print_text_block,
     sqlite_has_fts5,
 )
-from meetily_memory.config.paths import discover_meetily_db
+from meetily_memory.config.paths import canonical_source_path, discover_meetily_db
 from meetily_memory.config.settings import (
     AppSettings,
     load_app_settings,
@@ -26,9 +27,9 @@ from meetily_memory.config.settings import (
 )
 from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
-from meetily_memory.db.schema import index_connection
 from meetily_memory.diagnostics import (
     DatabaseDiagnostic,
+    inspect_database_status,
     inspect_local_databases,
     inspect_source_database,
 )
@@ -39,8 +40,15 @@ from meetily_memory.scanner.meetily_sqlite import (
     ScanResult,
     inspect_meetily_schema,
     meeting_external_ids,
+    previous_index_backup_path,
 )
-from meetily_memory.tagging import TagService
+from meetily_memory.user_state import (
+    AmbiguousSourceIdentityError,
+    SourcePathClaim,
+    UserStateRepository,
+    find_existing_source_by_uuid,
+    find_existing_source_for_settings_path,
+)
 
 app = make_typer("Local Meetily history lifecycle commands.")
 config_app = make_typer("Manage CLI settings.")
@@ -55,18 +63,84 @@ def utc_now_iso() -> str:
 SOURCE_KIND = "meetily_sqlite"
 
 
+def _rebind_compensation_checkpoint(_name: str) -> None:
+    return
+
+
+def require_canonical_source_path(path: Path) -> Path:
+    try:
+        return canonical_source_path(path)
+    except OSError as exc:
+        message = f"Source path does not exist or cannot be resolved: {path}"
+        raise typer.BadParameter(message) from exc
+
+
+def source_state_repository(index_path: Path) -> UserStateRepository:
+    return UserStateRepository(Path(index_path).with_name("state.sqlite"))
+
+
+def resolve_source_uuid(user_state: UserStateRepository, source_path: Path) -> str:
+    try:
+        return user_state.resolve_source(SOURCE_KIND, source_path, now=utc_now_iso())
+    except AmbiguousSourceIdentityError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def resolve_existing_rebind_source_uuid(
+    state_path: Path,
+    settings: AppSettings,
+    explicit_source_uuid: str | None,
+) -> str:
+    source_uuid = explicit_source_uuid if explicit_source_uuid is not None else settings.source_uuid
+    if source_uuid is not None:
+        source = find_existing_source_by_uuid(state_path, source_uuid)
+        if source is None:
+            message = f"Source UUID not found in user state: {source_uuid}."
+            raise typer.BadParameter(message)
+        if str(source["kind"]) != SOURCE_KIND:
+            message = f"Source UUID {source_uuid} has an incompatible source kind."
+            raise typer.BadParameter(message)
+        return source_uuid
+    if settings.source_path:
+        try:
+            source = find_existing_source_for_settings_path(
+                state_path,
+                SOURCE_KIND,
+                settings.source_path,
+            )
+        except AmbiguousSourceIdentityError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if source is not None:
+            return str(source["uuid"])
+        message = (
+            f"No state-owned source has the exact legacy path: {settings.source_path}. "
+            "Pass --source-uuid UUID to choose the identity to repair."
+        )
+        raise typer.BadParameter(message)
+    message = "No source identity is selected. Pass --source-uuid UUID with --rebind."
+    raise typer.BadParameter(message)
+
+
 def migrated_source_settings(index_path: Path, settings_path: Path) -> AppSettings:
     settings = load_app_settings(settings_path)
-    repo = IndexRepository(index_path)
     if settings.source_uuid:
         return settings
     if not settings.source_path:
         return settings
-    source_uuid = repo.user_state.get_or_create_source(
+    state_source = find_existing_source_for_settings_path(
+        Path(index_path).with_name("state.sqlite"),
         SOURCE_KIND,
-        str(Path(settings.source_path).expanduser()),
-        now=utc_now_iso(),
+        settings.source_path,
     )
+    if state_source is None:
+        message = (
+            "Legacy settings source_path has no exact state-owned current_path or pending "
+            f"projected_path match: {settings.source_path}. Select the source explicitly with "
+            "`mm config source PATH`, or repair an existing UUID with "
+            "`mm config source PATH --rebind --source-uuid UUID`."
+        )
+        raise typer.BadParameter(message)
+    source_uuid = str(state_source["uuid"])
     return update_app_settings(
         settings_path=settings_path,
         source_uuid=source_uuid,
@@ -80,18 +154,15 @@ def configured_source_path(
     explicit_source: Path | None = None,
 ) -> Path | None:
     if explicit_source is not None:
-        return explicit_source
+        return require_canonical_source_path(explicit_source)
     settings = migrated_source_settings(index_path, settings_path)
     if settings.source_uuid:
-        source = IndexRepository(index_path).user_state.get_source(settings.source_uuid)
+        source = source_state_repository(index_path).get_source(settings.source_uuid)
         configured = Path(str(source["current_path"])).expanduser() if source else None
         if configured and configured.exists():
-            return configured
-    if settings.source_path:
-        configured = Path(settings.source_path).expanduser()
-        if configured.exists():
-            return configured
-    return discover_meetily_db()
+            return require_canonical_source_path(configured)
+    discovered = discover_meetily_db()
+    return require_canonical_source_path(discovered) if discovered is not None else None
 
 
 def scan_update(
@@ -107,7 +178,8 @@ def scan_update(
         repo.complete_scan_run(result.run_id, utc_now_iso(), result)
 
     payload: dict[str, object] = {
-        "source_id": result.source_id,
+        "source_uuid": result.source_uuid,
+        "source_local_id": result.source_id,
         "meetings_seen": result.meetings_seen,
         "meetings_inserted": result.meetings_inserted,
         "meetings_updated": result.meetings_updated,
@@ -184,29 +256,28 @@ def init(
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    source_path = configured_source_path(ctx.obj["index_path"], ctx.obj["settings_path"], source)
-    if source_path is None:
-        message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
-        raise typer.BadParameter(message)
     should_enable_autosync = autosync
     if should_enable_autosync is None:
         should_enable_autosync = typer.confirm("Enable automatic index refreshes?", default=False)
     try:
         with RefreshLock(ctx.obj["index_path"]):
+            source_path = configured_source_path(
+                ctx.obj["index_path"], ctx.obj["settings_path"], source
+            )
+            if source_path is None:
+                message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
+                raise typer.BadParameter(message)
             payload, _ = scan_update(ctx.obj["index_path"], source_path)
+            source_uuid = str(payload["source_uuid"])
+            settings = update_app_settings(
+                settings_path=ctx.obj["settings_path"],
+                source_uuid=source_uuid,
+                source_path=None,
+                autosync_enabled=False,
+                last_update_at=utc_now_iso(),
+            )
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    repo = IndexRepository(ctx.obj["index_path"])
-    source_uuid = repo.user_state.get_or_create_source(
-        SOURCE_KIND, str(source_path), now=utc_now_iso()
-    )
-    settings = update_app_settings(
-        settings_path=ctx.obj["settings_path"],
-        source_uuid=source_uuid,
-        source_path=None,
-        autosync_enabled=False,
-        last_update_at=utc_now_iso(),
-    )
     if should_enable_autosync:
         try:
             enable_autosync(
@@ -317,22 +388,71 @@ def config_source(
     new_path: Annotated[Path, typer.Argument(help="Path to Meetily meeting_minutes.sqlite.")],
     rebind: Annotated[
         bool,
-        typer.Option("--rebind", help="Preserve the selected source UUID after verification."),
+        typer.Option("--rebind", help="Preserve a state-owned source UUID after verification."),
     ] = False,
+    source_uuid: Annotated[
+        str | None,
+        typer.Option(
+            "--source-uuid",
+            help="State-owned UUID to repair; requires --rebind.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    new_path = new_path.expanduser()
+    if source_uuid is not None and not rebind:
+        message = "--source-uuid requires --rebind."
+        raise typer.BadParameter(message)
+    new_path = require_canonical_source_path(new_path)
     valid, schema_error = inspect_meetily_schema(new_path)
     if not valid:
         raise typer.BadParameter(schema_error or "Meetily DB schema is unsupported.")
     index_path = ctx.obj["index_path"]
-    repo = IndexRepository(index_path)
-    settings = migrated_source_settings(index_path, ctx.obj["settings_path"])
-    payload = (
-        rebind_selected_source(repo, settings, new_path, ctx.obj["settings_path"])
-        if rebind
-        else select_source(repo, new_path, ctx.obj["settings_path"])
-    )
+    try:
+        with RefreshLock(index_path):
+            if rebind:
+                state_path = Path(index_path).with_name("state.sqlite")
+                settings = load_app_settings(ctx.obj["settings_path"])
+                rebind_uuid = resolve_existing_rebind_source_uuid(
+                    state_path,
+                    settings,
+                    source_uuid,
+                )
+                user_state = source_state_repository(index_path)
+                try:
+                    user_state.validate_source_path_claim(
+                        rebind_uuid,
+                        SOURCE_KIND,
+                        new_path,
+                    )
+                except (AmbiguousSourceIdentityError, ValueError, RuntimeError) as exc:
+                    raise typer.BadParameter(str(exc)) from exc
+                try:
+                    repo = IndexRepository(index_path, state_path=user_state.state_path)
+                    repo.heal_pending_source_path_projection(rebind_uuid)
+                    claim = user_state.claim_source_path(
+                        rebind_uuid,
+                        SOURCE_KIND,
+                        new_path,
+                        now=utc_now_iso(),
+                    )
+                    payload = rebind_source_identity(
+                        index_path,
+                        user_state,
+                        claim,
+                        new_path,
+                        ctx.obj["settings_path"],
+                        repo=repo,
+                    )
+                except (AmbiguousSourceIdentityError, ValueError, RuntimeError) as exc:
+                    raise typer.BadParameter(str(exc)) from exc
+            else:
+                payload = select_source(
+                    source_state_repository(index_path),
+                    new_path,
+                    ctx.obj["settings_path"],
+                )
+    except RefreshLockBusyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if json_output:
         print_json(payload)
         return
@@ -345,10 +465,13 @@ def config_source(
     print_text_block(f"source uuid: {payload['source_uuid']}")
 
 
-def select_source(repo: IndexRepository, new_path: Path, settings_path: Path) -> dict[str, object]:
-    source_uuid = repo.user_state.get_or_create_source(
-        SOURCE_KIND, str(new_path), now=utc_now_iso()
-    )
+def select_source(
+    user_state: UserStateRepository,
+    new_path: Path,
+    settings_path: Path,
+) -> dict[str, object]:
+    new_path = require_canonical_source_path(new_path)
+    source_uuid = resolve_source_uuid(user_state, new_path)
     update_app_settings(
         settings_path=settings_path,
         source_uuid=source_uuid,
@@ -357,40 +480,73 @@ def select_source(repo: IndexRepository, new_path: Path, settings_path: Path) ->
     return {"source_uuid": source_uuid, "source_path": str(new_path), "rebound": False}
 
 
-def rebind_selected_source(
-    repo: IndexRepository, settings: AppSettings, new_path: Path, settings_path: Path
-) -> dict[str, object]:
-    if not settings.source_uuid:
-        message = "No selected source is available to rebind."
-        raise typer.BadParameter(message)
-    current = repo.user_state.get_source(settings.source_uuid)
-    if current is None:
-        message = "The selected source no longer exists in user state."
-        raise typer.BadParameter(message)
-    old_path = str(current["current_path"])
-    target = repo.user_state.get_source_by_path(SOURCE_KIND, str(new_path))
-    if target and target["uuid"] != settings.source_uuid:
-        message = "The new path is already linked to another source UUID."
-        raise typer.BadParameter(message)
-    indexed_ids = repo.source_meeting_external_ids(SOURCE_KIND, old_path)
-    if not indexed_ids:
-        return select_source(repo, new_path, settings_path)
-    matching = indexed_ids & meeting_external_ids(new_path)
-    if not matching:
-        message = "The new source has no matching meeting IDs."
-        raise typer.BadParameter(message)
+def finalize_source_path_claim(
+    user_state: UserStateRepository,
+    claim: SourcePathClaim,
+) -> None:
+    if user_state.finalize_source_path_claim(claim):
+        return
+    message = f"Source path claim for UUID {claim.source_uuid} changed before finalization."
+    raise RuntimeError(message)
 
-    repo.user_state.update_source_path(settings.source_uuid, str(new_path), now=utc_now_iso())
-    repo.update_source_path_projection(SOURCE_KIND, old_path, str(new_path))
-    update_app_settings(
-        settings_path=settings_path,
-        source_uuid=settings.source_uuid,
-        source_path=None,
-    )
+
+def rebind_source_identity(
+    index_path: Path,
+    user_state: UserStateRepository,
+    claim: SourcePathClaim,
+    new_path: Path,
+    settings_path: Path,
+    *,
+    repo: IndexRepository | None = None,
+) -> dict[str, object]:
+    new_path = require_canonical_source_path(new_path)
+    try:
+        repo = repo or IndexRepository(index_path, state_path=user_state.state_path)
+        target_ids = meeting_external_ids(new_path)
+        indexed_ids = repo.rebind_source_path_projection(claim)
+        matching = indexed_ids & target_ids
+        update_app_settings(
+            settings_path=settings_path,
+            source_uuid=claim.source_uuid,
+            source_path=None,
+        )
+        finalize_source_path_claim(user_state, claim)
+    except BaseException as exc:
+        try:
+            rollback_claim = user_state.begin_source_path_rollback(
+                claim,
+                now=utc_now_iso(),
+            )
+        except (RuntimeError, sqlite3.Error):
+            rollback_claim = None
+        projection_restored = False
+        state_finalized = False
+        if rollback_claim is not None:
+            _rebind_compensation_checkpoint("rollback_pending")
+            if repo is not None:
+                try:
+                    projection_restored = repo.restore_source_path_projection(rollback_claim)
+                except (OSError, RuntimeError, ValueError, sqlite3.Error):
+                    projection_restored = False
+            if projection_restored:
+                _rebind_compensation_checkpoint("index_rolled_back")
+                try:
+                    state_finalized = user_state.finalize_source_path_claim(rollback_claim)
+                except (RuntimeError, sqlite3.Error):
+                    state_finalized = False
+        if rollback_claim is None or not projection_restored or not state_finalized:
+            message = (
+                "Source rebind failed and automatic compensation was incomplete. "
+                f"State UUID {claim.source_uuid} remains authoritative; a newer claim or a "
+                "persisted rollback-pending claim was not fully reconciled. Inspect state/index "
+                "paths and rerun refresh or explicit --rebind before scanning."
+            )
+            raise RuntimeError(message) from exc
+        raise
     return {
-        "source_uuid": settings.source_uuid,
-        "old_source_path": old_path,
-        "new_source_path": str(new_path),
+        "source_uuid": claim.source_uuid,
+        "old_source_path": claim.previous_path,
+        "new_source_path": claim.claimed_path,
         "matching_meetings": len(matching),
         "rebound": True,
     }
@@ -413,12 +569,14 @@ def scan(
         typer.Option("--analyze/--no-analyze", help="Analyze new or changed meetings."),
     ] = True,
 ) -> None:
-    source_path = configured_source_path(ctx.obj["index_path"], ctx.obj["settings_path"], source)
-    if source_path is None:
-        message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
-        raise typer.BadParameter(message)
     try:
         with RefreshLock(ctx.obj["index_path"]):
+            source_path = configured_source_path(
+                ctx.obj["index_path"], ctx.obj["settings_path"], source
+            )
+            if source_path is None:
+                message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
+                raise typer.BadParameter(message)
             result = MeetilySQLiteScanner(ctx.obj["index_path"]).scan(
                 source_path,
                 force=force,
@@ -427,7 +585,8 @@ def scan(
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     payload = {
-        "source_id": result.source_id,
+        "source_uuid": result.source_uuid,
+        "source_local_id": result.source_id,
         "meetings_seen": result.meetings_seen,
         "meetings_inserted": result.meetings_inserted,
         "meetings_updated": result.meetings_updated,
@@ -451,22 +610,22 @@ def run_refresh(
     settings_path: Path,
     source_path: Path,
 ) -> tuple[dict[str, object], bool]:
-    repo = IndexRepository(index_path)
-    repo.fail_abandoned_scan_runs(utc_now_iso())
+    source_path = require_canonical_source_path(source_path)
+    previous_backup = previous_index_backup_path(index_path)
+    discard_previous_backup = previous_backup.exists()
     settings = load_app_settings(settings_path)
     payload, result = scan_update(
         index_path,
         source_path,
         finalize=False,
     )
+    repo = IndexRepository(index_path)
     phase = "source_scan"
     obsidian_synced_at: str | None = None
     try:
         phase = "finalizing"
         repo.update_scan_run_phase(result.run_id, phase)
-        source_uuid = repo.user_state.get_or_create_source(
-            SOURCE_KIND, str(source_path), now=utc_now_iso()
-        )
+        source_uuid = result.source_uuid
         obsidian_synced = False
         if settings.obsidian.vault_path and settings.obsidian.sync_after_update:
             phase = "obsidian_sync"
@@ -489,6 +648,8 @@ def run_refresh(
             source_path=None,
             last_update_at=utc_now_iso(),
         )
+        if discard_previous_backup:
+            previous_backup.unlink(missing_ok=True)
     except Exception as exc:
         repo.fail_scan_run(
             result.run_id,
@@ -560,28 +721,57 @@ def db_status(
     ctx: typer.Context,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    index_path = ctx.obj["index_path"]
-    repo = IndexRepository(index_path)
-    with index_connection(index_path) as conn:
-        schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    migration_report = repo.user_state.latest_migration_report()
-    orphaned_tag_assignments = TagService(repo).orphaned_assignment_count()
+    index_path = Path(ctx.obj["index_path"])
+    state_path = index_path.with_name("state.sqlite")
+    status_diagnostics = inspect_database_status(index_path)
+    diagnostics = status_diagnostics.local
+    index_database = diagnostics.index_database
+    state_database = diagnostics.state_database
+    migration_report = status_diagnostics.migration_report
+    orphaned_tag_assignments = status_diagnostics.orphaned_tag_assignments
+    migration_status = {
+        "current": "current",
+        "legacy": "rebuild_required",
+        "missing": "missing",
+        "incompatible": "incompatible",
+    }[index_database.status]
     payload = {
         "index_path": str(index_path),
-        "state_path": str(repo.state_path),
-        "schema_version": schema_version,
+        "state_path": str(state_path),
+        "schema_version": index_database.schema_version,
         "current_schema_version": CURRENT_SCHEMA_VERSION,
+        "schema_status": index_database.status,
+        "state_schema_version": state_database.schema_version,
+        "state_schema_status": state_database.status,
+        "migration_status": migration_status,
+        "index_database": index_database.as_payload(),
+        "state_database": state_database.as_payload(),
         "user_state_migration": migration_report,
         "orphaned_tag_assignments": orphaned_tag_assignments,
+        "details_error": status_diagnostics.details_error,
     }
     if json_output:
         print_json(payload)
         return
     print_text_block(f"index path: {index_path}")
-    print_text_block(f"state path: {repo.state_path}")
-    print_text_block(f"schema version: {schema_version}")
+    print_text_block(f"state path: {state_path}")
+    schema_version = index_database.schema_version
+    print_text_block(
+        f"schema version: {schema_version if schema_version is not None else 'missing'}"
+    )
     print_text_block(f"current schema version: {CURRENT_SCHEMA_VERSION}")
-    print_text_block(f"orphaned tag assignments: {orphaned_tag_assignments}")
+    print_text_block(f"schema status: {index_database.status}")
+    print_text_block(f"migration status: {migration_status}")
+    orphaned_label = (
+        str(orphaned_tag_assignments) if orphaned_tag_assignments is not None else "unavailable"
+    )
+    print_text_block(f"orphaned tag assignments: {orphaned_label}")
+    if index_database.error:
+        print_text_block(f"index database error: {index_database.error}")
+    if state_database.error:
+        print_text_block(f"state database error: {state_database.error}")
+    if status_diagnostics.details_error:
+        print_text_block(f"database details error: {status_diagnostics.details_error}")
     if migration_report:
         print_text_block(
             "user state migration: "

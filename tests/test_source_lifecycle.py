@@ -19,6 +19,7 @@ from meetily_memory.repositories.records import ChunkRecord, MeetingRecord
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.structure_analyzer import StructureAnalyzer
 from meetily_memory.tagging import TagService
+from meetily_memory.user_state import UserStateRepository
 
 
 class EventLike(Protocol):
@@ -40,6 +41,11 @@ def test_legacy_source_path_is_read_only_in_status_and_migrates_on_refresh(
     data_dir.mkdir()
     index_path = data_dir / "index.sqlite"
     settings_path = data_dir / "settings.json"
+    source_uuid = UserStateRepository(data_dir / "state.sqlite").get_or_create_source(
+        MeetilySQLiteScanner.source_kind,
+        str(meetily_db),
+        now="legacy-exact-state-binding",
+    )
     legacy_settings = {"source_path": str(meetily_db)}
     settings_path.write_text(json.dumps(legacy_settings) + "\n")
     runner = CliRunner()
@@ -53,13 +59,13 @@ def test_legacy_source_path_is_read_only_in_status_and_migrates_on_refresh(
     assert loads_json(settings_path.read_text()) == legacy_settings
     assert json.loads(second.stdout)["source_path"] == str(meetily_db)
     assert not index_path.exists()
-    assert not (data_dir / "state.sqlite").exists()
+    assert (data_dir / "state.sqlite").exists()
 
     refresh = runner.invoke(app, ["--index", str(index_path), "refresh"], env=env)
     migrated_settings = loads_json(settings_path.read_text())
 
     assert refresh.exit_code == 0
-    assert migrated_settings["source_uuid"]
+    assert migrated_settings["source_uuid"] == source_uuid
     assert "source_path" not in migrated_settings
     with sqlite3.connect(data_dir / "state.sqlite") as conn:
         assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 1
@@ -109,7 +115,9 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     assert init.exit_code == 0
     StructureAnalyzer(IndexRepository(index_path)).analyze_all()
     before = MeetilyMemoryCore(index_path)
-    evidence_id = before.search("migration risks", limit=1).results[0].evidence[0].id
+    before_result = before.search("migration risks", limit=1).results[0]
+    meeting_ref = before_result.meeting.ref
+    evidence_id = before_result.evidence[0].id
     task = before.structured_entities("action_items").entities[0]
     before.set_task_status(task.id, "done", note="survives move")
     TagService(IndexRepository(index_path)).assign(("1",), ("Сбер",))
@@ -131,7 +139,9 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     assert settings["source_uuid"] == original_uuid
     assert "source_path" not in settings
     after = MeetilyMemoryCore(index_path)
-    assert after.search("migration risks", limit=1).results[0].evidence[0].id == evidence_id
+    after_result = after.search("migration risks", limit=1).results[0]
+    assert after_result.meeting.ref == meeting_ref
+    assert after_result.evidence[0].id == evidence_id
     matching_tasks = [
         entity
         for entity in after.structured_entities("action_items", limit=100).entities
@@ -175,7 +185,7 @@ def test_source_selection_without_rebind_uses_a_distinct_uuid(
     assert "source_path" not in loads_json((data_dir / "settings.json").read_text())
 
 
-def test_incompatible_rebind_is_atomic_and_creates_no_new_source(
+def test_explicit_rebind_allows_zero_overlap_without_creating_a_new_source(
     meetily_db: Path, tmp_path: Path
 ) -> None:
     data_dir = tmp_path / "data"
@@ -195,7 +205,7 @@ def test_incompatible_rebind_is_atomic_and_creates_no_new_source(
         ["--index", str(index_path), "init", "--source", str(meetily_db), "--no-autosync"],
         env=env,
     )
-    original_settings = loads_json((data_dir / "settings.json").read_text())
+    original_uuid = loads_json((data_dir / "settings.json").read_text())["source_uuid"]
 
     rebind = runner.invoke(
         app,
@@ -203,12 +213,19 @@ def test_incompatible_rebind_is_atomic_and_creates_no_new_source(
         env=env,
     )
 
-    assert rebind.exit_code != 0
-    assert "no matching meeting IDs" in rebind.output
-    assert loads_json((data_dir / "settings.json").read_text()) == original_settings
+    assert rebind.exit_code == 0
+    assert "matching meetings: 0" in rebind.stdout
+    assert loads_json((data_dir / "settings.json").read_text())["source_uuid"] == original_uuid
     with sqlite3.connect(data_dir / "state.sqlite") as conn:
         assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 1
-        assert conn.execute("SELECT current_path FROM sources").fetchone()[0] == str(meetily_db)
+        assert conn.execute("SELECT uuid, current_path FROM sources").fetchone() == (
+            original_uuid,
+            str(incompatible_db.resolve(strict=True)),
+        )
+    with sqlite3.connect(index_path) as conn:
+        assert conn.execute("SELECT path FROM sources").fetchone()[0] == str(
+            incompatible_db.resolve(strict=True)
+        )
 
 
 def test_rebind_accepts_a_partial_copy_with_one_matching_meeting(
@@ -271,6 +288,25 @@ def test_refresh_lock_blocks_a_second_writer_and_is_released_on_process_exit(
         ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
         env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
     )
+    blocked_selection = runner.invoke(
+        app,
+        ["--index", str(index_path), "config", "source", str(meetily_db)],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+    blocked_rebind = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "config",
+            "source",
+            str(meetily_db),
+            "--rebind",
+            "--source-uuid",
+            "missing-while-locked",
+        ],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
 
     assert autosync.exit_code == 0
     assert "autosync skipped" in autosync.output.lower()
@@ -279,7 +315,13 @@ def test_refresh_lock_blocks_a_second_writer_and_is_released_on_process_exit(
     assert "refresh is already running" in blocked.output.lower()
     assert f"pid {process.pid}" in blocked.output.lower()
     assert "acquired at" in blocked.output.lower()
+    assert blocked_selection.exit_code != 0
+    assert "refresh is already running" in blocked_selection.output.lower()
+    assert blocked_rebind.exit_code != 0
+    assert "refresh is already running" in blocked_rebind.output.lower()
     assert not index_path.exists()
+    assert not (data_dir / "state.sqlite").exists()
+    assert not (data_dir / "settings.json").exists()
 
     process.terminate()
     process.join(timeout=10)

@@ -20,7 +20,9 @@ def test_core_exposes_data_only_context_contract(meetily_db: Path, tmp_path: Pat
 
     assert bundle.question == "Who owns migration risks?"
     assert bundle.evidence[0].meeting.external_id == "meeting-2"
-    assert "Source: meeting-2 / transcript-2" in ContextRenderer().render(bundle)
+    rendered = ContextRenderer().render(bundle)
+    assert f"Source UUID: {bundle.evidence[0].meeting.ref.source_uuid}" in rendered
+    assert "/meeting-2 / transcript-2" in rendered
 
 
 def test_core_exposes_typed_topic_graph_and_structured_contracts(

@@ -1,3 +1,4 @@
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -215,14 +216,30 @@ def write_managed_note(path: Path, text: str) -> bool:
 
 
 def render_obsidian_meeting_note(meeting: dict[str, Any]) -> str:
+    meeting_ref = meeting["ref"]
+    if not isinstance(meeting_ref, dict):
+        message = "Serialized meeting ref must be an object."
+        raise TypeError(message)
     lines = [
         f"# {meeting['title']}",
         "",
         MANAGED_MARKER,
         "",
-        f"- Meetily ID: `{meeting['external_id']}`",
+        f"- Meetily ID: `{meeting_ref['external_id']}`",
+        f"- Source UUID: `{meeting_ref['source_uuid']}`",
         f"- Date: {meeting.get('updated_at') or meeting.get('created_at') or ''}",
-        f"- Open: `mm open {meeting['id']}`",
+        "- Open: `"
+        + shlex.join(
+            [
+                "mm",
+                "open",
+                "--source-uuid",
+                str(meeting_ref["source_uuid"]),
+                "--external-id",
+                str(meeting_ref["external_id"]),
+            ]
+        )
+        + "`",
     ]
     return "\n".join(lines).rstrip() + "\n"
 
@@ -341,8 +358,15 @@ def unique_meeting_titles(rows: object) -> list[str]:
 
 
 def source_label(row: dict[str, Any]) -> str:
+    meeting_ref = row.get("meeting_ref")
+    if isinstance(meeting_ref, dict):
+        source_uuid = str(meeting_ref.get("source_uuid") or "")
+        external_id = str(meeting_ref.get("external_id") or "")
+        meeting_source = "/".join(part for part in (source_uuid, external_id) if part)
+    else:
+        meeting_source = str(row.get("meeting_external_id") or row.get("meeting_local_id") or "")
     source_parts = [
-        str(row.get("meeting_external_id") or row.get("meeting_id") or ""),
+        meeting_source,
         str(row.get("chunk_external_id") or row.get("source_chunk_id") or ""),
     ]
     source = " / ".join(part for part in source_parts if part)

@@ -136,7 +136,7 @@ def test_scan_handles_non_object_language_metadata(meetily_db: Path, tmp_path: P
 
     assert result.meetings_seen == 2
     assert source is not None
-    meeting = repo.get_meeting_by_external_id(source["id"], "meeting-1")
+    meeting = repo.get_meeting_by_source_id(source["id"], "meeting-1")
     assert meeting is not None
     assert meeting["language"] is None
     completed_run = repo.scan_run_diagnostics()["last_completed_run"]
@@ -222,7 +222,7 @@ def test_scan_preserves_contiguous_context_order_and_fallback_evidence_on_force(
     repo = IndexRepository(index_path)
     source = repo.get_source("meetily_sqlite", str(meetily_db))
     assert source is not None
-    meeting = repo.get_meeting_by_external_id(source["id"], "meeting-1")
+    meeting = repo.get_meeting_by_source_id(source["id"], "meeting-1")
     assert meeting is not None
 
     chunks = repo.get_chunks_for_meeting(meeting["id"])
