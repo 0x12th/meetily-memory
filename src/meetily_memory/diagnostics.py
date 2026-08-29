@@ -16,6 +16,7 @@ from meetily_memory.db.migrations import (
     LATEST_IN_PLACE_SCHEMA_VERSION,
     SOURCE_AWARE_SCHEMA_VERSION,
 )
+from meetily_memory.json_codec import loads_json
 from meetily_memory.scanner.meetily_sqlite import validate_meetily_schema
 from meetily_memory.user_state import (
     CURRENT_USER_STATE_SCHEMA_VERSION,
@@ -1191,6 +1192,7 @@ def empty_scan_diagnostics() -> ScanDiagnostics:
         "last_completed_run": None,
         "last_failed_run": None,
         "last_running_run": None,
+        "last_post_publish_error": None,
     }
 
 
@@ -1205,6 +1207,7 @@ def read_scan_diagnostics(conn: sqlite3.Connection, tables: set[str]) -> ScanDia
     completed = scan_run_for_status(conn, "completed")
     failed = scan_run_for_status(conn, "failed")
     running = scan_run_for_status(conn, "running")
+    post_publish = scan_run_for_post_publish_error(conn) if "phase" in columns else None
     if failed and completed:
         failed_id = failed["id"]
         completed_id = completed["id"]
@@ -1217,6 +1220,7 @@ def read_scan_diagnostics(conn: sqlite3.Connection, tables: set[str]) -> ScanDia
     diagnostics["last_completed_run"] = completed
     diagnostics["last_failed_run"] = failed
     diagnostics["last_running_run"] = running
+    diagnostics["last_post_publish_error"] = post_publish
     return diagnostics
 
 
@@ -1225,11 +1229,36 @@ def scan_run_for_status(conn: sqlite3.Connection, status: str) -> ScanRunPayload
         "SELECT * FROM scan_runs WHERE status = ? ORDER BY id DESC LIMIT 1",
         (status,),
     ).fetchone()
+    return scan_run_payload(row)
+
+
+def scan_run_for_post_publish_error(conn: sqlite3.Connection) -> ScanRunPayload | None:
+    row = conn.execute(
+        """
+        SELECT *
+        FROM scan_runs
+        WHERE status = 'completed' AND phase LIKE 'post_publish%_failed'
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return scan_run_payload(row)
+
+
+def scan_run_payload(row: sqlite3.Row | None) -> ScanRunPayload | None:
     if row is None:
         return None
     payload = {str(key): value for key, value in zip(row.keys(), row, strict=True)}
     payload.setdefault("phase", "source_scan")
     payload.setdefault("error_message", None)
+    raw_errors = payload.get("errors_json")
+    if isinstance(raw_errors, str) and str(payload["phase"]).startswith("post_publish"):
+        try:
+            post_publish = loads_json(raw_errors)
+        except (TypeError, ValueError):
+            post_publish = None
+        if isinstance(post_publish, dict):
+            payload["post_publish"] = post_publish
     return payload
 
 

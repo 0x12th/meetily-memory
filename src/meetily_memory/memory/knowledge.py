@@ -1,6 +1,7 @@
 import hashlib
 import sqlite3
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -396,10 +397,16 @@ class KnowledgeRepository:
         aliases = [alias.alias for alias in state.list_topic_aliases(topic.stable_key)]
         return {"id": topic_id, "title": topic.title, "aliases": aliases}
 
-    def project_topic_aliases(self) -> None:
+    def project_topic_aliases(self, *, connection: sqlite3.Connection | None = None) -> None:
         aliases = self.context.user_state.list_topic_aliases()
-        with self.context.connection(self.context.index_path) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        connection_context = (
+            self.context.connection(self.context.index_path)
+            if connection is None
+            else nullcontext(connection)
+        )
+        with connection_context as conn:
+            if connection is None:
+                conn.execute("BEGIN IMMEDIATE")
             for alias in aliases:
                 conn.execute(
                     """
@@ -460,7 +467,8 @@ class KnowledgeRepository:
                 )
             else:
                 conn.execute("DELETE FROM topic_aliases")
-            conn.commit()
+            if connection is None:
+                conn.commit()
 
     def topic_memory(self, title: str, limit: int = 10) -> dict[str, Any]:
         with self.context.connection(self.context.index_path) as conn, sqlite_read_snapshot(conn):

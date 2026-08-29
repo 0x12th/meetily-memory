@@ -6,6 +6,7 @@ import subprocess
 from datetime import UTC, datetime
 from locale import getlocale
 from pathlib import Path
+from shlex import join as shell_join
 from typing import Annotated
 
 import typer
@@ -35,6 +36,7 @@ from meetily_memory.diagnostics import (
 )
 from meetily_memory.integrations import sync_obsidian_vault
 from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
+from meetily_memory.repositories.records import PostPublishIssue
 from meetily_memory.scanner.meetily_sqlite import (
     MeetilySQLiteScanner,
     ScanResult,
@@ -65,6 +67,57 @@ SOURCE_KIND = "meetily_sqlite"
 
 def _rebind_compensation_checkpoint(_name: str) -> None:
     return
+
+
+class PostPublishRefreshError(RuntimeError):
+    run_id: int
+    issues: tuple[PostPublishIssue, ...]
+
+    def __init__(self, run_id: int, issues: tuple[PostPublishIssue, ...]) -> None:
+        message = (
+            f"Index run #{run_id} completed, but post-publish work failed. "
+            "The searchable index is current; run `mm status` for a safe retry action."
+        )
+        super().__init__(message)
+        self.run_id = run_id
+        self.issues = issues
+
+
+def settings_update_issue(
+    source_uuid: str,
+    source_path: Path,
+    retry_command: tuple[str, ...],
+) -> PostPublishIssue:
+    return PostPublishIssue(
+        phase="settings_update",
+        error_type="SettingsUpdateError",
+        action="Retry the published source after fixing settings file access.",
+        source_uuid=source_uuid,
+        source_path=str(source_path),
+        retry_command=retry_command,
+    )
+
+
+def obsidian_sync_issue(
+    index_path: Path,
+    source_uuid: str,
+    source_path: Path,
+) -> PostPublishIssue:
+    return PostPublishIssue(
+        phase="obsidian_sync",
+        error_type="ObsidianSyncError",
+        action="Retry Obsidian sync for the published source after fixing its configuration.",
+        source_uuid=source_uuid,
+        source_path=str(source_path),
+        retry_command=(
+            "mm",
+            "--index",
+            str(index_path),
+            "refresh",
+            "--source",
+            str(source_path),
+        ),
+    )
 
 
 def require_canonical_source_path(path: Path) -> Path:
@@ -171,11 +224,11 @@ def scan_update(
     *,
     finalize: bool = True,
 ) -> tuple[dict[str, object], ScanResult]:
-    result = MeetilySQLiteScanner(index_path).scan(source_path, analyze=False, finalize=False)
-    repo = IndexRepository(index_path)
-
-    if finalize:
-        repo.complete_scan_run(result.run_id, utc_now_iso(), result)
+    result = MeetilySQLiteScanner(index_path).scan(
+        source_path,
+        analyze=False,
+        finalize=finalize,
+    )
 
     payload: dict[str, object] = {
         "source_uuid": result.source_uuid,
@@ -200,10 +253,34 @@ def print_update_payload(payload: dict[str, object]) -> None:
     console.print(f"chunks seen: {payload['chunks_seen']}")
 
 
+def post_publish_retry_commands(details: object) -> tuple[tuple[str, ...], ...]:
+    if not isinstance(details, dict):
+        return ()
+    issues = details.get("issues")
+    if not isinstance(issues, list):
+        return ()
+    retry_commands: set[tuple[str, ...]] = set()
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        command = issue.get("retry_command")
+        if not isinstance(command, list):
+            continue
+        typed_command: list[str] = []
+        for argument in command:
+            if not isinstance(argument, str):
+                break
+            typed_command.append(argument)
+        else:
+            retry_commands.add(tuple(typed_command))
+    return tuple(sorted(retry_commands))
+
+
 def print_scan_diagnostics(diagnostics: dict[str, dict[str, object] | None]) -> None:
     completed = diagnostics["last_completed_run"]
     failed = diagnostics["last_failed_run"]
     running = diagnostics["last_running_run"]
+    post_publish = diagnostics.get("last_post_publish_error")
     if completed:
         print_text_block(f"last completed run: #{completed['id']} at {completed['finished_at']}")
     if failed:
@@ -214,6 +291,14 @@ def print_scan_diagnostics(diagnostics: dict[str, dict[str, object] | None]) -> 
         started_at = running.get("started_at") or "unknown"
         phase = running.get("phase") or "unknown"
         print_text_block(f"running run: #{running['id']} since {started_at} during {phase}")
+    if post_publish:
+        print_text_block(
+            "post-publish error: "
+            f"run #{post_publish['id']} during {post_publish['phase']} "
+            f"({post_publish['error_message']})"
+        )
+        for retry_command in post_publish_retry_commands(post_publish.get("post_publish")):
+            print_text_block(f"post-publish retry: {shell_join(retry_command)}")
 
 
 def print_database_diagnostic(label: str, diagnostic: DatabaseDiagnostic) -> None:
@@ -267,15 +352,36 @@ def init(
             if source_path is None:
                 message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
                 raise typer.BadParameter(message)
-            payload, _ = scan_update(ctx.obj["index_path"], source_path)
+            payload, result = scan_update(ctx.obj["index_path"], source_path)
             source_uuid = str(payload["source_uuid"])
-            settings = update_app_settings(
-                settings_path=ctx.obj["settings_path"],
-                source_uuid=source_uuid,
-                source_path=None,
-                autosync_enabled=False,
-                last_update_at=utc_now_iso(),
-            )
+            repo = IndexRepository(ctx.obj["index_path"])
+            try:
+                settings = update_app_settings(
+                    settings_path=ctx.obj["settings_path"],
+                    source_uuid=source_uuid,
+                    source_path=None,
+                    autosync_enabled=False,
+                    last_update_at=utc_now_iso(),
+                )
+            except Exception:  # noqa: BLE001
+                settings = None
+            if settings is None:
+                issue = settings_update_issue(
+                    source_uuid,
+                    source_path,
+                    (
+                        "mm",
+                        "--index",
+                        str(ctx.obj["index_path"]),
+                        "init",
+                        "--source",
+                        str(source_path),
+                        "--no-autosync",
+                    ),
+                )
+                repo.record_post_publish_failure(result.run_id, (issue,))
+                raise PostPublishRefreshError(result.run_id, (issue,)) from None
+            repo.resolve_post_publish_failures(source_uuid, ("settings_update",))
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if should_enable_autosync:
@@ -620,16 +726,12 @@ def run_refresh(
         finalize=False,
     )
     repo = IndexRepository(index_path)
-    phase = "source_scan"
+    source_uuid = result.source_uuid
     obsidian_synced_at: str | None = None
-    try:
-        phase = "finalizing"
-        repo.update_scan_run_phase(result.run_id, phase)
-        source_uuid = result.source_uuid
-        obsidian_synced = False
-        if settings.obsidian.vault_path and settings.obsidian.sync_after_update:
-            phase = "obsidian_sync"
-            repo.update_scan_run_phase(result.run_id, phase)
+    obsidian_synced = False
+    failures: list[PostPublishIssue] = []
+    if settings.obsidian.vault_path and settings.obsidian.sync_after_update:
+        try:
             sync_obsidian_vault(
                 index_path,
                 Path(settings.obsidian.vault_path),
@@ -637,9 +739,11 @@ def run_refresh(
             )
             obsidian_synced_at = utc_now_iso()
             obsidian_synced = True
-        phase = "finalizing"
-        repo.update_scan_run_phase(result.run_id, phase)
-        repo.complete_scan_run(result.run_id, utc_now_iso(), result)
+        except Exception:  # noqa: BLE001
+            failures.append(obsidian_sync_issue(index_path, source_uuid, source_path))
+        else:
+            repo.resolve_post_publish_failures(source_uuid, ("obsidian_sync",))
+    try:
         update_app_settings(
             settings_path=settings_path,
             expected_obsidian=settings.obsidian if obsidian_synced_at else None,
@@ -648,17 +752,22 @@ def run_refresh(
             source_path=None,
             last_update_at=utc_now_iso(),
         )
-        if discard_previous_backup:
-            previous_backup.unlink(missing_ok=True)
-    except Exception as exc:
-        repo.fail_scan_run(
-            result.run_id,
-            utc_now_iso(),
-            phase,
-            result,
-            type(exc).__name__,
+    except Exception:  # noqa: BLE001
+        failures.append(
+            settings_update_issue(
+                source_uuid,
+                source_path,
+                ("mm", "--index", str(index_path), "refresh", "--source", str(source_path)),
+            )
         )
-        raise
+    else:
+        repo.resolve_post_publish_failures(source_uuid, ("settings_update",))
+    if failures:
+        issues = tuple(failures)
+        repo.record_post_publish_failure(result.run_id, issues)
+        raise PostPublishRefreshError(result.run_id, issues) from None
+    if discard_previous_backup:
+        previous_backup.unlink(missing_ok=True)
     return payload, obsidian_synced
 
 

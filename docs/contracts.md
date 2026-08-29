@@ -63,6 +63,58 @@ identity with SQLite `mode=rw`: they do not create a directory/database or migra
 missing, replaced, or retargeted state path fails with restore-state guidance before commit instead
 of writing a new database or another workspace/global state.
 
+## Atomic refresh publication
+
+An ordinary schema-v7 refresh publishes one incremental projection transaction; it does not copy or
+rebuild the complete index. Constructing `IndexRepository` never heals or commits pending source
+paths. The scanner first commits a durable `scan_runs.status = 'running'` row. It then uses one
+connection and one `BEGIN IMMEDIATE` unit of work for every pending source-path projection,
+meeting and chunk upserts, FTS, people, structured entities, knowledge nodes and edges, deletion
+reconciliation, state-owned topic-alias projection, and the same run's `completed` status and
+statistics. There are no per-meeting commits in this unit of work. An exception before commit rolls
+back all derived changes and is followed by a separate durable `failed` update with the safe local
+phase; the exception text is never persisted.
+
+The unit of work uses transient WAL when the index normally uses `DELETE` journaling. This lets
+read-only search ignore uncommitted frames after abrupt process death and continue to see the old
+completed snapshot. A durable sibling marker records that WAL is temporary. Clean success or
+handled rollback checkpoints WAL, restores `DELETE`, and removes the marker and SQLite sidecars. If
+the process dies, the marker and WAL may remain temporarily; search still sees the old commit, and
+the next refresh recovers, retries, restores `DELETE`, and removes all temporary files without manual
+cleanup. An explicitly pre-existing persistent WAL mode has no transient marker and is preserved,
+which keeps task-08 long-lived read snapshots compatible. Readers that overlap a normal refresh see
+one coherent old or new SQLite snapshot, never an in-progress projection. Meetily source databases
+remain opened read-only.
+
+A completed projection is committed before settings, Obsidian, or other optional integrations.
+Those operations still run while the caller holds `refresh.lock`, but their failures cannot change the
+run back to `failed`. Instead the completed row records a sanitized `post_publish_*_failed` phase,
+`index_status = completed`, a separate post-publish status, the source UUID and canonical source
+path, and a structured supported retry command. Raw integration exceptions are neither chained nor
+persisted. `mm status` exposes the latest unresolved event as `last_post_publish_error`; a successful
+operation resolves only events with the same source UUID and phase. A completed refresh for another
+source, or a refresh that does not attempt the failed Obsidian phase, leaves the event visible.
+
+### Local design comparison (2026-08-29)
+
+Both candidates were measured on the same generated Meetily fixture and current schema v7. The
+fixture contained 500 meetings, ten transcripts per meeting plus summaries and notes (6,000 indexed
+chunks initially). The incremental refresh changed 40 meetings, deleted 10, added 10, and ran real
+structured-entity and knowledge projection. The generated source was 1,007,616 bytes. The baseline
+index was 11,010,048 bytes and the published index was 11,603,968 bytes. Seven runs per candidate
+were alternated in the same local macOS workspace; times below are wall-clock medians, with the
+observed min/max range, so absolute time is environment-specific.
+
+| Candidate | Refresh time | Peak index family | Extra disk / baseline | Rollback and recovery complexity |
+|---|---:|---:|---:|---|
+| One projection transaction with transient WAL | 3.528 s (3.511–3.532) | 17,017,495 B (`1.546×` baseline) | `0.546×` | SQLite rollback for handled faults; one durable transient-WAL marker makes hard-crash retry and cleanup explicit. No index copy, backup, validation swap, or generation handoff on an ordinary refresh. |
+| Copy to staging, update, validate, fsync, retain previous copy, atomically replace | 3.614 s (3.577–3.635) | 33,624,064 B (`3.054×` baseline) | `2.054×` | Must recover/validate `.next`, coordinate schema-v7 generation/state ownership, fsync stage and directory, retain/expire the previous index, handle swap boundaries and stale artifacts, and reconcile the durable run across two files. |
+
+Staging was 2.4% slower in this workload and used about 3.76 times as much additional disk. The
+single-transaction design is therefore the schema-v7 incremental path. Side-by-side rebuild and swap
+remain limited to incompatible format upgrades, preserving the task-07 safety contract; these
+measurements do not justify a full rebuild or full-file copy on each incremental refresh.
+
 ## User state migration
 
 Schema v4 makes every structured entity require `source_chunk_id` and changes deletion to

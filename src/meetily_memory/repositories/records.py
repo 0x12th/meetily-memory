@@ -22,6 +22,16 @@ class MeetingRecord:
 
 
 @dataclass(frozen=True)
+class PostPublishIssue:
+    phase: str
+    error_type: str
+    action: str
+    source_uuid: str
+    source_path: str | None
+    retry_command: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ChunkRecord:
     external_id: str | None
     kind: str
@@ -37,6 +47,7 @@ class ChunkRecord:
 
 
 class ScanRunStats(Protocol):
+    source_id: int
     meetings_seen: int
     meetings_inserted: int
     meetings_updated: int

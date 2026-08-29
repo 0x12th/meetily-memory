@@ -1,4 +1,5 @@
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -198,9 +199,16 @@ class StructuredEntityRepository:
         meeting_id: int,
         entities: Iterable[StructuredEntity],
         now: str,
+        *,
+        connection: Any | None = None,
     ) -> dict[str, int]:
         counts = empty_entity_counts()
-        with index_connection(self.context.index_path) as conn:
+        connection_context = (
+            index_connection(self.context.index_path)
+            if connection is None
+            else nullcontext(connection)
+        )
+        with connection_context as conn:
             self.context.delete_structured_knowledge(conn, meeting_id)
             self.context.delete_structured_entities(conn, meeting_id)
             for entity in entities:
@@ -222,7 +230,8 @@ class StructuredEntityRepository:
                 )
                 counts[entity.kind] += 1
             self.context.sync_meeting_knowledge(conn, meeting_id, now)
-            conn.commit()
+            if connection is None:
+                conn.commit()
             return counts
 
     def list_structured_entities(

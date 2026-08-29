@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -40,10 +41,24 @@ class StructureAnalyzer:
     def __init__(self, repo: IndexRepository) -> None:
         self.repo = repo
 
-    def analyze_meeting(self, meeting_id: int) -> StructureAnalysisResult:
-        chunks = self.repo.get_chunks_for_meeting(meeting_id)
+    def analyze_meeting(
+        self,
+        meeting_id: int,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> StructureAnalysisResult:
+        chunks = (
+            self.repo.get_chunks_for_meeting(meeting_id)
+            if connection is None
+            else [dict(row) for row in self.repo.meetings.chunk_rows(connection, meeting_id)]
+        )
         entities = extract_structured_entities(chunks)
-        counts = self.repo.replace_structured_entities(meeting_id, entities, utc_now())
+        counts = self.repo.replace_structured_entities(
+            meeting_id,
+            entities,
+            utc_now(),
+            connection=connection,
+        )
         result = StructureAnalysisResult(meetings_analyzed=1)
         result.add_counts(counts)
         return result

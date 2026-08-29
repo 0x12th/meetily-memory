@@ -1,5 +1,6 @@
 import sqlite3
 from collections.abc import Iterable, Mapping
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
@@ -13,6 +14,7 @@ from meetily_memory.db.schema import (
     IndexRebuildRequiredError,
     existing_index_connection,
     index_connection,
+    index_projection_transaction,
     sqlite_read_snapshot,
 )
 from meetily_memory.domain import (
@@ -40,7 +42,12 @@ from meetily_memory.memory.entities import (
 from meetily_memory.memory.knowledge import KnowledgeContext, KnowledgeRepository
 from meetily_memory.memory.task_status import TaskStatusContext, TaskStatusRepository
 from meetily_memory.repositories.meetings import MeetingsContext, MeetingsRepository
-from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, ScanRunStats
+from meetily_memory.repositories.records import (
+    ChunkRecord,
+    MeetingRecord,
+    PostPublishIssue,
+    ScanRunStats,
+)
 from meetily_memory.repositories.search import EvidenceResolutionError, SearchRepository
 from meetily_memory.user_state import (
     SourcePathClaim,
@@ -117,7 +124,6 @@ class IndexRepository:
                     self.state_path,
                     now=now,
                 )
-                self.heal_pending_source_path_projections()
                 for ledger_path in ledger_paths:
                     self.register_state_owned_generation_path(ledger_path)
         self.meetings = MeetingsRepository(
@@ -190,15 +196,24 @@ class IndexRepository:
     def rows_to_dicts(self, rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
         return rows_to_dicts(rows)
 
-    def upsert_source(
+    def upsert_source(  # noqa: PLR0913
         self,
         source_uuid: str,
         kind: str,
         path: str,
         now: str,
         label: str | None = None,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> int:
-        return self.meetings.upsert_source(source_uuid, kind, path, now, label)
+        return self.meetings.upsert_source(
+            source_uuid,
+            kind,
+            path,
+            now,
+            label,
+            connection=connection,
+        )
 
     def get_source(self, kind: str, path: str) -> dict[str, Any] | None:
         return self.meetings.get_source(kind, path)
@@ -304,87 +319,117 @@ class IndexRepository:
         return {str(row["external_id"]) for row in rows}
 
     def heal_pending_source_path_projection(self, source_uuid: str) -> set[str]:
-        return self.heal_pending_source_path_projections().get(source_uuid, set())
+        if self.requires_rebuild:
+            return set()
+        claim = self.user_state.get_pending_source_path_claim(source_uuid)
+        if claim is None:
+            return set()
+        return self._heal_pending_source_path_claims((claim,)).get(source_uuid, set())
 
-    def heal_pending_source_path_projections(self) -> dict[str, set[str]]:  # noqa: C901
-        claims = self.user_state.list_pending_source_path_claims()
-        if not claims or self.requires_rebuild:
+    def heal_pending_source_path_projections(self) -> dict[str, set[str]]:
+        if self.requires_rebuild:
             return {}
-        verified_claims: list[SourcePathClaim] = []
-        external_ids: dict[str, set[str]] = {}
+        claims = self.user_state.list_pending_source_path_claims()
+        return self._heal_pending_source_path_claims(claims)
+
+    def project_pending_source_path_projections(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[SourcePathClaim, ...]:
+        """Project every current pending claim without committing either database."""
+        if self.requires_rebuild:
+            return ()
+        if not connection.in_transaction:
+            message = "Pending source paths require the active projection transaction."
+            raise RuntimeError(message)
+        claims = self.user_state.list_pending_source_path_claims()
+        verified_claims, _external_ids = self._project_source_path_claims(connection, claims)
+        return verified_claims
+
+    def _heal_pending_source_path_claims(
+        self,
+        claims: tuple[SourcePathClaim, ...],
+    ) -> dict[str, set[str]]:
+        if not claims:
+            return {}
         with index_connection(self.index_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            for claim in claims:
-                self._require_current_source_path_claim(claim)
-                source = conn.execute(
-                    "SELECT id, kind, path FROM sources WHERE source_uuid = ?",
-                    (claim.source_uuid,),
-                ).fetchone()
-                if source is None:
-                    continue
-                if str(source["kind"]) != claim.kind:
-                    message = (
-                        f"Source UUID {claim.source_uuid} is registered with a different kind."
-                    )
-                    raise ValueError(message)
-                source_id = int(source["id"])
-                projected_path = str(source["path"])
-                if projected_path not in {claim.projected_path, claim.claimed_path}:
-                    message = (
-                        f"Source UUID {claim.source_uuid} is projected at unexpected path "
-                        f"{projected_path}."
-                    )
-                    raise RuntimeError(message)
-                path_owner = conn.execute(
-                    "SELECT id FROM sources WHERE kind = ? AND path = ?",
-                    (claim.kind, claim.claimed_path),
-                ).fetchone()
-                if path_owner is not None and int(path_owner["id"]) != source_id:
-                    message = "The pending source target is projected as another source."
-                    raise ValueError(message)
-                rows = conn.execute(
-                    "SELECT external_id FROM meetings WHERE source_id = ?",
-                    (source_id,),
-                ).fetchall()
-                if projected_path != claim.claimed_path:
-                    cursor = conn.execute(
-                        """
-                        UPDATE sources
-                        SET path = ?
-                        WHERE id = ? AND source_uuid = ? AND kind = ? AND path = ?
-                        """,
-                        (
-                            claim.claimed_path,
-                            source_id,
-                            claim.source_uuid,
-                            claim.kind,
-                            projected_path,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        message = (
-                            f"Source UUID {claim.source_uuid} projection changed during recovery."
-                        )
-                        raise RuntimeError(message)
-                conn.execute(
-                    "UPDATE meetings SET source_path = ? WHERE source_id = ?",
-                    (claim.claimed_path, source_id),
-                )
-                self._require_current_source_path_claim(claim)
-                verified_claims.append(claim)
-                external_ids[claim.source_uuid] = {str(row["external_id"]) for row in rows}
-            for claim in verified_claims:
-                self._require_current_source_path_claim(claim)
+            verified_claims, external_ids = self._project_source_path_claims(conn, claims)
             conn.commit()
-        finalized = tuple(verified_claims)
-        if finalized and not self.user_state.finalize_source_path_claims(finalized):
-            source_uuids = ", ".join(claim.source_uuid for claim in finalized)
+        if verified_claims and not self.user_state.finalize_source_path_claims(verified_claims):
+            source_uuids = ", ".join(claim.source_uuid for claim in verified_claims)
             message = (
                 "Source path claims changed before atomic finalization for UUID(s): "
                 f"{source_uuids}."
             )
             raise RuntimeError(message)
         return external_ids
+
+    def _project_source_path_claims(
+        self,
+        conn: sqlite3.Connection,
+        claims: tuple[SourcePathClaim, ...],
+    ) -> tuple[tuple[SourcePathClaim, ...], dict[str, set[str]]]:
+        verified_claims: list[SourcePathClaim] = []
+        external_ids: dict[str, set[str]] = {}
+        for claim in claims:
+            self._require_current_source_path_claim(claim)
+            source = conn.execute(
+                "SELECT id, kind, path FROM sources WHERE source_uuid = ?",
+                (claim.source_uuid,),
+            ).fetchone()
+            if source is None:
+                continue
+            if str(source["kind"]) != claim.kind:
+                message = f"Source UUID {claim.source_uuid} is registered with a different kind."
+                raise ValueError(message)
+            source_id = int(source["id"])
+            projected_path = str(source["path"])
+            if projected_path not in {claim.projected_path, claim.claimed_path}:
+                message = (
+                    f"Source UUID {claim.source_uuid} is projected at unexpected path "
+                    f"{projected_path}."
+                )
+                raise RuntimeError(message)
+            path_owner = conn.execute(
+                "SELECT id FROM sources WHERE kind = ? AND path = ?",
+                (claim.kind, claim.claimed_path),
+            ).fetchone()
+            if path_owner is not None and int(path_owner["id"]) != source_id:
+                message = "The pending source target is projected as another source."
+                raise ValueError(message)
+            rows = conn.execute(
+                "SELECT external_id FROM meetings WHERE source_id = ?",
+                (source_id,),
+            ).fetchall()
+            if projected_path != claim.claimed_path:
+                cursor = conn.execute(
+                    """
+                    UPDATE sources
+                    SET path = ?
+                    WHERE id = ? AND source_uuid = ? AND kind = ? AND path = ?
+                    """,
+                    (
+                        claim.claimed_path,
+                        source_id,
+                        claim.source_uuid,
+                        claim.kind,
+                        projected_path,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    message = f"Source UUID {claim.source_uuid} projection changed during recovery."
+                    raise RuntimeError(message)
+            conn.execute(
+                "UPDATE meetings SET source_path = ? WHERE source_id = ?",
+                (claim.claimed_path, source_id),
+            )
+            self._require_current_source_path_claim(claim)
+            verified_claims.append(claim)
+            external_ids[claim.source_uuid] = {str(row["external_id"]) for row in rows}
+        for claim in verified_claims:
+            self._require_current_source_path_claim(claim)
+        return tuple(verified_claims), external_ids
 
     def register_state_owned_generation_path(self, ledger_path: Path) -> str:
         return register_state_owned_index_generation(
@@ -582,8 +627,14 @@ class IndexRepository:
         external_id: str,
         *,
         filters: MeetingSearchFilters | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any] | None:
-        return self.meetings.get_meeting_by_source_id(source_id, external_id, filters=filters)
+        return self.meetings.get_meeting_by_source_id(
+            source_id,
+            external_id,
+            filters=filters,
+            connection=connection,
+        )
 
     def upsert_meeting_with_chunks(
         self,
@@ -591,11 +642,27 @@ class IndexRepository:
         chunks: Iterable[ChunkRecord],
         *,
         force: bool = False,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[int, bool, int]:
-        return self.meetings.upsert_meeting_with_chunks(meeting, chunks, force=force)
+        return self.meetings.upsert_meeting_with_chunks(
+            meeting,
+            chunks,
+            force=force,
+            connection=connection,
+        )
 
-    def reconcile_source_meetings(self, source_id: int, external_ids: set[str]) -> int:
-        return self.meetings.reconcile_source_meetings(source_id, external_ids)
+    def reconcile_source_meetings(
+        self,
+        source_id: int,
+        external_ids: set[str],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
+        return self.meetings.reconcile_source_meetings(
+            source_id,
+            external_ids,
+            connection=connection,
+        )
 
     def _delete_structured_entities(self, conn: sqlite3.Connection, meeting_id: int) -> None:
         self.meetings.delete_structured_entities(conn, meeting_id)
@@ -622,8 +689,15 @@ class IndexRepository:
         meeting_id: int,
         entities: Iterable[StructuredEntity],
         now: str,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, int]:
-        return self.entities.replace_structured_entities(meeting_id, entities, now)
+        return self.entities.replace_structured_entities(
+            meeting_id,
+            entities,
+            now,
+            connection=connection,
+        )
 
     def list_meeting_ids(self) -> list[int]:
         return self.meetings.list_meeting_ids()
@@ -675,8 +749,8 @@ class IndexRepository:
     def remove_topic_aliases(self, aliases: Iterable[str]) -> tuple[str, ...]:
         return self.knowledge.remove_topic_aliases(aliases)
 
-    def project_topic_aliases(self) -> None:
-        self.knowledge.project_topic_aliases()
+    def project_topic_aliases(self, *, connection: sqlite3.Connection | None = None) -> None:
+        self.knowledge.project_topic_aliases(connection=connection)
 
     def topic_memory(self, title: str, limit: int = 10) -> dict[str, Any]:
         return self.knowledge.topic_memory(title, limit)
@@ -877,14 +951,11 @@ class IndexRepository:
     def dominant_meeting_language(self) -> str | None:
         return self.meetings.dominant_meeting_language()
 
-    def begin_source_scan(
-        self,
-        source_uuid: str,
-        kind: str,
-        path: str,
-        started_at: str,
-    ) -> tuple[int, int]:
-        return self.meetings.begin_source_scan(source_uuid, kind, path, started_at)
+    def projection_transaction(self) -> AbstractContextManager[sqlite3.Connection]:
+        return index_projection_transaction(self.index_path)
+
+    def begin_source_scan(self, source_uuid: str, started_at: str) -> tuple[int, int]:
+        return self.meetings.begin_source_scan(source_uuid, started_at)
 
     def fail_abandoned_scan_runs(self, finished_at: str) -> None:
         self.meetings.fail_abandoned_scan_runs(finished_at)
@@ -892,8 +963,20 @@ class IndexRepository:
     def update_scan_run_phase(self, run_id: int, phase: str) -> None:
         self.meetings.update_scan_run_phase(run_id, phase)
 
-    def complete_scan_run(self, run_id: int, finished_at: str, result: ScanRunStats) -> None:
-        self.meetings.complete_scan_run(run_id, finished_at, result)
+    def complete_scan_run(
+        self,
+        run_id: int,
+        finished_at: str,
+        result: ScanRunStats,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        self.meetings.complete_scan_run(
+            run_id,
+            finished_at,
+            result,
+            connection=connection,
+        )
 
     def fail_scan_run(
         self,
@@ -904,6 +987,20 @@ class IndexRepository:
         error_type: str,
     ) -> None:
         self.meetings.fail_scan_run(run_id, finished_at, phase, result, error_type)
+
+    def record_post_publish_failure(
+        self,
+        run_id: int,
+        issues: tuple[PostPublishIssue, ...],
+    ) -> None:
+        self.meetings.record_post_publish_failure(run_id, issues)
+
+    def resolve_post_publish_failures(
+        self,
+        source_uuid: str,
+        phases: tuple[str, ...],
+    ) -> None:
+        self.meetings.resolve_post_publish_failures(source_uuid, phases)
 
     def scan_run_diagnostics(self) -> dict[str, dict[str, Any] | None]:
         return self.meetings.scan_run_diagnostics()

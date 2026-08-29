@@ -12,13 +12,15 @@ from typing import Any
 
 from meetily_memory.config.paths import canonical_source_path
 from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
+from meetily_memory.db.schema import IndexProjectionCleanupError
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
 from meetily_memory.repositories.index import IndexRepository
-from meetily_memory.repositories.records import ChunkRecord, MeetingRecord
+from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, PostPublishIssue
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
 from meetily_memory.structure_analyzer import StructureAnalyzer
 from meetily_memory.user_state import (
     AmbiguousSourceIdentityError,
+    SourcePathClaim,
     UserStateRepository,
     prepare_index_user_state,
     recover_and_validate_index,
@@ -28,6 +30,10 @@ MEETING_NORMALIZATION_VERSION = 2
 
 
 def _rebuild_checkpoint(_name: str) -> None:
+    return
+
+
+def _scan_checkpoint(_name: str) -> None:
     return
 
 
@@ -58,6 +64,10 @@ class RebuildSource:
     projected_path: str
     pending_revision: int | None
     requested: bool
+
+
+class SourcePathProjectionFinalizeError(RuntimeError):
+    """The index committed, but pending source binding finalization did not."""
 
 
 class MeetilySQLiteScanner:
@@ -110,7 +120,6 @@ class MeetilySQLiteScanner:
                     started_at,
                     rebuild_sources,
                     force=force,
-                    finalize=finalize,
                 )
             if source_uuid is None:
                 source_uuid = user_state.resolve_source(
@@ -126,14 +135,12 @@ class MeetilySQLiteScanner:
                 started_at,
                 force=force,
                 analyze=analyze,
-                finalize=finalize,
             )
-            repo.project_topic_aliases()
         if finalize:
             self._discard_confirmed_backup()
         return result
 
-    def _scan_repository(  # noqa: PLR0913
+    def _scan_repository(  # noqa: PLR0913, PLR0915
         self,
         conn: Any,
         repo: IndexRepository,
@@ -143,54 +150,195 @@ class MeetilySQLiteScanner:
         *,
         force: bool,
         analyze: bool,
-        finalize: bool,
+        heal_pending_paths: bool = True,
     ) -> ScanResult:
         result = ScanResult(source_uuid=source_uuid)
-        source_id, run_id = repo.begin_source_scan(
-            source_uuid,
-            self.source_kind,
-            str(source_path),
-            started_at,
-        )
+        source_id, run_id = repo.begin_source_scan(source_uuid, started_at)
         result.source_id = source_id
         result.run_id = run_id
+        phase = "source_scan"
         seen_external_ids: set[str] = set()
         structure_analyzer = StructureAnalyzer(repo)
+        pending_claims: tuple[SourcePathClaim, ...] = ()
 
         try:
-            for upstream in self._read_meetings(conn):
-                result.meetings_seen += 1
-                meeting, chunks = normalize_meeting(source_id, source_path, upstream, utc_now())
-                result.chunks_seen += len(chunks)
-                existing = repo.get_meeting_by_source_id(source_id, meeting.external_id)
-                meeting_id, updated, inserted_chunks = repo.upsert_meeting_with_chunks(
-                    meeting,
-                    chunks,
-                    force=force,
+            _scan_checkpoint("after_running")
+            with repo.projection_transaction() as projection:
+                if heal_pending_paths:
+                    pending_claims = repo.project_pending_source_path_projections(projection)
+                    _scan_checkpoint("after_pending_path_projection")
+                source_id = repo.upsert_source(
+                    source_uuid,
+                    self.source_kind,
+                    str(source_path),
+                    started_at,
+                    connection=projection,
                 )
-                if analyze and (existing is None or updated):
-                    structure_analyzer.analyze_meeting(meeting_id)
-                    result.meetings_analyzed += 1
-                result.chunks_inserted += inserted_chunks
-                if existing is None:
-                    result.meetings_inserted += 1
-                elif updated:
-                    result.meetings_updated += 1
-                    result.chunks_updated += inserted_chunks
-                seen_external_ids.add(meeting.external_id)
-            repo.reconcile_source_meetings(source_id, seen_external_ids)
-        except Exception as exc:
+                result.source_id = source_id
+                for meeting_number, upstream in enumerate(self._read_meetings(conn), start=1):
+                    _scan_checkpoint(f"before_meeting:{meeting_number}")
+                    result.meetings_seen += 1
+                    meeting, chunks = normalize_meeting(
+                        source_id,
+                        source_path,
+                        upstream,
+                        utc_now(),
+                    )
+                    result.chunks_seen += len(chunks)
+                    existing = repo.get_meeting_by_source_id(
+                        source_id,
+                        meeting.external_id,
+                        connection=projection,
+                    )
+                    meeting_id, updated, inserted_chunks = repo.upsert_meeting_with_chunks(
+                        meeting,
+                        chunks,
+                        force=force,
+                        connection=projection,
+                    )
+                    if analyze and (existing is None or updated):
+                        structure_analyzer.analyze_meeting(
+                            meeting_id,
+                            connection=projection,
+                        )
+                        result.meetings_analyzed += 1
+                    result.chunks_inserted += inserted_chunks
+                    if existing is None:
+                        result.meetings_inserted += 1
+                    elif updated:
+                        result.meetings_updated += 1
+                        result.chunks_updated += inserted_chunks
+                    seen_external_ids.add(meeting.external_id)
+                phase = "reconciliation"
+                _scan_checkpoint("before_reconciliation")
+                repo.reconcile_source_meetings(
+                    source_id,
+                    seen_external_ids,
+                    connection=projection,
+                )
+                phase = "topic_alias_projection"
+                _scan_checkpoint("before_topic_alias_projection")
+                repo.project_topic_aliases(connection=projection)
+                phase = "publishing"
+                repo.complete_scan_run(
+                    result.run_id,
+                    utc_now(),
+                    result,
+                    connection=projection,
+                )
+                _scan_checkpoint("before_publish")
+        except IndexProjectionCleanupError:
+            issues = [self._post_publish_issue("index_cleanup", source_uuid, source_path)]
+            claims_finalized = self._try_finalize_published_source_path_claims(
+                repo,
+                pending_claims,
+            )
+            if claims_finalized:
+                self._resolve_successful_post_publish_phases(
+                    repo,
+                    source_uuid,
+                    pending_claims,
+                    index_cleanup=False,
+                )
+            else:
+                issues.append(
+                    self._post_publish_issue("source_path_finalize", source_uuid, source_path)
+                )
+            repo.record_post_publish_failure(result.run_id, tuple(issues))
+            raise
+        except BaseException as exc:
             repo.fail_scan_run(
                 result.run_id,
                 utc_now(),
-                "source_scan",
+                phase,
                 result,
                 type(exc).__name__,
             )
             raise
-        if finalize:
-            repo.complete_scan_run(result.run_id, utc_now(), result)
+        claims_finalized = self._try_finalize_published_source_path_claims(repo, pending_claims)
+        if not claims_finalized:
+            repo.record_post_publish_failure(
+                result.run_id,
+                (self._post_publish_issue("source_path_finalize", source_uuid, source_path),),
+            )
+            message = (
+                "Index projection committed, but source binding finalization failed. "
+                "Rerun refresh to retry the state handoff."
+            )
+            raise SourcePathProjectionFinalizeError(message) from None
+        self._resolve_successful_post_publish_phases(
+            repo,
+            source_uuid,
+            pending_claims,
+            index_cleanup=True,
+        )
         return result
+
+    def _try_finalize_published_source_path_claims(
+        self,
+        repo: IndexRepository,
+        claims: tuple[SourcePathClaim, ...],
+    ) -> bool:
+        try:
+            self._finalize_published_source_path_claims(repo, claims)
+        except BaseException:  # noqa: BLE001
+            return False
+        return True
+
+    def _finalize_published_source_path_claims(
+        self,
+        repo: IndexRepository,
+        claims: tuple[SourcePathClaim, ...],
+    ) -> None:
+        if claims and not repo.user_state.finalize_source_path_claims(claims):
+            message = "Pending source path claims changed after index publication."
+            raise RuntimeError(message)
+
+    def _resolve_successful_post_publish_phases(
+        self,
+        repo: IndexRepository,
+        source_uuid: str,
+        claims: tuple[SourcePathClaim, ...],
+        *,
+        index_cleanup: bool,
+    ) -> None:
+        finalized_source_uuids = {claim.source_uuid for claim in claims}
+        finalized_source_uuids.add(source_uuid)
+        for finalized_source_uuid in sorted(finalized_source_uuids):
+            phases = ["source_path_finalize"]
+            if index_cleanup and finalized_source_uuid == source_uuid:
+                phases.insert(0, "index_cleanup")
+            repo.resolve_post_publish_failures(finalized_source_uuid, tuple(phases))
+
+    def _post_publish_issue(
+        self,
+        phase: str,
+        source_uuid: str,
+        source_path: Path,
+    ) -> PostPublishIssue:
+        error_types = {
+            "index_cleanup": "IndexProjectionCleanupError",
+            "source_path_finalize": "SourcePathProjectionFinalizeError",
+        }
+        actions = {
+            "index_cleanup": "Retry refresh to clean transient SQLite files.",
+            "source_path_finalize": "Retry refresh to finalize pending source bindings.",
+        }
+        return PostPublishIssue(
+            phase=phase,
+            error_type=error_types[phase],
+            action=actions[phase],
+            source_uuid=source_uuid,
+            source_path=str(source_path),
+            retry_command=(
+                "mm",
+                "--index",
+                str(self.index_path),
+                "refresh",
+                "--source",
+                str(source_path),
+            ),
+        )
 
     def _preflight_legacy_rebuild_sources(
         self,
@@ -225,7 +373,6 @@ class MeetilySQLiteScanner:
         rebuild_sources: tuple[RebuildSource, ...],
         *,
         force: bool,
-        finalize: bool,
     ) -> ScanResult:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -246,7 +393,6 @@ class MeetilySQLiteScanner:
                 raise RuntimeError(message)
             requested_result: ScanResult | None = None
             for rebuild_source in rebuild_sources:
-                source_finalize = finalize if rebuild_source.requested else True
                 if rebuild_source.requested:
                     result = self._scan_repository(
                         source_conn,
@@ -256,7 +402,7 @@ class MeetilySQLiteScanner:
                         started_at,
                         force=force,
                         analyze=True,
-                        finalize=source_finalize,
+                        heal_pending_paths=False,
                     )
                     requested_result = result
                     continue
@@ -270,7 +416,7 @@ class MeetilySQLiteScanner:
                         started_at,
                         force=force,
                         analyze=True,
-                        finalize=source_finalize,
+                        heal_pending_paths=False,
                     )
             if requested_result is None:
                 message = "The requested source was not included in the rebuilt index."

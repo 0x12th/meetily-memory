@@ -9,13 +9,12 @@ from typing import Protocol
 import pytest
 from typer.testing import CliRunner
 
+import meetily_memory.scanner.meetily_sqlite as scanner_module
 from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.json_codec import loads_json
 from meetily_memory.refresh_lock import RefreshLock
-from meetily_memory.repositories.meetings import MeetingsRepository
-from meetily_memory.repositories.records import ChunkRecord, MeetingRecord
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.structure_analyzer import StructureAnalyzer
 from meetily_memory.tagging import TagService
@@ -358,24 +357,12 @@ def test_failed_refresh_records_phase_preserves_last_update_and_recovers(
     settings["last_update_at"] = "2020-01-01T00:00:00Z"
     settings_path.write_text(json.dumps(settings) + "\n", encoding="utf-8")
 
-    original_upsert = MeetingsRepository.upsert_meeting_with_chunks
-    calls = 0
-
-    def fail_after_first_meeting(
-        self: MeetingsRepository,
-        meeting: MeetingRecord,
-        chunks: Iterable[ChunkRecord],
-        *,
-        force: bool = False,
-    ) -> tuple[int, bool, int]:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
+    def fail_before_second_meeting(checkpoint: str) -> None:
+        if checkpoint == "before_meeting:2":
             error_message = "credential=secret transcript=private"
             raise RuntimeError(error_message)
-        return original_upsert(self, meeting, chunks, force=force)
 
-    monkeypatch.setattr(MeetingsRepository, "upsert_meeting_with_chunks", fail_after_first_meeting)
+    monkeypatch.setattr(scanner_module, "_scan_checkpoint", fail_before_second_meeting)
     failed = runner.invoke(
         app,
         ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
@@ -394,14 +381,14 @@ def test_failed_refresh_records_phase_preserves_last_update_and_recovers(
     assert failed_run["finished_at"] is not None
     assert "RuntimeError" in failed_run["error_message"]
     assert "secret" not in failed_run["error_message"]
-    assert failed_run["meetings_seen"] == 2
+    assert failed_run["meetings_seen"] == 1
 
     status = runner.invoke(app, ["--index", str(index_path), "status", "--json"], env=env)
     status_payload = loads_json(status.stdout)
     assert status_payload["last_completed_run"]["status"] == "completed"
     assert status_payload["last_failed_run"]["id"] == failed_run["id"]
 
-    monkeypatch.setattr(MeetingsRepository, "upsert_meeting_with_chunks", original_upsert)
+    monkeypatch.setattr(scanner_module, "_scan_checkpoint", lambda _checkpoint: None)
     recovered = runner.invoke(
         app,
         ["--index", str(index_path), "refresh", "--source", str(meetily_db)],

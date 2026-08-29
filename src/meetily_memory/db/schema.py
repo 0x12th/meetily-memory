@@ -1,7 +1,9 @@
+import os
 import sqlite3
 from collections.abc import Callable, Generator
-from contextlib import AbstractContextManager, closing, contextmanager
+from contextlib import AbstractContextManager, closing, contextmanager, suppress
 from pathlib import Path
+from time import monotonic, sleep
 
 from meetily_memory.db.migrations import (
     CURRENT_SCHEMA_VERSION,
@@ -11,6 +13,12 @@ from meetily_memory.db.migrations import (
 )
 
 IndexConnectionFactory = Callable[[Path], AbstractContextManager[sqlite3.Connection]]
+TRANSIENT_WAL_CLEANUP_TIMEOUT_SECONDS = 5.0
+TRANSIENT_WAL_CLEANUP_RETRY_SECONDS = 0.01
+INDEX_PROJECTION_CLEANUP_MESSAGE = (
+    "Index projection committed, but transient SQLite cleanup failed. "
+    "The published snapshot is usable; rerun refresh to retry cleanup."
+)
 
 
 class IndexRebuildRequiredError(RuntimeError):
@@ -19,6 +27,10 @@ class IndexRebuildRequiredError(RuntimeError):
 
 class IndexReadError(RuntimeError):
     pass
+
+
+class IndexProjectionCleanupError(RuntimeError):
+    """The projection committed, but transient WAL cleanup did not finish."""
 
 
 def missing_user_state_message(state_path: Path) -> str:
@@ -54,6 +66,136 @@ def index_connection(index_path: Path) -> Generator[sqlite3.Connection, None, No
         conn.execute("PRAGMA foreign_keys=ON")
         ensure_schema(conn)
         yield conn
+
+
+@contextmanager
+def index_projection_transaction(  # noqa: C901, PLR0912, PLR0915
+    index_path: Path,
+) -> Generator[sqlite3.Connection, None, None]:
+    """Publish one projection commit while keeping crash-time readers on the old snapshot."""
+    index_path = Path(index_path)
+    marker_path = transient_wal_marker_path(index_path)
+    published = False
+    restore_delete_mode = False
+    post_commit_cleanup_failed = False
+    try:
+        with index_connection(index_path) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            initial_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).casefold()
+            restore_delete_mode = initial_mode != "wal" or marker_path.exists()
+            if restore_delete_mode:
+                _write_transient_wal_marker(marker_path)
+            try:
+                selected_mode = str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+            except BaseException:
+                if restore_delete_mode:
+                    _discard_transient_wal_marker(marker_path)
+                raise
+            if selected_mode.casefold() != "wal":
+                if restore_delete_mode:
+                    _discard_transient_wal_marker(marker_path)
+                message = "Index projection could not enter transient WAL journal mode."
+                raise RuntimeError(message)  # noqa: TRY301
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                conn.commit()
+                published = True
+            except BaseException as projection_error:
+                if conn.in_transaction:
+                    conn.rollback()
+                if restore_delete_mode:
+                    try:
+                        _restore_delete_journal_mode(conn)
+                        _require_clean_index_sidecars(index_path)
+                        _discard_transient_wal_marker(marker_path)
+                    except BaseException as cleanup_error:  # noqa: BLE001
+                        projection_error.add_note(
+                            "Transient WAL cleanup also failed; the next refresh will retry "
+                            f"recovery after {type(cleanup_error).__name__}."
+                        )
+                raise
+            if restore_delete_mode:
+                _restore_delete_journal_mode(conn)
+        if published and restore_delete_mode:
+            _require_clean_index_sidecars(index_path)
+            _discard_transient_wal_marker(marker_path)
+    except BaseException:
+        if not published or not restore_delete_mode:
+            raise
+        post_commit_cleanup_failed = True
+    if post_commit_cleanup_failed:
+        raise IndexProjectionCleanupError(INDEX_PROJECTION_CLEANUP_MESSAGE) from None
+
+
+def transient_wal_marker_path(index_path: Path) -> Path:
+    return index_path.with_name(f".{index_path.name}.refresh-wal")
+
+
+def _write_transient_wal_marker(marker_path: Path) -> None:
+    with marker_path.open("wb") as marker:
+        marker.write(b"delete\n")
+        marker.flush()
+        os.fsync(marker.fileno())
+    _fsync_directory(marker_path.parent)
+
+
+def _discard_transient_wal_marker(marker_path: Path) -> None:
+    marker_path.unlink(missing_ok=True)
+    _fsync_directory(marker_path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        with suppress(OSError):
+            os.close(directory_fd)
+
+
+def _restore_delete_journal_mode(conn: sqlite3.Connection) -> None:
+    deadline = monotonic() + TRANSIENT_WAL_CLEANUP_TIMEOUT_SECONDS
+    while True:
+        checkpoint: sqlite3.Row | tuple[int, ...] | None = None
+        try:
+            checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            checkpoint_complete = (
+                checkpoint is not None
+                and int(checkpoint[0]) == 0
+                and int(checkpoint[1]) == int(checkpoint[2])
+            )
+            if checkpoint_complete:
+                selected_mode = str(conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
+                if selected_mode.casefold() == "delete":
+                    return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).casefold() and "busy" not in str(exc).casefold():
+                raise
+        if monotonic() >= deadline:
+            message = "Transient index WAL could not be checkpointed and restored to DELETE mode."
+            raise RuntimeError(message)
+        sleep(TRANSIENT_WAL_CLEANUP_RETRY_SECONDS)
+
+
+def _require_clean_index_sidecars(index_path: Path) -> None:
+    stale = [
+        sidecar
+        for suffix in ("-wal", "-shm", "-journal")
+        if (sidecar := index_path.with_name(index_path.name + suffix)).exists()
+    ]
+    if stale:
+        names = ", ".join(path.name for path in stale)
+        message = (
+            "Index projection committed, but SQLite sidecars remain: "
+            f"{names}. Rerun refresh to retry cleanup."
+        )
+        raise IndexProjectionCleanupError(message)
 
 
 @contextmanager

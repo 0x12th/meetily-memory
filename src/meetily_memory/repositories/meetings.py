@@ -1,5 +1,6 @@
 import sqlite3
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from itertools import batched
 from pathlib import Path
@@ -14,15 +15,34 @@ from meetily_memory.domain import (
     MeetingSearchFilters,
     stable_evidence_id,
 )
-from meetily_memory.json_codec import dumps_json
+from meetily_memory.json_codec import dumps_json, loads_json
 from meetily_memory.meeting_structure import ENTITY_KINDS
 from meetily_memory.memory.entities import ENTITY_COUNT_SQL, ENTITY_DELETE_SQL, ENTITY_SELECT_SQL
-from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, ScanRunStats
+from meetily_memory.repositories.records import (
+    ChunkRecord,
+    MeetingRecord,
+    PostPublishIssue,
+    ScanRunStats,
+)
 from meetily_memory.repositories.search import meeting_time_predicate
 
 SyncKnowledge = Callable[[sqlite3.Connection, int, str], None]
 DeleteKnowledge = Callable[[sqlite3.Connection, int], None]
 MEETING_READ_BATCH_SIZE = 200
+POST_PUBLISH_PHASES = frozenset(
+    {"index_cleanup", "obsidian_sync", "settings_update", "source_path_finalize"}
+)
+POST_PUBLISH_ERROR_MESSAGE = (
+    "Index scan completed; post-publish work failed. "
+    "Use the structured status diagnostic for a safe retry action."
+)
+
+
+def post_publish_run_phase(phases: Iterable[str]) -> str:
+    phase_names = tuple(phases)
+    if len(phase_names) == 1 and phase_names[0] in POST_PUBLISH_PHASES:
+        return f"post_publish_{phase_names[0]}_failed"
+    return "post_publish_failed"
 
 
 @dataclass(frozen=True)
@@ -42,17 +62,23 @@ class MeetingsRepository:
         self.context = context
         self.index_path = context.index_path
 
-    def upsert_source(
+    def upsert_source(  # noqa: PLR0913
         self,
         source_uuid: str,
         kind: str,
         path: str,
         now: str,
         label: str | None = None,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> int:
-        with index_connection(self.index_path) as conn:
+        connection_context = (
+            index_connection(self.index_path) if connection is None else nullcontext(connection)
+        )
+        with connection_context as conn:
             source_id = self._upsert_source(conn, source_uuid, kind, path, now, label)
-            conn.commit()
+            if connection is None:
+                conn.commit()
             return source_id
 
     def _upsert_source(  # noqa: PLR0913
@@ -132,9 +158,15 @@ class MeetingsRepository:
         external_id: str,
         *,
         filters: MeetingSearchFilters | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any] | None:
         time_sql, time_params = meeting_time_predicate(filters)
-        with self.context.connection(self.index_path) as conn:
+        connection_context = (
+            self.context.connection(self.index_path)
+            if connection is None
+            else nullcontext(connection)
+        )
+        with connection_context as conn:
             sql = f"""
                 SELECT m.*, s.source_uuid
                 FROM meetings m
@@ -153,9 +185,13 @@ class MeetingsRepository:
         chunks: Iterable[ChunkRecord],
         *,
         force: bool = False,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[int, bool, int]:
         chunk_list = list(chunks)
-        with index_connection(self.index_path) as conn:
+        connection_context = (
+            index_connection(self.index_path) if connection is None else nullcontext(connection)
+        )
+        with connection_context as conn:
             existing = conn.execute(
                 "SELECT * FROM meetings WHERE source_id = ? AND external_id = ?",
                 (meeting.source_id, meeting.external_id),
@@ -293,11 +329,21 @@ class MeetingsRepository:
                 self._link_person(conn, meeting_id, person_name)
 
             self.context.sync_meeting_knowledge(conn, meeting_id, meeting.indexed_at)
-            conn.commit()
+            if connection is None:
+                conn.commit()
             return meeting_id, updated, inserted_chunks
 
-    def reconcile_source_meetings(self, source_id: int, external_ids: set[str]) -> int:
-        with index_connection(self.index_path) as conn:
+    def reconcile_source_meetings(
+        self,
+        source_id: int,
+        external_ids: set[str],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
+        connection_context = (
+            index_connection(self.index_path) if connection is None else nullcontext(connection)
+        )
+        with connection_context as conn:
             rows = conn.execute(
                 "SELECT id, external_id FROM meetings WHERE source_id = ?",
                 (source_id,),
@@ -308,7 +354,8 @@ class MeetingsRepository:
             for meeting_id in meeting_ids:
                 self.delete_meeting_children(conn, meeting_id)
                 conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
-            conn.commit()
+            if connection is None:
+                conn.commit()
             return len(meeting_ids)
 
     def delete_meeting_children(self, conn: sqlite3.Connection, meeting_id: int) -> None:
@@ -621,22 +668,20 @@ class MeetingsRepository:
             ).fetchone()
             return str(row["language"]) if row else None
 
-    def begin_source_scan(
-        self,
-        source_uuid: str,
-        kind: str,
-        path: str,
-        started_at: str,
-    ) -> tuple[int, int]:
+    def begin_source_scan(self, source_uuid: str, started_at: str) -> tuple[int, int]:
         with index_connection(self.index_path) as conn:
-            source_id = self._upsert_source(conn, source_uuid, kind, path, started_at)
+            source = conn.execute(
+                "SELECT id FROM sources WHERE source_uuid = ?",
+                (source_uuid,),
+            ).fetchone()
+            source_id = int(source["id"]) if source is not None else 0
             self._fail_running_scan_runs(conn, started_at)
             cursor = conn.execute(
                 """
                 INSERT INTO scan_runs (source_id, started_at, status, phase)
                 VALUES (?, ?, 'running', 'source_scan')
                 """,
-                (source_id, started_at),
+                (source_id or None, started_at),
             )
             conn.commit()
             return source_id, last_insert_id(cursor)
@@ -651,13 +696,20 @@ class MeetingsRepository:
         conn.execute(
             """
             UPDATE scan_runs
-            SET finished_at = ?, status = 'failed', error_message = ?, errors_json = ?
+            SET finished_at = ?, status = 'failed', phase = 'interrupted',
+                error_message = ?, errors_json = ?
             WHERE status = 'running'
             """,
             (
                 finished_at,
                 interrupted_message,
-                dumps_json({"message": interrupted_message}),
+                dumps_json(
+                    {
+                        "phase": "interrupted",
+                        "message": interrupted_message,
+                        "action": "Rerun refresh; the previous projection was not published.",
+                    }
+                ),
             ),
         )
 
@@ -674,18 +726,24 @@ class MeetingsRepository:
         run_id: int,
         finished_at: str,
         result: ScanRunStats,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
-        with index_connection(self.index_path) as conn:
-            conn.execute(
+        connection_context = (
+            index_connection(self.index_path) if connection is None else nullcontext(connection)
+        )
+        with connection_context as conn:
+            cursor = conn.execute(
                 """
                 UPDATE scan_runs
-                SET finished_at = ?, status = 'completed', phase = 'completed',
+                SET source_id = ?, finished_at = ?, status = 'completed', phase = 'completed',
                     meetings_seen = ?, meetings_inserted = ?, meetings_updated = ?,
                     chunks_seen = ?, chunks_inserted = ?, chunks_updated = ?,
                     errors_json = NULL, error_message = NULL
                 WHERE id = ? AND status = 'running'
                 """,
                 (
+                    result.source_id,
                     finished_at,
                     result.meetings_seen,
                     result.meetings_inserted,
@@ -696,7 +754,11 @@ class MeetingsRepository:
                     run_id,
                 ),
             )
-            conn.commit()
+            if cursor.rowcount != 1:
+                message = f"Running scan row disappeared before atomic publish: {run_id}."
+                raise RuntimeError(message)
+            if connection is None:
+                conn.commit()
 
     def fail_scan_run(
         self,
@@ -715,7 +777,7 @@ class MeetingsRepository:
                     meetings_seen = ?, meetings_inserted = ?, meetings_updated = ?,
                     chunks_seen = ?, chunks_inserted = ?, chunks_updated = ?,
                     errors_json = ?, error_message = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'running'
                 """,
                 (
                     finished_at,
@@ -733,6 +795,125 @@ class MeetingsRepository:
             )
             conn.commit()
 
+    def record_post_publish_failure(
+        self,
+        run_id: int,
+        issues: tuple[PostPublishIssue, ...],
+    ) -> None:
+        if not issues:
+            return
+        if any(issue.phase not in POST_PUBLISH_PHASES for issue in issues):
+            message = "Unsupported post-publish diagnostic phase."
+            raise ValueError(message)
+        source_uuids = {issue.source_uuid for issue in issues}
+        if len(source_uuids) != 1 or not next(iter(source_uuids)):
+            message = "Post-publish diagnostics require one source UUID."
+            raise ValueError(message)
+        source_uuid = issues[0].source_uuid
+        source_paths = {issue.source_path for issue in issues if issue.source_path is not None}
+        payload = {
+            "index_status": "completed",
+            "post_publish_status": "failed",
+            "source_uuid": source_uuid,
+            "source_path": next(iter(source_paths)) if len(source_paths) == 1 else None,
+            "issues": [asdict(issue) for issue in issues],
+        }
+        phase = post_publish_run_phase(issue.phase for issue in issues)
+        with index_connection(self.index_path) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scan_runs
+                SET phase = ?, errors_json = ?, error_message = ?
+                WHERE id = ? AND status = 'completed'
+                """,
+                (phase, dumps_json(payload), POST_PUBLISH_ERROR_MESSAGE, run_id),
+            )
+            if cursor.rowcount != 1:
+                error = f"Completed scan row not found for post-publish diagnostics: {run_id}."
+                raise RuntimeError(error)
+            conn.commit()
+
+    def resolve_post_publish_failures(  # noqa: C901, PLR0912, PLR0915
+        self,
+        source_uuid: str,
+        phases: tuple[str, ...],
+    ) -> None:
+        resolved_phases = frozenset(phases)
+        if not resolved_phases:
+            return
+        if not resolved_phases <= POST_PUBLISH_PHASES:
+            message = "Unsupported post-publish resolution phase."
+            raise ValueError(message)
+        with index_connection(self.index_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT r.id, r.errors_json, s.source_uuid AS run_source_uuid
+                FROM scan_runs r
+                LEFT JOIN sources s ON s.id = r.source_id
+                WHERE r.status = 'completed'
+                  AND r.phase LIKE 'post_publish%_failed'
+                ORDER BY r.id
+                """
+            ).fetchall()
+            for row in rows:
+                raw_payload = row["errors_json"]
+                if not isinstance(raw_payload, str):
+                    continue
+                try:
+                    payload = loads_json(raw_payload)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(payload, dict) or not isinstance(payload.get("issues"), list):
+                    continue
+                payload_source = payload.get("source_uuid")
+                run_source = row["run_source_uuid"]
+                remaining: list[object] = []
+                resolved: list[object] = []
+                for issue in payload["issues"]:
+                    if not isinstance(issue, dict):
+                        remaining.append(issue)
+                        continue
+                    issue_source = issue.get("source_uuid") or payload_source or run_source
+                    issue_phase = issue.get("phase")
+                    if issue_source == source_uuid and issue_phase in resolved_phases:
+                        resolved.append(issue)
+                    else:
+                        remaining.append(issue)
+                if not resolved:
+                    continue
+                previous_resolved = payload.get("resolved_issues")
+                resolved_issues = previous_resolved if isinstance(previous_resolved, list) else []
+                payload["resolved_issues"] = [*resolved_issues, *resolved]
+                payload["issues"] = remaining
+                if remaining:
+                    payload["post_publish_status"] = "failed"
+                    remaining_phases: list[str] = []
+                    for remaining_issue in remaining:
+                        if not isinstance(remaining_issue, dict):
+                            continue
+                        remaining_phase = remaining_issue.get("phase")
+                        if (
+                            isinstance(remaining_phase, str)
+                            and remaining_phase in POST_PUBLISH_PHASES
+                        ):
+                            remaining_phases.append(remaining_phase)
+                    phase = post_publish_run_phase(remaining_phases)
+                    error_message = POST_PUBLISH_ERROR_MESSAGE
+                else:
+                    payload["post_publish_status"] = "resolved"
+                    phase = "completed"
+                    error_message = None
+                conn.execute(
+                    """
+                    UPDATE scan_runs
+                    SET phase = ?, errors_json = ?, error_message = ?
+                    WHERE id = ? AND status = 'completed'
+                    """,
+                    (phase, dumps_json(payload), error_message, int(row["id"])),
+                )
+            conn.commit()
+
     def scan_run_diagnostics(self) -> dict[str, dict[str, Any] | None]:
         with self.context.connection(self.index_path) as conn:
             completed = conn.execute(
@@ -741,8 +922,18 @@ class MeetingsRepository:
             failed = conn.execute(
                 "SELECT * FROM scan_runs WHERE status = 'failed' ORDER BY id DESC LIMIT 1"
             ).fetchone()
+            post_publish = conn.execute(
+                """
+                SELECT *
+                FROM scan_runs
+                WHERE status = 'completed' AND phase LIKE 'post_publish%_failed'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
         completed_payload = row_to_dict(completed)
         failed_payload = row_to_dict(failed)
+        post_publish_payload = row_to_dict(post_publish)
         if (
             failed_payload
             and completed_payload
@@ -752,6 +943,7 @@ class MeetingsRepository:
         return {
             "last_completed_run": completed_payload,
             "last_failed_run": failed_payload,
+            "last_post_publish_error": post_publish_payload,
         }
 
     def stats(self) -> dict[str, int]:
