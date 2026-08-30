@@ -15,6 +15,7 @@ from meetily_memory.db.schema import (
     IndexRebuildRequiredError,
     existing_index_connection,
     index_connection,
+    index_needs_schema_initialization,
     index_projection_transaction,
     sqlite_read_snapshot,
 )
@@ -90,8 +91,13 @@ class IndexRepository:
         state_path: Path | None = None,
         generation_ledger_paths: Iterable[Path] = (),
         _read_only: bool = False,
+        _user_state: UserStateRepository | None = None,
     ) -> None:
         self.index_path = Path(index_path)
+        index_existed = self.index_path.is_file()
+        needs_schema_initialization = not index_existed or index_needs_schema_initialization(
+            self.index_path
+        )
         self.state_path = (
             Path(state_path) if state_path else self.index_path.with_name("state.sqlite")
         )
@@ -115,6 +121,7 @@ class IndexRepository:
                 self.index_path,
                 self.state_path,
                 now=now,
+                user_state=_user_state,
             )
             prepare_user_state_migration(
                 self.index_path,
@@ -127,11 +134,13 @@ class IndexRepository:
             except IndexRebuildRequiredError:
                 self.requires_rebuild = True
             if not self.requires_rebuild:
-                self.user_state = prepare_index_user_state(
-                    self.index_path,
-                    self.state_path,
-                    now=now,
-                )
+                if needs_schema_initialization:
+                    self.user_state = prepare_index_user_state(
+                        self.index_path,
+                        self.state_path,
+                        now=now,
+                        user_state=self.user_state,
+                    )
                 for ledger_path in ledger_paths:
                     self.register_state_owned_generation_path(ledger_path)
         self.meetings = MeetingsRepository(

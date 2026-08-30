@@ -21,6 +21,7 @@ from meetily_memory.db.migrations import (
     MIGRATIONS,
     initialize_current_schema,
 )
+from meetily_memory.db.schema import IndexReadError
 from meetily_memory.domain import AmbiguousMeetingError, MeetingRef
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.scanner import meetily_sqlite as scanner_module
@@ -28,6 +29,8 @@ from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.serializers import search_results_payload
 from meetily_memory.tagging import TagService
 from meetily_memory.user_state import (
+    CURRENT_USER_STATE_SCHEMA_VERSION,
+    TOPIC_ALIAS_STATE_SCHEMA_VERSION,
     USER_STATE_SCHEMA,
     AmbiguousSourceIdentityError,
     SourcePathClaim,
@@ -181,6 +184,25 @@ def _create_v3_index_with_task_status(index_path: Path, source_path: Path) -> No
 def _remove_index_generation_marker(index_path: Path) -> None:
     with sqlite3.connect(index_path) as conn:
         conn.execute("DROP TABLE index_generation")
+        conn.commit()
+
+
+def _downgrade_state_before_generation_ledger(state_path: Path) -> None:
+    with sqlite3.connect(state_path) as conn:
+        conn.executescript(
+            """
+            DROP TABLE topic_alias_imports;
+            DROP TABLE index_generations;
+            CREATE TABLE topic_alias_imports (
+              index_path TEXT PRIMARY KEY,
+              source_schema_version INTEGER NOT NULL,
+              source_alias_count INTEGER NOT NULL CHECK (source_alias_count >= 0),
+              source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
+              imported_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(f"PRAGMA user_version = {TOPIC_ALIAS_STATE_SCHEMA_VERSION}")
         conn.commit()
 
 
@@ -951,6 +973,341 @@ def test_symlink_only_legacy_settings_fail_without_exact_raw_state_match(
     assert index_path.read_bytes() == index_before
     with sqlite3.connect(state_path) as conn:
         assert conn.execute("SELECT uuid FROM sources").fetchall() == [(scan.source_uuid,)]
+
+
+def test_refresh_does_not_fallback_when_selected_source_is_unavailable(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "selected-source-unavailable"
+    data_dir.mkdir()
+    index_path = data_dir / "index.sqlite"
+    state_path = data_dir / "state.sqlite"
+    settings_path = data_dir / "settings.json"
+    discoverable_source = tmp_path / "discoverable-source.sqlite"
+    shutil.copy2(meetily_db, discoverable_source)
+    scan = MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    settings_path.write_text(
+        json.dumps({"source_uuid": scan.source_uuid}) + "\n",
+        encoding="utf-8",
+    )
+    before = (
+        index_path.read_bytes(),
+        state_path.read_bytes(),
+        settings_path.read_bytes(),
+    )
+    meetily_db.unlink()
+
+    refreshed = CliRunner().invoke(
+        app,
+        ["--index", str(index_path), "refresh"],
+        env={
+            "MEETILY_MEMORY_DATA_DIR": str(data_dir),
+            "MEETILY_MEMORY_SOURCE": str(discoverable_source),
+        },
+    )
+
+    assert refreshed.exit_code != 0
+    assert f"Source path for selected UUID {scan.source_uuid}" in refreshed.output
+    assert (
+        index_path.read_bytes(),
+        state_path.read_bytes(),
+        settings_path.read_bytes(),
+    ) == before
+
+
+def test_refresh_does_not_recreate_missing_state_for_current_index(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "current-index-missing-state"
+    data_dir.mkdir()
+    index_path = data_dir / "index.sqlite"
+    state_path = data_dir / "state.sqlite"
+    settings_path = data_dir / "settings.json"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    settings_path.write_text(json.dumps({"ui_language": "en"}) + "\n", encoding="utf-8")
+    state_path.unlink()
+    before = (index_path.read_bytes(), settings_path.read_bytes())
+
+    refreshed = CliRunner().invoke(
+        app,
+        ["--index", str(index_path), "refresh"],
+        env={
+            "MEETILY_MEMORY_DATA_DIR": str(data_dir),
+            "MEETILY_MEMORY_SOURCE": str(meetily_db),
+        },
+    )
+
+    assert refreshed.exit_code != 0
+    error = f"{refreshed.output} {refreshed.exception}"
+    assert "Restore the authoritative `state.sqlite`" in error
+    assert "`mm refresh` alone cannot recover" in error
+    assert not state_path.exists()
+    assert (index_path.read_bytes(), settings_path.read_bytes()) == before
+
+
+@pytest.mark.parametrize("precreated_index", ["empty-file", "version-zero-db"])
+def test_scan_twice_registers_generation_for_preexisting_uninitialized_index(
+    meetily_db: Path,
+    tmp_path: Path,
+    precreated_index: str,
+) -> None:
+    index_path = tmp_path / f"{precreated_index}.sqlite"
+    state_path = tmp_path / f"{precreated_index}-state.sqlite"
+    if precreated_index == "empty-file":
+        index_path.touch()
+    else:
+        with sqlite3.connect(index_path) as conn:
+            conn.execute("VACUUM")
+    scanner = MeetilySQLiteScanner(index_path, state_path=state_path)
+
+    first = scanner.scan(meetily_db)
+    second = scanner.scan(meetily_db)
+
+    assert second.source_uuid == first.source_uuid
+    with sqlite3.connect(index_path) as conn:
+        generation_id, alias_owner = conn.execute(
+            "SELECT generation_id, alias_owner FROM index_generation"
+        ).fetchone()
+    assert alias_owner == "state"
+    with sqlite3.connect(state_path) as conn:
+        assert conn.execute(
+            """
+            SELECT alias_owner
+            FROM index_generations
+            WHERE generation_id = ? AND index_path = ?
+            """,
+            (generation_id, str(index_path.resolve(strict=True))),
+        ).fetchone() == ("state",)
+
+
+def test_refresh_rejects_current_index_with_empty_replacement_state(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "current-index-empty-replacement-state"
+    data_dir.mkdir()
+    index_path = data_dir / "index.sqlite"
+    state_path = data_dir / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    replacement_path = tmp_path / "empty-replacement-state.sqlite"
+    UserStateRepository(replacement_path)
+    replacement_path.replace(state_path)
+    before = (index_path.read_bytes(), state_path.read_bytes())
+
+    refreshed = CliRunner().invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+
+    assert refreshed.exit_code != 0
+    error = f"{refreshed.output} {refreshed.exception}"
+    assert "does not match the authoritative user state" in error
+    assert (index_path.read_bytes(), state_path.read_bytes()) == before
+
+
+def test_refresh_rejects_clean_divergent_projected_source_path(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "clean-divergent-source-path"
+    data_dir.mkdir()
+    index_path = data_dir / "index.sqlite"
+    state_path = data_dir / "state.sqlite"
+    scan = MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    indexed_path = str(meetily_db.resolve(strict=True))
+    with sqlite3.connect(state_path) as conn:
+        conn.execute(
+            """
+            UPDATE sources
+            SET current_path = ?, projected_path = ?, pending_revision = NULL
+            WHERE uuid = ?
+            """,
+            (str(tmp_path / "divergent-current.sqlite"), indexed_path, scan.source_uuid),
+        )
+        conn.commit()
+    before = (index_path.read_bytes(), state_path.read_bytes())
+
+    refreshed = CliRunner().invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+
+    assert refreshed.exit_code != 0
+    error = f"{refreshed.output} {refreshed.exception}"
+    assert "source projection does not match the authoritative user state" in error
+    assert (index_path.read_bytes(), state_path.read_bytes()) == before
+
+
+def test_refresh_rejects_matching_replacement_state_without_generation_ledger(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "replacement-state-without-ledger"
+    data_dir.mkdir()
+    index_path = data_dir / "index.sqlite"
+    state_path = data_dir / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    replacement_path = tmp_path / "matching-replacement-state.sqlite"
+    shutil.copy2(state_path, replacement_path)
+    with sqlite3.connect(replacement_path) as conn:
+        conn.execute("DELETE FROM index_generations")
+        conn.commit()
+    replacement_path.replace(state_path)
+    before = (index_path.read_bytes(), state_path.read_bytes())
+
+    refreshed = CliRunner().invoke(
+        app,
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+
+    assert refreshed.exit_code != 0
+    error = f"{refreshed.output} {refreshed.exception}"
+    assert "missing ledger for generation" in error
+    assert (index_path.read_bytes(), state_path.read_bytes()) == before
+
+
+def test_state_owned_current_index_rejects_outdated_state_without_migration(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "state-owned-current-index.sqlite"
+    state_path = tmp_path / "state-owned-outdated-state.sqlite"
+    scanner = MeetilySQLiteScanner(index_path, state_path=state_path)
+    scanner.scan(meetily_db)
+    _downgrade_state_before_generation_ledger(state_path)
+    before = (index_path.read_bytes(), state_path.read_bytes())
+
+    with pytest.raises(IndexReadError, match=r"schema .* is outdated"):
+        scanner.scan(meetily_db)
+
+    assert (index_path.read_bytes(), state_path.read_bytes()) == before
+
+
+def test_legacy_owned_outdated_state_projection_mismatch_is_read_only(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "legacy-owned-mismatch-index.sqlite"
+    state_path = tmp_path / "legacy-owned-mismatch-state.sqlite"
+    scanner = MeetilySQLiteScanner(index_path, state_path=state_path)
+    initial = scanner.scan(meetily_db)
+    indexed_path = str(meetily_db.resolve(strict=True))
+    with sqlite3.connect(index_path) as conn:
+        conn.execute("UPDATE index_generation SET alias_owner = 'legacy'")
+        conn.commit()
+    _downgrade_state_before_generation_ledger(state_path)
+    with sqlite3.connect(state_path) as conn:
+        conn.execute(
+            """
+            UPDATE sources
+            SET current_path = ?, projected_path = ?, pending_revision = NULL
+            WHERE uuid = ?
+            """,
+            (str(tmp_path / "mismatched.sqlite"), indexed_path, initial.source_uuid),
+        )
+        conn.commit()
+    before = (index_path.read_bytes(), state_path.read_bytes())
+
+    with pytest.raises(IndexReadError, match="source projection does not match"):
+        scanner.scan(meetily_db)
+
+    assert (index_path.read_bytes(), state_path.read_bytes()) == before
+
+
+def test_invalid_source_does_not_migrate_legacy_owned_outdated_state(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "legacy-owned-invalid-source-index.sqlite"
+    state_path = tmp_path / "legacy-owned-invalid-source-state.sqlite"
+    scanner = MeetilySQLiteScanner(index_path, state_path=state_path)
+    scanner.scan(meetily_db)
+    with sqlite3.connect(index_path) as conn:
+        conn.execute("UPDATE index_generation SET alias_owner = 'legacy'")
+        conn.commit()
+    _downgrade_state_before_generation_ledger(state_path)
+    meetily_db.write_bytes(b"not a sqlite database")
+    before = (index_path.read_bytes(), state_path.read_bytes())
+
+    with pytest.raises(sqlite3.DatabaseError):
+        scanner.scan(meetily_db)
+
+    assert (index_path.read_bytes(), state_path.read_bytes()) == before
+
+
+def test_legacy_owned_current_index_migrates_pinned_outdated_state(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "legacy-owned-current-index.sqlite"
+    state_path = tmp_path / "legacy-owned-outdated-state.sqlite"
+    scanner = MeetilySQLiteScanner(index_path, state_path=state_path)
+    initial = scanner.scan(meetily_db)
+    with sqlite3.connect(index_path) as conn:
+        conn.execute("UPDATE index_generation SET alias_owner = 'legacy'")
+        conn.commit()
+    _downgrade_state_before_generation_ledger(state_path)
+
+    refreshed = scanner.scan(meetily_db)
+
+    assert refreshed.source_uuid == initial.source_uuid
+    with sqlite3.connect(state_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == (
+            CURRENT_USER_STATE_SCHEMA_VERSION
+        )
+        assert conn.execute(
+            """
+            SELECT alias_owner
+            FROM index_generations
+            WHERE index_path = ?
+            """,
+            (str(index_path.resolve(strict=True)),),
+        ).fetchone() == ("legacy",)
+
+
+@pytest.mark.parametrize("source_failure", ["missing", "invalid"])
+def test_failed_legacy_source_path_preflight_does_not_migrate_settings(
+    meetily_db: Path,
+    tmp_path: Path,
+    source_failure: str,
+) -> None:
+    data_dir = tmp_path / f"legacy-source-{source_failure}"
+    data_dir.mkdir()
+    index_path = data_dir / "index.sqlite"
+    state_path = data_dir / "state.sqlite"
+    settings_path = data_dir / "settings.json"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    settings_path.write_text(
+        json.dumps({"source_path": str(meetily_db.resolve(strict=True))}) + "\n",
+        encoding="utf-8",
+    )
+    if source_failure == "missing":
+        meetily_db.unlink()
+    else:
+        meetily_db.write_bytes(b"not a sqlite database")
+    before = (
+        index_path.read_bytes(),
+        state_path.read_bytes(),
+        settings_path.read_bytes(),
+    )
+
+    refreshed = CliRunner().invoke(
+        app,
+        ["--index", str(index_path), "refresh"],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+
+    assert refreshed.exit_code != 0
+    assert (
+        index_path.read_bytes(),
+        state_path.read_bytes(),
+        settings_path.read_bytes(),
+    ) == before
 
 
 def test_legacy_path_only_settings_missing_identity_advises_source_uuid(

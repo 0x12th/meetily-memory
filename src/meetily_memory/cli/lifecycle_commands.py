@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime
 from locale import getlocale
 from pathlib import Path
@@ -194,11 +195,7 @@ def migrated_source_settings(index_path: Path, settings_path: Path) -> AppSettin
         )
         raise typer.BadParameter(message)
     source_uuid = str(state_source["uuid"])
-    return update_app_settings(
-        settings_path=settings_path,
-        source_uuid=source_uuid,
-        source_path=None,
-    )
+    return replace(settings, source_uuid=source_uuid, source_path=None)
 
 
 def configured_source_path(
@@ -210,10 +207,35 @@ def configured_source_path(
         return require_canonical_source_path(explicit_source)
     settings = migrated_source_settings(index_path, settings_path)
     if settings.source_uuid:
-        source = source_state_repository(index_path).get_source(settings.source_uuid)
-        configured = Path(str(source["current_path"])).expanduser() if source else None
-        if configured and configured.exists():
-            return require_canonical_source_path(configured)
+        source = find_existing_source_by_uuid(
+            Path(index_path).with_name("state.sqlite"),
+            settings.source_uuid,
+        )
+        if source is None:
+            message = f"Source UUID not found in user state: {settings.source_uuid}."
+            raise typer.BadParameter(message)
+        if str(source["kind"]) != SOURCE_KIND:
+            message = f"Source UUID {settings.source_uuid} has an incompatible source kind."
+            raise typer.BadParameter(message)
+        current_path = source["current_path"]
+        if not isinstance(current_path, str) or not current_path.strip():
+            message = f"Source UUID {settings.source_uuid} has no usable current path."
+            raise typer.BadParameter(message)
+        configured = Path(current_path).expanduser()
+        try:
+            canonical = canonical_source_path(configured)
+        except OSError as exc:
+            message = (
+                f"Source path for selected UUID {settings.source_uuid} does not exist or cannot "
+                f"be resolved: {configured}"
+            )
+            raise typer.BadParameter(message) from exc
+        if not canonical.is_file():
+            message = (
+                f"Source path for selected UUID {settings.source_uuid} is unavailable: {canonical}"
+            )
+            raise typer.BadParameter(message)
+        return canonical
     discovered = discover_meetily_db()
     return require_canonical_source_path(discovered) if discovered is not None else None
 

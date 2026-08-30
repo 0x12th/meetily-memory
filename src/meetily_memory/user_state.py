@@ -332,6 +332,7 @@ class UserStateRepository:
         *,
         _read_only: bool = False,
         _expected_identity: UserStateFileIdentity | None = None,
+        _migrate_existing: bool = False,
     ) -> None:
         self.state_path = Path(state_path)
         self.read_only = _read_only
@@ -341,8 +342,11 @@ class UserStateRepository:
                 self.state_path,
                 expected=_expected_identity,
             )
-            with self._connect():
-                pass
+            if _migrate_existing:
+                self._migrate_existing_schema()
+            else:
+                with self._connect():
+                    pass
             return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
@@ -353,8 +357,50 @@ class UserStateRepository:
         )
 
     @classmethod
-    def open_existing(cls, state_path: Path) -> "UserStateRepository":
-        return cls(state_path, _read_only=True)
+    def open_existing(
+        cls,
+        state_path: Path,
+        *,
+        expected_identity: UserStateFileIdentity | None = None,
+    ) -> "UserStateRepository":
+        return cls(
+            state_path,
+            _read_only=True,
+            _expected_identity=expected_identity,
+        )
+
+    @classmethod
+    def open_existing_migration_writer(
+        cls,
+        state_path: Path,
+        *,
+        expected_identity: UserStateFileIdentity,
+    ) -> "UserStateRepository":
+        return cls(
+            state_path,
+            _expected_identity=expected_identity,
+            _migrate_existing=True,
+        )
+
+    def _migrate_existing_schema(self) -> None:
+        if self._state_identity is None:
+            message = "A validated user-state identity is required for schema migration."
+            raise RuntimeError(message)
+        identity = _require_user_state_identity(
+            self.state_path,
+            expected=self._state_identity,
+        )
+        uri = f"{identity.physical_path.as_uri()}?mode=rw"
+        try:
+            connection = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error as exc:
+            raise IndexReadError(_changed_user_state_message(self.state_path)) from exc
+        with closing(connection) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            ensure_user_state_schema(conn)
+            validate_existing_user_state_schema(conn)
+        self.recheck_identity()
 
     @property
     def read_only_uri(self) -> str:
@@ -1049,6 +1095,24 @@ class UserStateRepository:
                 raise
         return tuple(removed)
 
+    def has_index_generation(
+        self,
+        generation_id: str,
+        index_path: Path,
+        alias_owner: str,
+    ) -> bool:
+        canonical_index_path = canonical_database_path(index_path)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM index_generations
+                WHERE generation_id = ? AND index_path = ? AND alias_owner = ?
+                """,
+                (generation_id, canonical_index_path, alias_owner),
+            ).fetchone()
+        return row is not None
+
     def register_index_generation(
         self,
         generation_id: str,
@@ -1425,6 +1489,14 @@ def _require_user_state_identity(
     return identity
 
 
+def pin_user_state_identity(
+    state_path: Path,
+    *,
+    expected: UserStateFileIdentity | None = None,
+) -> UserStateFileIdentity:
+    return _require_user_state_identity(Path(state_path), expected=expected)
+
+
 def _changed_user_state_message(state_path: Path) -> str:
     return (
         f"Meetily Memory user state no longer matches the database validated at {state_path}. "
@@ -1453,10 +1525,11 @@ def prepare_index_user_state(
     state_path: Path,
     *,
     now: str,
+    user_state: UserStateRepository | None = None,
 ) -> UserStateRepository:
     index_path = Path(index_path)
     if not index_path.is_file():
-        return UserStateRepository(state_path)
+        return user_state or UserStateRepository(state_path)
 
     with closing(sqlite3.connect(index_path)) as conn:
         conn.row_factory = sqlite3.Row
@@ -1465,7 +1538,7 @@ def prepare_index_user_state(
         try:
             version = _supported_index_version(conn)
             marker = read_index_generation_marker(conn)
-            state = UserStateRepository(state_path)
+            state = user_state or UserStateRepository(state_path)
             if marker is not None and marker[1] == INDEX_ALIAS_OWNER_STATE:
                 state.register_index_generation(
                     marker[0],
@@ -1607,11 +1680,14 @@ def _index_topic_alias_snapshot(
 def find_existing_source_by_uuid(
     state_path: Path,
     source_uuid: str,
+    *,
+    expected_identity: UserStateFileIdentity | None = None,
 ) -> dict[str, Any] | None:
     state_path = Path(state_path)
-    if not state_path.is_file():
+    if expected_identity is None and not state_path.is_file():
         return None
-    uri = f"{state_path.resolve(strict=True).as_uri()}?mode=ro&immutable=1"
+    identity = pin_user_state_identity(state_path, expected=expected_identity)
+    uri = f"{identity.physical_path.as_uri()}?mode=ro&immutable=1"
     with closing(sqlite3.connect(uri, uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -1624,14 +1700,27 @@ def find_existing_source_by_uuid(
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sources)").fetchall()}
         if not {"uuid", "kind", "current_path"}.issubset(columns):
             return None
-        row = conn.execute(
-            """
-            SELECT uuid, kind, current_path
-            FROM sources
-            WHERE uuid = ?
-            """,
-            (source_uuid,),
-        ).fetchone()
+        if {"projected_path", "pending_revision"}.issubset(columns):
+            row = conn.execute(
+                """
+                SELECT uuid, kind, current_path, projected_path, pending_revision
+                FROM sources
+                WHERE uuid = ?
+                """,
+                (source_uuid,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT
+                  uuid, kind, current_path,
+                  NULL AS projected_path, NULL AS pending_revision
+                FROM sources
+                WHERE uuid = ?
+                """,
+                (source_uuid,),
+            ).fetchone()
+    pin_user_state_identity(state_path, expected=identity)
     return dict(row) if row is not None else None
 
 

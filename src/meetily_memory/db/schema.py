@@ -229,6 +229,12 @@ def existing_index_connection(index_path: Path) -> Generator[sqlite3.Connection,
         raise IndexReadError(message) from exc
 
 
+def index_needs_schema_initialization(index_path: Path) -> bool:
+    physical_path = Path(index_path).resolve(strict=True)
+    with closing(sqlite3.connect(physical_path)) as conn:
+        return _connection_needs_schema_initialization(conn)
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version > CURRENT_SCHEMA_VERSION:
@@ -238,7 +244,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         raise RuntimeError(message)
 
-    if version == 0 and not _has_application_tables(conn):
+    if _connection_needs_schema_initialization(conn):
         initialize_current_schema(conn)
         return
 
@@ -304,6 +310,11 @@ def _raise_invalid_current_index(reason: str) -> None:
         "Run `mm refresh` or `mm scan --source PATH` to rebuild the disposable index."
     )
     raise IndexReadError(message)
+
+
+def _connection_needs_schema_initialization(conn: sqlite3.Connection) -> bool:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    return version == 0 and not _has_application_tables(conn)
 
 
 def _has_application_tables(conn: sqlite3.Connection) -> bool:

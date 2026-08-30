@@ -11,8 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from meetily_memory.config.paths import canonical_source_path
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
-from meetily_memory.db.schema import IndexProjectionCleanupError
+from meetily_memory.db.migration_identity import canonical_database_path
+from meetily_memory.db.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    INDEX_ALIAS_OWNER_LEGACY,
+    INDEX_ALIAS_OWNER_STATE,
+    read_index_generation_marker,
+)
+from meetily_memory.db.schema import IndexProjectionCleanupError, IndexReadError
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, PostPublishIssue
@@ -21,8 +27,10 @@ from meetily_memory.structure_analyzer import StructureAnalyzer
 from meetily_memory.user_state import (
     AmbiguousSourceIdentityError,
     SourcePathClaim,
+    UserStateFileIdentity,
     UserStateRepository,
-    prepare_index_user_state,
+    find_existing_source_by_uuid,
+    pin_user_state_identity,
     recover_and_validate_index,
 )
 
@@ -40,6 +48,118 @@ def _scan_checkpoint(_name: str) -> None:
 def previous_index_backup_path(index_path: Path) -> Path:
     path = Path(index_path)
     return path.with_name(f"{path.name}.pre-v{CURRENT_SCHEMA_VERSION}")
+
+
+@dataclass(frozen=True)
+class IndexFileIdentity:
+    physical_path: Path
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class CurrentIndexPreflight:
+    state_reader: UserStateRepository | None
+    state_identity: UserStateFileIdentity
+    index_identity: IndexFileIdentity
+
+
+def require_index_identity(
+    index_path: Path,
+    *,
+    expected: IndexFileIdentity | None = None,
+) -> IndexFileIdentity:
+    try:
+        physical_path = Path(index_path).resolve(strict=True)
+        path_stat = physical_path.stat()
+    except OSError as exc:
+        message = f"Meetily Memory index no longer matches the preflighted database: {index_path}."
+        raise IndexReadError(message) from exc
+    if not physical_path.is_file():
+        message = f"Meetily Memory index is not a regular file: {index_path}."
+        raise IndexReadError(message)
+    identity = IndexFileIdentity(physical_path, path_stat.st_dev, path_stat.st_ino)
+    if expected is not None and identity != expected:
+        message = f"Meetily Memory index no longer matches the preflighted database: {index_path}."
+        raise IndexReadError(message)
+    return identity
+
+
+def preflight_current_index_user_state(
+    index_path: Path,
+    state_path: Path,
+) -> CurrentIndexPreflight:
+    index_identity = require_index_identity(index_path)
+    with readonly_sqlite_connection(index_identity.physical_path) as conn:
+        marker = read_index_generation_marker(conn)
+        sources = conn.execute(
+            "SELECT source_uuid, kind, path FROM sources ORDER BY source_uuid"
+        ).fetchall()
+    require_index_identity(index_path, expected=index_identity)
+
+    alias_owner = marker[1] if marker is not None else INDEX_ALIAS_OWNER_LEGACY
+    state_identity = pin_user_state_identity(state_path)
+    if alias_owner == INDEX_ALIAS_OWNER_STATE:
+        state_reader = UserStateRepository.open_existing(
+            state_path,
+            expected_identity=state_identity,
+        )
+    else:
+        try:
+            state_reader = UserStateRepository.open_existing(
+                state_path,
+                expected_identity=state_identity,
+            )
+        except IndexReadError:
+            state_reader = None
+
+    if marker is not None and alias_owner == INDEX_ALIAS_OWNER_STATE:
+        generation_id = marker[0]
+        if state_reader is None or not state_reader.has_index_generation(
+            generation_id,
+            Path(canonical_database_path(index_path)),
+            INDEX_ALIAS_OWNER_STATE,
+        ):
+            message = (
+                "Current state-owned index generation does not match the authoritative user "
+                f"state at {state_path}: missing ledger for generation {generation_id}, index "
+                f"{canonical_database_path(index_path)}. Restore the authoritative `state.sqlite` "
+                "from backup; refusing to resolve sources or write the index."
+            )
+            raise IndexReadError(message)
+
+    for source in sources:
+        source_uuid = str(source["source_uuid"])
+        kind = str(source["kind"])
+        index_path_value = str(source["path"])
+        binding = (
+            state_reader.get_source_binding(source_uuid)
+            if state_reader is not None
+            else find_existing_source_by_uuid(
+                state_path,
+                source_uuid,
+                expected_identity=state_identity,
+            )
+        )
+        if binding is not None and str(binding["kind"]) == kind:
+            current_path = str(binding["current_path"])
+            projected_path = binding["projected_path"]
+            pending_revision = binding["pending_revision"]
+            if index_path_value == current_path or (
+                pending_revision is not None
+                and projected_path is not None
+                and index_path_value == str(projected_path)
+            ):
+                continue
+        message = (
+            "Current index source projection does not match the authoritative user state at "
+            f"{state_path}: UUID {source_uuid}, kind {kind}, path {index_path_value}. Restore the "
+            "authoritative `state.sqlite` from backup; refusing to resolve sources or write the "
+            "index."
+        )
+        raise IndexReadError(message)
+    pin_user_state_identity(state_path, expected=state_identity)
+    return CurrentIndexPreflight(state_reader, state_identity, index_identity)
 
 
 @dataclass
@@ -91,27 +211,42 @@ class MeetilySQLiteScanner:
     ) -> ScanResult:
         source_path = canonical_source_path(source_path)
         started_at = utc_now()
-        recover_and_validate_index(self.index_path)
+        index_version = recover_and_validate_index(self.index_path)
+        current_preflight = (
+            preflight_current_index_user_state(self.index_path, self.state_path)
+            if index_version == CURRENT_SCHEMA_VERSION
+            else None
+        )
         with readonly_sqlite_connection(source_path) as conn:
             validate_meetily_schema(conn)
-            user_state = UserStateRepository(self.state_path)
-            rebuild_sources = self._preflight_legacy_rebuild_sources(source_path, started_at)
-            if self.index_path.is_file():
-                user_state = prepare_index_user_state(
-                    self.index_path,
+            if current_preflight is not None:
+                pin_user_state_identity(
                     self.state_path,
-                    now=started_at,
+                    expected=current_preflight.state_identity,
                 )
-            source_uuid = (
-                user_state.resolve_source(
-                    self.source_kind,
-                    source_path,
-                    now=started_at,
+                if current_preflight.state_reader is not None:
+                    current_preflight.state_reader.recheck_identity()
+                    user_state = current_preflight.state_reader.open_existing_writer()
+                else:
+                    user_state = UserStateRepository.open_existing_migration_writer(
+                        self.state_path,
+                        expected_identity=current_preflight.state_identity,
+                    )
+                user_state.recheck_identity()
+            else:
+                user_state = UserStateRepository(self.state_path)
+            rebuild_sources = self._preflight_legacy_rebuild_sources(source_path, started_at)
+            if current_preflight is not None:
+                user_state.recheck_identity()
+                require_index_identity(
+                    self.index_path,
+                    expected=current_preflight.index_identity,
                 )
-                if rebuild_sources is None
-                else None
+            repo = IndexRepository(
+                self.index_path,
+                state_path=self.state_path,
+                _user_state=user_state,
             )
-            repo = IndexRepository(self.index_path, state_path=self.state_path)
             if repo.requires_rebuild:
                 if rebuild_sources is None:
                     rebuild_sources = self._prepare_rebuild_sources(source_path, started_at)
@@ -121,12 +256,11 @@ class MeetilySQLiteScanner:
                     rebuild_sources,
                     force=force,
                 )
-            if source_uuid is None:
-                source_uuid = user_state.resolve_source(
-                    self.source_kind,
-                    source_path,
-                    now=started_at,
-                )
+            source_uuid = repo.user_state.resolve_source(
+                self.source_kind,
+                source_path,
+                now=started_at,
+            )
             result = self._scan_repository(
                 conn,
                 repo,
@@ -382,6 +516,7 @@ class MeetilySQLiteScanner:
             delete=False,
         ) as temporary_file:
             temporary_path = Path(temporary_file.name)
+        temporary_path.unlink()
         try:
             rebuilt_repo = IndexRepository(
                 temporary_path,
