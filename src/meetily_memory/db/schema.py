@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from collections.abc import Callable, Generator
-from contextlib import AbstractContextManager, closing, contextmanager, suppress
+from contextlib import AbstractContextManager, closing, contextmanager
 from pathlib import Path
 from time import monotonic, sleep
 
@@ -11,6 +11,7 @@ from meetily_memory.db.migrations import (
     MIGRATIONS,
     initialize_current_schema,
 )
+from meetily_memory.durable_files import fsync_directory
 
 IndexConnectionFactory = Callable[[Path], AbstractContextManager[sqlite3.Connection]]
 TRANSIENT_WAL_CLEANUP_TIMEOUT_SECONDS = 5.0
@@ -140,26 +141,12 @@ def _write_transient_wal_marker(marker_path: Path) -> None:
         marker.write(b"delete\n")
         marker.flush()
         os.fsync(marker.fileno())
-    _fsync_directory(marker_path.parent)
+    fsync_directory(marker_path.parent)
 
 
 def _discard_transient_wal_marker(marker_path: Path) -> None:
     marker_path.unlink(missing_ok=True)
-    _fsync_directory(marker_path.parent)
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        directory_fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(directory_fd)
-    except OSError:
-        pass
-    finally:
-        with suppress(OSError):
-            os.close(directory_fd)
+    fsync_directory(marker_path.parent)
 
 
 def _restore_delete_journal_mode(conn: sqlite3.Connection) -> None:

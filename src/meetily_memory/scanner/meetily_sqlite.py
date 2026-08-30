@@ -1,5 +1,4 @@
 import hashlib
-import os
 import shutil
 import sqlite3
 import tempfile
@@ -19,6 +18,7 @@ from meetily_memory.db.migrations import (
     read_index_generation_marker,
 )
 from meetily_memory.db.schema import IndexProjectionCleanupError, IndexReadError
+from meetily_memory.durable_files import durable_replace
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.repositories.records import ChunkRecord, MeetingRecord, PostPublishIssue
@@ -565,7 +565,7 @@ class MeetilySQLiteScanner:
                 rebuilt_repo.project_topic_aliases()
                 self._verify_rebuilt_index(temporary_path, rebuild_sources)
                 self._verify_quiesced_index_family(active_conn)
-                temporary_path.replace(self.index_path)
+                durable_replace(temporary_path, self.index_path)
             self._finalize_rebuilt_source_bindings(rebuild_sources)
             return requested_result
         finally:
@@ -1026,9 +1026,7 @@ class MeetilySQLiteScanner:
             temporary_backup = Path(backup_file.name)
         try:
             shutil.copyfile(self.index_path, temporary_backup)
-            with temporary_backup.open("rb") as backup_file:
-                os.fsync(backup_file.fileno())
-            temporary_backup.replace(self._backup_path())
+            durable_replace(temporary_backup, self._backup_path())
         finally:
             temporary_backup.unlink(missing_ok=True)
 

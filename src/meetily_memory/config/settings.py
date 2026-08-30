@@ -2,12 +2,13 @@ import fcntl
 import os
 import tempfile
 from collections.abc import Generator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from meetily_memory.config.paths import app_config_path
+from meetily_memory.durable_files import fsync_directory
 from meetily_memory.json_codec import dumps_json, loads_json
 
 
@@ -201,7 +202,7 @@ def _atomic_write_settings(path: Path, payload: dict[str, Any]) -> None:
             temp_path = Path(temp_file.name)
             _write_and_sync(temp_file, contents)
         os.replace(temp_path, path)  # noqa: PTH105
-        _fsync_directory(path.parent)
+        fsync_directory(path.parent)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -211,18 +212,6 @@ def _write_and_sync(file: _SyncableTextFile, contents: str) -> None:
     file.write(contents)
     file.flush()
     os.fsync(file.fileno())
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        directory_fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        with suppress(OSError):
-            os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
 
 
 def obsidian_from_payload(payload: dict[str, Any]) -> ObsidianSettings:
