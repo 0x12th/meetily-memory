@@ -290,10 +290,21 @@ class SearchRepository:
         if not evidence_refs:
             return []
         with self._connection(self.index_path) as conn, sqlite_read_snapshot(conn):
-            rows = self.resolve_evidence_rows(conn, evidence_refs)
-            if context <= 0:
-                return rows
-            return self._expand_context(conn, rows, context)
+            return self.expand_evidence_refs_in_snapshot(conn, evidence_refs, context)
+
+    def expand_evidence_refs_in_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        evidence_refs: tuple[EvidenceReference, ...],
+        context: int,
+    ) -> list[dict[str, Any]]:
+        if not conn.in_transaction:
+            message = "Context connection must be inside an explicit read snapshot."
+            raise RuntimeError(message)
+        rows = self.resolve_evidence_rows(conn, evidence_refs)
+        if context <= 0:
+            return rows
+        return self._expand_context(conn, rows, context)
 
     def resolve_evidence_rows(
         self,

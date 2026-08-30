@@ -1,6 +1,6 @@
 import sqlite3
-from collections.abc import Iterable, Mapping
-from contextlib import AbstractContextManager
+from collections.abc import Generator, Iterable, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
@@ -10,6 +10,7 @@ from meetily_memory.config.paths import canonical_source_path
 from meetily_memory.db.fts import build_fts_query
 from meetily_memory.db.rows import rows_to_dicts
 from meetily_memory.db.schema import (
+    OPERATION_STATE_SCHEMA,
     IndexConnectionFactory,
     IndexRebuildRequiredError,
     existing_index_connection,
@@ -56,6 +57,7 @@ from meetily_memory.user_state import (
     prepare_user_state_migration,
     register_state_owned_index_generation,
     task_identity,
+    validate_existing_user_state_version,
 )
 
 __all__ = [
@@ -68,6 +70,11 @@ __all__ = [
 ]
 
 MEMORY_ENTITY_BATCH_SIZE = 200
+OPERATION_SNAPSHOT_PIN_SQL = """
+SELECT
+  (SELECT COUNT(*) FROM main.sources) AS index_source_count,
+  (SELECT COUNT(*) FROM operation_state.sources) AS state_source_count
+"""
 ENTITY_KIND_ORDER = {kind: order for order, kind in enumerate(ENTITY_KINDS)}
 
 
@@ -92,6 +99,7 @@ class IndexRepository:
         self.connection: IndexConnectionFactory = (
             existing_index_connection if self.read_only else index_connection
         )
+        self.operation_connection: IndexConnectionFactory = existing_index_connection
         ledger_paths = tuple(generation_ledger_paths)
         self.requires_rebuild = False
         if self.read_only:
@@ -177,6 +185,24 @@ class IndexRepository:
         state_path: Path | None = None,
     ) -> "IndexRepository":
         return cls(index_path, state_path=state_path, _read_only=True)
+
+    @contextmanager
+    def operation_snapshot(self) -> Generator[sqlite3.Connection, None, None]:
+        """Pin one per-file snapshot for index and attached state before retrieval."""
+        state_uri = self.user_state.read_only_uri
+        with self.operation_connection(self.index_path) as conn:
+            conn.execute(
+                f"ATTACH DATABASE ? AS {OPERATION_STATE_SCHEMA}",
+                (state_uri,),
+            )
+            self.user_state.recheck_identity()
+            state_version = int(
+                conn.execute(f"PRAGMA {OPERATION_STATE_SCHEMA}.user_version").fetchone()[0]
+            )
+            validate_existing_user_state_version(state_version)
+            with sqlite_read_snapshot(conn):
+                conn.execute(OPERATION_SNAPSHOT_PIN_SQL).fetchone()
+                yield conn
 
     def structured_entity_sort_key(self, row: dict[str, Any]) -> tuple[str, int]:
         return structured_entity_sort_key(row)
@@ -783,7 +809,7 @@ class IndexRepository:
             rows.extend(self._list_structured_entity_details_conn(conn, kind, limit))
         return rows
 
-    def search(
+    def search(  # noqa: PLR0913
         self,
         query: str,
         limit: int = 10,
@@ -791,7 +817,17 @@ class IndexRepository:
         meeting_id: int | None = None,
         context: int = 0,
         filters: MeetingSearchFilters | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
+        if connection is not None:
+            return self.search_repo.search_in_snapshot(
+                connection,
+                query,
+                limit,
+                meeting_id=meeting_id,
+                context=context,
+                filters=filters,
+            )
         return self.search_repo.search(
             query,
             limit,
@@ -800,7 +836,7 @@ class IndexRepository:
             filters=filters,
         )
 
-    def search_hits(
+    def search_hits(  # noqa: PLR0913
         self,
         query: str,
         limit: int = 10,
@@ -808,6 +844,7 @@ class IndexRepository:
         meeting_id: int | None = None,
         context: int = 0,
         filters: MeetingSearchFilters | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[SearchHit, ...]:
         rows = self.search(
             query,
@@ -815,6 +852,7 @@ class IndexRepository:
             meeting_id=meeting_id,
             context=context,
             filters=filters,
+            connection=connection,
         )
         return tuple(self.search_hit_from_row(row) for row in rows)
 
@@ -823,13 +861,19 @@ class IndexRepository:
         return search_hit_from_row(row)
 
     def expand_search_hits(
-        self, hits: tuple[SearchHit, ...], context: int
+        self,
+        hits: tuple[SearchHit, ...],
+        context: int,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[SearchHit, ...]:
         if context <= 0 or not hits:
             return hits
-        rows = self.search_repo.expand_evidence_refs(
-            tuple((hit.id, hit.meeting.ref) for hit in hits),
-            context,
+        evidence_refs = tuple((hit.id, hit.meeting.ref) for hit in hits)
+        rows = (
+            self.search_repo.expand_evidence_refs_in_snapshot(connection, evidence_refs, context)
+            if connection is not None
+            else self.search_repo.expand_evidence_refs(evidence_refs, context)
         )
         return tuple(search_hit_from_row(row) for row in rows)
 
@@ -905,8 +949,13 @@ class IndexRepository:
         refs: tuple[MeetingRef, ...],
         *,
         filters: MeetingSearchFilters | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[MeetingRef, dict[str, Any]]:
-        return self.meetings.get_meetings_by_refs(refs, filters=filters)
+        return self.meetings.get_meetings_by_refs(
+            refs,
+            filters=filters,
+            connection=connection,
+        )
 
     def get_meetings_by_local_ids(
         self,

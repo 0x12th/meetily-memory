@@ -18,6 +18,7 @@ from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import IndexReadError
 from meetily_memory.json_codec import dumps_json
+from meetily_memory.open_commands import stable_meeting_open_command
 
 PACKAGE_NAME = "meetily-memory"
 console = Console(markup=False)
@@ -113,16 +114,20 @@ def meeting_label(row: dict[str, object]) -> str:
 
 
 def print_meeting_table(rows: list[dict[str, object]]) -> None:
-    table = Table("id", "date", "chunks", "open", "title")
+    table = Table("id", "date", "chunks", "title")
     for row in rows:
         table.add_row(
             str(row["id"]),
             compact_date(row.get("updated_at") or row.get("created_at")),
             str(row["chunk_count"]),
-            f"mm open {row['id']}",
             str(row["title"]),
         )
     console.print(table)
+    for row in rows:
+        print_text_block(
+            f"#{row['id']} open: "
+            + stable_meeting_open_command(row["source_uuid"], row["external_id"])
+        )
 
 
 def compact_date(value: object) -> str:

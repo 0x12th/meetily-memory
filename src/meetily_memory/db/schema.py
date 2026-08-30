@@ -33,6 +33,9 @@ class IndexProjectionCleanupError(RuntimeError):
     """The projection committed, but transient WAL cleanup did not finish."""
 
 
+OPERATION_STATE_SCHEMA = "operation_state"
+
+
 def missing_user_state_message(state_path: Path) -> str:
     return (
         f"Meetily Memory user state not found: {state_path}. Restore the authoritative "

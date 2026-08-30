@@ -284,6 +284,52 @@ def test_search_mapping_resolver_and_context_have_bounded_connections_and_querie
     assert any(statement.lstrip().upper().startswith("WITH MATCHED") for statement in statements)
 
 
+def test_operation_snapshot_validates_pinned_state_and_pins_both_schemas_first(
+    meetily_db: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    state_path = tmp_path / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    repository = IndexRepository.open_existing(index_path, state_path=state_path)
+    statements: list[str] = []
+
+    @contextmanager
+    def traced_connection(path: Path) -> Generator[sqlite3.Connection, None, None]:
+        with existing_index_connection(path) as conn:
+            conn.set_trace_callback(statements.append)
+            yield conn
+
+    monkeypatch.setattr(repository, "operation_connection", traced_connection)
+
+    with repository.operation_snapshot() as snapshot:
+        assert snapshot.in_transaction
+
+    normalized = [" ".join(statement.upper().split()) for statement in statements]
+    begin_index = normalized.index("BEGIN")
+    state_validation_index = next(
+        index
+        for index, statement in enumerate(normalized)
+        if statement.startswith("PRAGMA OPERATION_STATE.USER_VERSION")
+    )
+    first_snapshot_statement = normalized[begin_index + 1]
+    assert state_validation_index < begin_index
+    assert first_snapshot_statement.startswith("SELECT")
+    assert "FROM MAIN.SOURCES" in first_snapshot_statement
+    assert "FROM OPERATION_STATE.SOURCES" in first_snapshot_statement
+
+    replacement_path = tmp_path / "replacement-state.sqlite"
+    shutil.copy2(state_path, replacement_path)
+    replacement_path.replace(state_path)
+
+    with (
+        pytest.raises(IndexReadError, match="no longer matches"),
+        repository.operation_snapshot(),
+    ):
+        pass
+
+
 def test_shared_core_cli_mcp_retrieval_counts_stay_bounded_from_limit_one_to_eight(
     meetily_db: Path,
     tmp_path: Path,
@@ -341,8 +387,6 @@ def test_shared_core_cli_mcp_retrieval_counts_stay_bounded_from_limit_one_to_eig
     counts = {
         "index_connections": 0,
         "index_queries": 0,
-        "state_connections": 0,
-        "state_queries": 0,
     }
 
     @contextmanager
@@ -357,51 +401,27 @@ def test_shared_core_cli_mcp_retrieval_counts_stay_bounded_from_limit_one_to_eig
             conn.set_trace_callback(trace)
             yield conn
 
-    original_state_connection = strategy.tags.repository._connect  # noqa: SLF001
+    def reject_state_connection() -> None:
+        message = "Core search must read attached state through the operation snapshot."
+        raise AssertionError(message)
 
-    @contextmanager
-    def counted_state_connection() -> Generator[sqlite3.Connection, None, None]:
-        counts["state_connections"] += 1
-        with original_state_connection() as conn:
-
-            def trace(statement: str) -> None:
-                if statement.lstrip().upper().startswith(("SELECT", "WITH")):
-                    counts["state_queries"] += 1
-
-            conn.set_trace_callback(trace)
-            yield conn
-
-    monkeypatch.setattr(repository.search_repo, "_connection", counted_index_connection)
-    monkeypatch.setattr(
-        repository.meetings,
-        "context",
-        replace(repository.meetings.context, connection=counted_index_connection),
-    )
-    monkeypatch.setattr(strategy.tags.repository, "_connect", counted_state_connection)
+    monkeypatch.setattr(repository, "operation_connection", counted_index_connection)
+    monkeypatch.setattr(strategy.tags.repository, "_connect", reject_state_connection)
 
     measurements: dict[int, dict[str, int]] = {}
     for limit in (1, 8):
-        counts.update(
-            index_connections=0,
-            index_queries=0,
-            state_connections=0,
-            state_queries=0,
-        )
+        counts.update(index_connections=0, index_queries=0)
         results = core.search("boundedretrieval", limit=limit, context=1).results
         assert len(results) == limit
         measurements[limit] = dict(counts)
 
     assert measurements[1] == {
-        "index_connections": 3,
-        "index_queries": 5,
-        "state_connections": 1,
-        "state_queries": 1,
+        "index_connections": 1,
+        "index_queries": 7,
     }
     assert measurements[8] == {
-        "index_connections": 3,
-        "index_queries": 5,
-        "state_connections": 1,
-        "state_queries": 1,
+        "index_connections": 1,
+        "index_queries": 7,
     }
 
 

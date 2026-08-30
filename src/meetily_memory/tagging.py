@@ -8,7 +8,11 @@ from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from meetily_memory.db.schema import IndexReadError, missing_user_state_message
+from meetily_memory.db.schema import (
+    OPERATION_STATE_SCHEMA,
+    IndexReadError,
+    missing_user_state_message,
+)
 from meetily_memory.domain import MeetingRef
 from meetily_memory.user_state import (
     ensure_user_state_schema,
@@ -300,23 +304,42 @@ class TagRepository:
         return {ref: tuple(tags) for ref, tags in tags_by_ref.items()}
 
     def search(self, query: str) -> tuple[TagMatch, ...]:
+        with self._connect() as conn:
+            return self._search_in_connection(conn, query, schema="main")
+
+    def search_in_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+    ) -> tuple[TagMatch, ...]:
+        if not conn.in_transaction:
+            message = "Tag connection must be inside an explicit read snapshot."
+            raise RuntimeError(message)
+        return self._search_in_connection(conn, query, schema=OPERATION_STATE_SCHEMA)
+
+    def _search_in_connection(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        *,
+        schema: str,
+    ) -> tuple[TagMatch, ...]:
         normalized_query = normalize_tag_name(query)
         if not normalized_query:
             return ()
         query_tokens = set(normalized_query.split())
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                  mt.source_uuid,
-                  mt.meeting_external_id,
-                  t.normalized_name,
-                  t.display_name
-                FROM meeting_tags mt
-                JOIN tags t ON t.id = mt.tag_id
-                ORDER BY mt.meeting_external_id, t.normalized_name
-                """
-            ).fetchall()
+        rows = conn.execute(
+            f"""
+            SELECT
+              mt.source_uuid,
+              mt.meeting_external_id,
+              t.normalized_name,
+              t.display_name
+            FROM {schema}.meeting_tags mt
+            JOIN {schema}.tags t ON t.id = mt.tag_id
+            ORDER BY mt.meeting_external_id, t.normalized_name
+            """  # noqa: S608
+        ).fetchall()
         matches: list[TagMatch] = []
         for row in rows:
             normalized_name = str(row["normalized_name"])

@@ -557,21 +557,32 @@ class MeetingsRepository:
         ref: MeetingRef,
         *,
         filters: MeetingSearchFilters | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any] | None:
-        return self.get_meetings_by_refs((ref,), filters=filters).get(ref)
+        return self.get_meetings_by_refs(
+            (ref,),
+            filters=filters,
+            connection=connection,
+        ).get(ref)
 
     def get_meetings_by_refs(
         self,
         refs: tuple[MeetingRef, ...],
         *,
         filters: MeetingSearchFilters | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[MeetingRef, dict[str, Any]]:
         unique_refs = tuple(dict.fromkeys(refs))
         if not unique_refs:
             return {}
         time_sql, time_params = meeting_time_predicate(filters)
         meetings: dict[MeetingRef, dict[str, Any]] = {}
-        with self.context.connection(self.index_path) as conn:
+        connection_context = (
+            self.context.connection(self.index_path)
+            if connection is None
+            else nullcontext(connection)
+        )
+        with connection_context as conn:
             for ref_batch in batched(unique_refs, MEETING_READ_BATCH_SIZE):
                 values_sql = ", ".join("(?, ?, ?)" for _ in ref_batch)
                 requested_params = tuple(

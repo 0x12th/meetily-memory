@@ -15,11 +15,14 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from meetily_memory.domain import MeetingSearchFilters, SearchHit, SearchResults
+
 import pytest
 from typer.testing import CliRunner
 
 import meetily_memory.cli.lifecycle_commands as lifecycle_module
 import meetily_memory.db.schema as schema_module
+import meetily_memory.retrieval as retrieval_module
 import meetily_memory.scanner.meetily_sqlite as scanner_module
 from meetily_memory.cli.app import app
 from meetily_memory.config.settings import (
@@ -27,11 +30,14 @@ from meetily_memory.config.settings import (
     load_app_settings,
     update_app_settings,
 )
+from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.domain import RetrievalSource
 from meetily_memory.integrations import ObsidianSyncResult
 from meetily_memory.json_codec import loads_json
 from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.tagging import TagService
 from meetily_memory.user_state import UserStateRepository
 
 CRASH_EXIT_CODE = 91
@@ -561,6 +567,142 @@ def test_concurrent_readers_observe_only_complete_snapshots(
     assert new_state in observed
     assert set(observed) <= {old_state, new_state}
     _assert_clean_index_family(index_path)
+
+
+def test_core_search_stays_on_one_snapshot_across_projection_replacement(  # noqa: PLR0915
+    meetily_db: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    state_path = tmp_path / "state.sqlite"
+    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    with _readonly_connection(index_path) as conn:
+        old_local_id = str(
+            conn.execute("SELECT id FROM meetings WHERE external_id = 'meeting-1'").fetchone()[0]
+        )
+    TagService(IndexRepository(index_path, state_path=state_path)).assign(
+        (old_local_id,),
+        ("pricing decision",),
+    )
+    old_core = MeetilyMemoryCore(index_path, state_path=state_path)
+    old_meeting = old_core.search("pricing decision", limit=1).results[0]
+    assert old_meeting.match_sources == (RetrievalSource.TAG, RetrievalSource.FTS)
+    assert old_meeting.matched_tags == ("pricing decision",)
+
+    with sqlite3.connect(meetily_db) as conn:
+        conn.execute(
+            """
+            UPDATE meetings
+            SET title = ?, created_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                "Atomic Replacement Launch",
+                "2026-07-03T10:00:00Z",
+                "2026-08-30T10:00:00Z",
+                "meeting-1",
+            ),
+        )
+        conn.execute(
+            "UPDATE transcripts SET transcript = ? WHERE id = ?",
+            ("Atomic replacement marker is visible only in the new projection.", "transcript-1"),
+        )
+        conn.commit()
+
+    next_index_path = tmp_path / "index.next.sqlite"
+    MeetilySQLiteScanner(next_index_path, state_path=state_path).scan(meetily_db)
+    with _readonly_connection(next_index_path) as conn:
+        new_local_id = int(
+            conn.execute("SELECT id FROM meetings WHERE external_id = 'meeting-1'").fetchone()[0]
+        )
+    assert old_meeting.meeting_id != new_local_id
+
+    fts_complete = threading.Event()
+    continue_search = threading.Event()
+    search_results: list[SearchResults] = []
+    search_errors: list[BaseException] = []
+    original_search = retrieval_module.LexicalRetrievalStrategy._search_in_snapshot  # noqa: SLF001
+
+    def pause_after_fts(  # noqa: PLR0913
+        strategy: retrieval_module.LexicalRetrievalStrategy,
+        query: str,
+        limit: int = 10,
+        *,
+        operation_snapshot: sqlite3.Connection,
+        prepared_query: object | None = None,
+        filters: MeetingSearchFilters | None = None,
+    ) -> tuple[SearchHit, ...]:
+        hits = original_search(
+            strategy,
+            query,
+            limit,
+            operation_snapshot=operation_snapshot,
+            prepared_query=prepared_query,
+            filters=filters,
+        )
+        if query == "pricing decision":
+            fts_complete.set()
+            assert continue_search.wait(timeout=10)
+        return hits
+
+    def run_search() -> None:
+        try:
+            search_results.append(old_core.search("pricing decision", limit=1, context=1))
+        except BaseException as exc:  # noqa: BLE001
+            search_errors.append(exc)
+
+    monkeypatch.setattr(
+        retrieval_module.LexicalRetrievalStrategy,
+        "_search_in_snapshot",
+        pause_after_fts,
+    )
+    reader = threading.Thread(target=run_search)
+    reader.start()
+    assert fts_complete.wait(timeout=10)
+
+    next_index_path.replace(index_path)
+    continue_search.set()
+    reader.join(timeout=10)
+
+    assert not reader.is_alive()
+    assert not search_errors
+    old_snapshot_result = search_results[0].results[0]
+    assert old_snapshot_result.meeting_id == old_meeting.meeting_id
+    assert old_snapshot_result.meeting.title == "Launch Planning"
+    assert set(old_snapshot_result.match_sources) == {
+        RetrievalSource.FTS,
+        RetrievalSource.TAG,
+    }
+    assert old_snapshot_result.matched_tags == ("pricing decision",)
+    assert all(
+        hit.meeting.id == old_meeting.meeting_id and hit.meeting.title == "Launch Planning"
+        for hit in old_snapshot_result.evidence
+    )
+    assert any(
+        not hit.is_context and "pricing decision" in hit.excerpt.text
+        for hit in old_snapshot_result.evidence
+    )
+    assert any(hit.is_context for hit in old_snapshot_result.evidence)
+    assert all(
+        "atomic replacement marker" not in hit.excerpt.text.casefold()
+        for hit in old_snapshot_result.evidence
+    )
+
+    new_core = MeetilyMemoryCore(index_path, state_path=state_path)
+    new_tag_result = new_core.search("pricing decision", limit=1).results[0]
+    assert new_tag_result.meeting_id == new_local_id
+    assert new_tag_result.meeting.title == "Atomic Replacement Launch"
+    assert new_tag_result.match_sources == (RetrievalSource.TAG,)
+    assert new_tag_result.matched_tags == ("pricing decision",)
+    assert new_tag_result.evidence == ()
+    new_snapshot_result = new_core.search("atomic replacement marker", limit=1).results[0]
+    assert new_snapshot_result.meeting_id == new_local_id
+    assert new_snapshot_result.meeting.title == "Atomic Replacement Launch"
+    assert any(
+        "atomic replacement marker" in hit.excerpt.text.casefold()
+        for hit in new_snapshot_result.evidence
+    )
 
 
 def test_obsidian_failure_is_post_publish_and_retry_clears_diagnostic(

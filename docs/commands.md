@@ -97,6 +97,11 @@ combined; `--to` can be used by itself or as an upper bound.
 | `mm c "what did we decide?" --context 2` | Explicitly adds two neighboring chunks around each lexical match. |
 | `mm t "migration"` | Experimental source-backed topic dossier. It starts from search evidence, labels heuristic matches as possible decisions/tasks/risks/questions, and still shows evidence when structured memory is empty. It is not an LLM answer. |
 
+User-facing search, meeting, topic, evidence, and generated-note renderers print the stable
+`mm open --source-uuid UUID --external-id ID` form. Arguments are shell-escaped, so the displayed
+command can be pasted safely even when an external ID contains whitespace or shell metacharacters.
+Generation-local integer forms remain accepted only as explicit shortcuts.
+
 Context and entity hydration never carry a generation-local chunk ID into another SQLite
 snapshot. Every hit is batch-resolved by stable `evidence_id` inside one explicit read transaction
 that remains open through the final context/entity SELECT, and its `MeetingRef` must still match. A

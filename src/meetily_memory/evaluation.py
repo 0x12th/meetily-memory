@@ -13,12 +13,14 @@ from typing import Any, ClassVar
 
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import existing_index_connection
-from meetily_memory.domain import MeetingSearchResult, RetrievalSource, SearchHit
+from meetily_memory.domain import MeetingRef, MeetingSearchResult, RetrievalSource, SearchHit
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
 from meetily_memory.retrieval import (
     LexicalRetrievalStrategy,
     MeetingRetrievalStrategy,
     RetrievalStrategy,
+    search_hits_with_builtin_snapshot,
+    search_meetings_with_builtin_snapshot,
 )
 from meetily_memory.tagging import TagRepository
 
@@ -457,11 +459,21 @@ def retrieve_results(
     context: int,
 ) -> tuple[MeetingSearchResult, ...]:
     if config.meeting_strategy is not None:
-        return config.meeting_strategy.search_meetings(query, limit, context)
+        return search_meetings_with_builtin_snapshot(
+            repository,
+            config.meeting_strategy,
+            query,
+            limit,
+            context,
+        )
     strategy = config.strategy or LexicalRetrievalStrategy(repository)
-    hits = strategy.search(query, limit)
-    if context:
-        hits = repository.expand_search_hits(hits, context)
+    hits = search_hits_with_builtin_snapshot(
+        repository,
+        strategy,
+        query,
+        limit,
+        context,
+    )
     return collapse_search_hits(repository, hits, config.mode)
 
 
@@ -505,18 +517,17 @@ def collapse_search_hits(
     hits: tuple[SearchHit, ...],
     mode: str,
 ) -> tuple[MeetingSearchResult, ...]:
-    grouped: dict[tuple[int, str], list[SearchHit]] = {}
+    grouped: dict[MeetingRef, list[SearchHit]] = {}
     for hit in hits:
-        key = (hit.meeting.id, hit.meeting.external_id)
+        key = hit.meeting.ref
         grouped.setdefault(key, []).append(hit)
     source = RetrievalSource.SEMANTIC if mode == "semantic" else RetrievalSource.FTS
     results: list[MeetingSearchResult] = []
-    for key, evidence in grouped.items():
-        meeting_id = key[0]
+    for evidence in grouped.values():
         meeting = evidence[0].meeting
         results.append(
             MeetingSearchResult(
-                meeting_id=meeting_id,
+                meeting_id=meeting.id,
                 meeting=meeting,
                 rank=len(results) + 1,
                 match_sources=(source,),

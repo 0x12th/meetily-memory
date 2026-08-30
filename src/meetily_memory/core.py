@@ -45,6 +45,7 @@ from meetily_memory.retrieval import (
     MeetingRetrievalStrategy,
     RetrievalStrategy,
     TagRetrievalStrategy,
+    search_meetings_with_builtin_snapshot,
 )
 from meetily_memory.tagging import TagRepository
 
@@ -114,11 +115,15 @@ class MeetilyMemoryCore:
         *,
         filters: MeetingSearchFilters | None = None,
     ) -> SearchResults:
-        return SearchResults(
-            query=query,
-            context=context,
-            results=self._meeting_retrieval.search_meetings(query, limit, context, filters=filters),
+        results = search_meetings_with_builtin_snapshot(
+            self._repository,
+            self._meeting_retrieval,
+            query,
+            limit,
+            context,
+            filters=filters,
         )
+        return SearchResults(query=query, context=context, results=results)
 
     def resolve_search_hit(self, evidence_id: str) -> SearchHit:
         hit = self._repository.get_search_hit(evidence_id)

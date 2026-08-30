@@ -462,7 +462,12 @@ def test_cli_search_explains_tag_only_match(meetily_db: Path, tmp_path: Path) ->
     assert "#2 Dobrynya Follow-up" in result.stdout
     assert "matched tag: сбер" in result.stdout
     assert "chunk #" not in result.stdout
-    assert "open: mm open 2" in result.stdout
+    meeting = IndexRepository.open_existing(index_path).get_meeting_by_local_id(2)
+    assert meeting is not None
+    assert (
+        "open: mm open --source-uuid "
+        f"{meeting['source_uuid']} --external-id {meeting['external_id']}" in result.stdout
+    )
 
 
 @requires_sqlite_vec

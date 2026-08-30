@@ -2,7 +2,6 @@ import base64
 import binascii
 import hashlib
 import re
-import shlex
 import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -11,6 +10,7 @@ from typing import Any, cast
 
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.json_codec import dumps_json, loads_json
+from meetily_memory.open_commands import markdown_inline_code, stable_meeting_open_command
 from meetily_memory.serializers import (
     meeting_payload,
     structured_signal_payload,
@@ -704,21 +704,16 @@ def render_obsidian_meeting_note(
         "",
         note_ref.identity_marker,
         "",
-        f"- Meetily ID: `{meeting_ref['external_id']}`",
-        f"- Source UUID: `{meeting_ref['source_uuid']}`",
+        f"- Meetily ID: {markdown_inline_code(str(meeting_ref['external_id']))}",
+        f"- Source UUID: {markdown_inline_code(str(meeting_ref['source_uuid']))}",
         f"- Date: {meeting.get('updated_at') or meeting.get('created_at') or ''}",
-        "- Open: `"
-        + shlex.join(
-            [
-                "mm",
-                "open",
-                "--source-uuid",
-                str(meeting_ref["source_uuid"]),
-                "--external-id",
-                str(meeting_ref["external_id"]),
-            ]
-        )
-        + "`",
+        "- Open: "
+        + markdown_inline_code(
+            stable_meeting_open_command(
+                meeting_ref["source_uuid"],
+                meeting_ref["external_id"],
+            )
+        ),
     ]
     return "\n".join(lines).rstrip() + "\n"
 

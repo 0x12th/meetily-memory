@@ -356,6 +356,23 @@ class UserStateRepository:
     def open_existing(cls, state_path: Path) -> "UserStateRepository":
         return cls(state_path, _read_only=True)
 
+    @property
+    def read_only_uri(self) -> str:
+        self.recheck_identity()
+        if self._state_identity is None:
+            message = "A validated user-state identity is required for pinned access."
+            raise RuntimeError(message)
+        return f"{self._state_identity.physical_path.as_uri()}?mode=ro"
+
+    def recheck_identity(self) -> None:
+        if self._state_identity is None:
+            message = "A validated user-state identity is required for pinned access."
+            raise RuntimeError(message)
+        _require_user_state_identity(
+            self.state_path,
+            expected=self._state_identity,
+        )
+
     def open_existing_writer(self) -> "UserStateRepository":
         if not self.read_only:
             return self
@@ -2149,7 +2166,10 @@ def content_fingerprint(text: str) -> str:
 
 
 def validate_existing_user_state_schema(conn: sqlite3.Connection) -> None:
-    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    validate_existing_user_state_version(int(conn.execute("PRAGMA user_version").fetchone()[0]))
+
+
+def validate_existing_user_state_version(version: int) -> None:
     if version != CURRENT_USER_STATE_SCHEMA_VERSION:
         if version > CURRENT_USER_STATE_SCHEMA_VERSION:
             message = (

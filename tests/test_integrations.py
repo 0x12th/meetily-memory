@@ -806,6 +806,23 @@ def test_limited_sync_is_non_destructive_and_plan_order_is_deterministic(
     assert stale_path.exists()
 
 
+def test_meeting_renderer_uses_safe_inline_code_for_identifiers_and_command() -> None:
+    note = render_obsidian_meeting_note(
+        {
+            "local_id": 41,
+            "ref": {"source_uuid": "source`a", "external_id": "meeting`a"},
+            "title": "Backtick meeting",
+        }
+    )
+
+    assert note.splitlines()[4:7] == [
+        "- Meetily ID: `` meeting`a ``",
+        "- Source UUID: `` source`a ``",
+        "- Date: ",
+    ]
+    assert "- Open: ``` mm open --source-uuid 'source`a' --external-id 'meeting`a' ```" in note
+
+
 def test_meeting_renderer_keeps_source_aware_persistent_open_command() -> None:
     first = render_obsidian_meeting_note(
         {

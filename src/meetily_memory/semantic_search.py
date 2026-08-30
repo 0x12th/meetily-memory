@@ -5,7 +5,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -62,6 +62,25 @@ class EmbeddingProvider(Protocol):
     def dims(self) -> int | None: ...
 
     def embed(self, texts: list[str], *, role: EmbeddingRole) -> list[list[float]]: ...
+
+
+@dataclass(frozen=True)
+class PreparedSemanticQuery:
+    provider: str
+    model: str
+    embedding: tuple[float, ...]
+
+
+def prepare_semantic_query(
+    query: str,
+    provider: EmbeddingProvider,
+) -> PreparedSemanticQuery:
+    embedding = provider.embed([query], role="query")[0]
+    return PreparedSemanticQuery(
+        provider=provider.name,
+        model=provider.model,
+        embedding=tuple(embedding),
+    )
 
 
 @dataclass(frozen=True)
@@ -176,19 +195,35 @@ class OllamaEmbeddingProvider:
         return [normalize_embedding(parse_embedding(values)) for values in raw_embeddings]
 
 
-def semantic_search(
+def semantic_search(  # noqa: PLR0913
     index_path: Path,
     query: str,
     limit: int = 10,
     *,
     embedding_provider: EmbeddingProvider | None = None,
     filters: MeetingSearchFilters | None = None,
+    connection: sqlite3.Connection | None = None,
+    prepared_query: PreparedSemanticQuery | None = None,
 ) -> list[Row]:
     provider = embedding_provider or resolve_embedding_provider()
-    query_embedding = provider.embed([query], role="query")[0]
+    if prepared_query is None:
+        if connection is not None:
+            message = "Semantic query embedding must be prepared before opening a read snapshot."
+            raise RuntimeError(message)
+        prepared_query = prepare_semantic_query(query, provider)
+    if prepared_query.provider != provider.name or prepared_query.model != provider.model:
+        message = "Prepared semantic query does not match the configured embedding provider."
+        raise RuntimeError(message)
+    query_embedding = prepared_query.embedding
     dimensions = len(query_embedding)
     vector_table = vector_table_name(provider, dimensions)
-    with existing_index_connection(index_path) as conn:
+    if connection is not None and not connection.in_transaction:
+        message = "Semantic connection must be inside an explicit read snapshot."
+        raise RuntimeError(message)
+    connection_context = (
+        existing_index_connection(index_path) if connection is None else nullcontext(connection)
+    )
+    with connection_context as conn:
         load_sqlite_vec(conn)
         require_semantic_schema(conn, vector_table)
         if count_indexed_embeddings(conn, provider, dimensions) == 0:
@@ -229,7 +264,7 @@ def semantic_search(
         rows = conn.execute(
             semantic_sql,
             (
-                serialize_float32(query_embedding),
+                serialize_float32(list(query_embedding)),
                 limit,
                 *time_params,
                 provider.name,
@@ -549,8 +584,16 @@ def count_indexed_embeddings(
 def semantic_index_coverage(
     index_path: Path,
     provider: EmbeddingProvider,
+    *,
+    connection: sqlite3.Connection | None = None,
 ) -> SemanticIndexCoverage:
-    with existing_index_connection(index_path) as conn:
+    if connection is not None and not connection.in_transaction:
+        message = "Semantic coverage connection must be inside an explicit read snapshot."
+        raise RuntimeError(message)
+    connection_context = (
+        existing_index_connection(index_path) if connection is None else nullcontext(connection)
+    )
+    with connection_context as conn:
         total_chunks = int(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         dimensions = indexed_dimensions(conn, provider)
         metadata_exists = conn.execute(

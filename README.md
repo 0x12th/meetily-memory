@@ -37,7 +37,7 @@ opening the original:
 
 ```text
 #10 Meeting 2026-07-06
-open: mm open 10
+open: mm open --source-uuid 8fd43c7b-4e82-4e91-aab1-6bd92131bc20 --external-id meeting-10
 
 12:56:36 | chunk #3863
 If I write to the database, I must also publish to Kafka...
@@ -46,7 +46,7 @@ If I write to the database, I must also publish to Kafka...
 Open the meeting:
 
 ```bash
-mm open 10
+mm open --source-uuid 8fd43c7b-4e82-4e91-aab1-6bd92131bc20 --external-id meeting-10
 ```
 
 If Meetily cannot be discovered automatically:

@@ -252,7 +252,9 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert "Launch Planning" in search.stdout
     assert "pricing decision" in search.stdout
     assert "chunk #" in search.stdout
-    assert "open: mm open 1" in search.stdout
+    with sqlite3.connect(index_path) as conn:
+        source_uuid = str(conn.execute("SELECT source_uuid FROM sources").fetchone()[0])
+    assert f"open: mm open --source-uuid {source_uuid} --external-id meeting-1" in search.stdout
 
     context = runner.invoke(app, ["--index", str(index_path), "c", "Who owns migration risks?"])
     assert context.exit_code == 0
@@ -326,7 +328,9 @@ def test_cli_search_can_include_neighboring_context(meetily_db: Path, tmp_path: 
     assert "Alice confirmed the launch checklist and pricing decision." in search.stdout
     assert "Open question: who owns partner review?" in search.stdout
     assert "context" in search.stdout
-    assert "open: mm open 1" in search.stdout
+    with sqlite3.connect(index_path) as conn:
+        source_uuid = str(conn.execute("SELECT source_uuid FROM sources").fetchone()[0])
+    assert f"open: mm open --source-uuid {source_uuid} --external-id meeting-1" in search.stdout
 
 
 def test_cli_search_filters_text_and_json_results_by_inclusive_dates(

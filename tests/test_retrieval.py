@@ -1,7 +1,12 @@
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import override
+
+import pytest
 
 from meetily_memory import retrieval
 from meetily_memory.context_builder import ContextRenderer
@@ -15,7 +20,11 @@ from meetily_memory.domain import (
 )
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
-from meetily_memory.semantic_search import LocalHashEmbeddingProvider, index_semantic_embeddings
+from meetily_memory.semantic_search import (
+    EmbeddingRole,
+    LocalHashEmbeddingProvider,
+    index_semantic_embeddings,
+)
 from meetily_memory.tagging import TagRepository, TagService
 from meetily_memory.user_state import UserStateRepository
 from tests.semantic_helpers import requires_sqlite_vec
@@ -52,6 +61,61 @@ class FixedMeetingRetrievalStrategy:
         return self.results[:limit]
 
 
+class SnapshotTrackingEmbeddingProvider:
+    def __init__(self) -> None:
+        self.delegate: LocalHashEmbeddingProvider = LocalHashEmbeddingProvider()
+        self.snapshot_open: bool = False
+        self.query_snapshot_states: list[bool] = []
+
+    @property
+    def name(self) -> str:
+        return self.delegate.name
+
+    @property
+    def model(self) -> str:
+        return self.delegate.model
+
+    @property
+    def dims(self) -> int | None:
+        return self.delegate.dims
+
+    def embed(self, texts: list[str], *, role: EmbeddingRole) -> list[list[float]]:
+        if role == "query":
+            self.query_snapshot_states.append(self.snapshot_open)
+        return self.delegate.embed(texts, role=role)
+
+
+class FailingQueryEmbeddingProvider:
+    name = "hash"
+    model = "local-hash-v1"
+    dims: int | None = 128
+
+    def __init__(self) -> None:
+        self.query_calls = 0
+
+    def embed(self, texts: list[str], *, role: EmbeddingRole) -> list[list[float]]:
+        del texts
+        assert role == "query"
+        self.query_calls += 1
+        message = "provider unavailable during query preparation"
+        raise RuntimeError(message)
+
+
+class NoCallEmbeddingProvider:
+    name = "hash"
+    model = "local-hash-v1"
+    dims: int | None = 128
+
+    def __init__(self) -> None:
+        self.query_calls = 0
+
+    def embed(self, texts: list[str], *, role: EmbeddingRole) -> list[list[float]]:
+        del texts, role
+        self.query_calls += 1
+        message = "incomplete semantic index must skip the provider"
+        raise AssertionError(message)
+
+
 def test_core_delegates_public_search_to_meeting_retrieval_strategy(
     meetily_db: Path,
     tmp_path: Path,
@@ -75,6 +139,80 @@ def test_core_delegates_public_search_to_meeting_retrieval_strategy(
     response = core.search("query ignored by strategy").results
 
     assert response == (result,)
+
+
+def test_core_respects_overridden_builtin_meeting_strategy_method(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    repository = IndexRepository(index_path)
+    lexical_hit = repository.search_hits("pricing decision")[0]
+    expected = MeetingSearchResult(
+        meeting_id=lexical_hit.meeting.id,
+        meeting=lexical_hit.meeting,
+        rank=1,
+        match_sources=(RetrievalSource.FTS,),
+        evidence=(lexical_hit,),
+        matched_tags=(),
+    )
+
+    class CustomLexicalTagStrategy(retrieval.LexicalTagMeetingRetrievalStrategy):
+        @override
+        def search_meetings(
+            self,
+            query: str,
+            limit: int = 10,
+            context: int = 0,
+            *,
+            filters: MeetingSearchFilters | None = None,
+        ) -> tuple[MeetingSearchResult, ...]:
+            del query
+            return super().search_meetings(
+                "pricing decision",
+                limit,
+                context,
+                filters=filters,
+            )
+
+    strategy = CustomLexicalTagStrategy(
+        repository=repository,
+        lexical=retrieval.LexicalRetrievalStrategy(repository),
+        tags=retrieval.TagRetrievalStrategy(TagRepository(repository.state_path)),
+    )
+    core = MeetilyMemoryCore(index_path, meeting_retrieval_strategy=strategy)
+
+    assert core.search("query ignored by override").results == (expected,)
+
+
+def test_builtin_meeting_strategy_respects_overridden_builtin_retrieval_method(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    repository = IndexRepository(index_path)
+    expected_hit = repository.search_hits("pricing decision")[0]
+
+    class CustomLexicalStrategy(retrieval.LexicalRetrievalStrategy):
+        @override
+        def search(
+            self,
+            query: str,
+            limit: int = 10,
+            *,
+            filters: MeetingSearchFilters | None = None,
+        ) -> tuple[SearchHit, ...]:
+            del query, limit, filters
+            return (expected_hit,)
+
+    core = MeetilyMemoryCore(index_path, retrieval_strategy=CustomLexicalStrategy(repository))
+
+    result = core.search("query ignored by override").results[0]
+
+    assert result.evidence == (expected_hit,)
+    assert result.meeting == expected_hit.meeting
 
 
 def test_meeting_retrieval_expands_candidates_until_limit_has_unique_meetings(
@@ -266,25 +404,25 @@ class FailingRetrievalStrategy:
         raise RuntimeError(message)
 
 
-def test_hybrid_strategy_skips_semantic_when_index_is_incomplete(
+def test_hybrid_strategy_skips_provider_when_semantic_index_is_incomplete(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    lexical_hit = IndexRepository(index_path).search_hits("migration risks", 1)[0]
-    semantic = FailingRetrievalStrategy()
+    repository = IndexRepository(index_path)
+    provider = NoCallEmbeddingProvider()
     strategy = retrieval.HybridRetrievalStrategy(
-        repository=IndexRepository(index_path),
-        lexical=FixedRetrievalStrategy((lexical_hit,)),
-        semantic=semantic,
-        tags=retrieval.TagRetrievalStrategy(TagRepository(IndexRepository(index_path).state_path)),
-        semantic_provider=LocalHashEmbeddingProvider(),
+        repository=repository,
+        lexical=retrieval.LexicalRetrievalStrategy(repository),
+        semantic=retrieval.SemanticRetrievalStrategy(repository, provider),
+        tags=retrieval.TagRetrievalStrategy(TagRepository(repository.state_path)),
+        semantic_provider=provider,
     )
 
     result = strategy.search_with_trace("migration risks", 5)
 
-    assert semantic.calls == 0
+    assert provider.query_calls == 0
     assert result.trace.semantic_status == "incomplete"
     assert result.results[0].match_sources == (retrieval.RetrievalSource.FTS,)
 
@@ -313,6 +451,80 @@ def test_hybrid_strategy_falls_back_when_ready_semantic_search_fails(
     assert semantic.calls == 1
     assert result.trace.semantic_status == "error"
     assert result.results[0].match_sources == (retrieval.RetrievalSource.FTS,)
+
+
+@requires_sqlite_vec
+def test_hybrid_strategy_keeps_lexical_and_tag_results_when_query_prepare_fails(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    index_semantic_embeddings(
+        index_path,
+        embedding_provider=LocalHashEmbeddingProvider(),
+    )
+    repository = IndexRepository(index_path)
+    TagService(repository).assign(("1",), ("migration risks",))
+    provider = FailingQueryEmbeddingProvider()
+    strategy = retrieval.HybridRetrievalStrategy(
+        repository=repository,
+        lexical=retrieval.LexicalRetrievalStrategy(repository),
+        semantic=retrieval.SemanticRetrievalStrategy(repository, provider),
+        tags=retrieval.TagRetrievalStrategy(TagRepository(repository.state_path)),
+        semantic_provider=provider,
+    )
+
+    result = strategy.search_with_trace("migration risks", 5)
+
+    assert provider.query_calls == 1
+    assert result.trace.semantic_status == "error"
+    assert result.results
+    assert {source for item in result.results for source in item.match_sources} >= {
+        retrieval.RetrievalSource.FTS,
+        retrieval.RetrievalSource.TAG,
+    }
+    assert any(item.matched_tags == ("migration risks",) for item in result.results)
+
+
+@requires_sqlite_vec
+def test_core_prepares_hybrid_embedding_before_opening_operation_snapshot(
+    meetily_db: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    provider = SnapshotTrackingEmbeddingProvider()
+    index_semantic_embeddings(index_path, embedding_provider=provider)
+    repository = IndexRepository.open_existing(index_path)
+    strategy = retrieval.HybridRetrievalStrategy(
+        repository=repository,
+        lexical=retrieval.LexicalRetrievalStrategy(repository),
+        semantic=retrieval.SemanticRetrievalStrategy(repository, provider),
+        tags=retrieval.TagRetrievalStrategy(TagRepository.open_existing(repository.state_path)),
+        semantic_provider=provider,
+    )
+    core = MeetilyMemoryCore(index_path, meeting_retrieval_strategy=strategy)
+    original_operation_snapshot = IndexRepository.operation_snapshot
+
+    @contextmanager
+    def tracked_operation_snapshot(
+        snapshot_repository: IndexRepository,
+    ) -> Generator[sqlite3.Connection, None, None]:
+        provider.snapshot_open = True
+        try:
+            with original_operation_snapshot(snapshot_repository) as connection:
+                yield connection
+        finally:
+            provider.snapshot_open = False
+
+    monkeypatch.setattr(IndexRepository, "operation_snapshot", tracked_operation_snapshot)
+
+    results = core.search("migration risks", limit=1).results
+
+    assert results
+    assert provider.query_snapshot_states == [False]
 
 
 @requires_sqlite_vec

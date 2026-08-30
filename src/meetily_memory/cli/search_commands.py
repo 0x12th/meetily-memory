@@ -19,6 +19,7 @@ from meetily_memory.cli.common import (
 from meetily_memory.cli.renderers import print_topic_memory
 from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, ContextRenderer
 from meetily_memory.domain import AmbiguousMeetingError, MeetingRef, MeetingSearchFilters
+from meetily_memory.open_commands import stable_meeting_open_command
 from meetily_memory.serializers import (
     meeting_search_result_payload,
     topic_alias_payload,
@@ -126,7 +127,14 @@ def print_search_meeting_header(result: dict[str, object]) -> None:
     date = compact_date(meeting.get("updated_at") or meeting.get("created_at"))
     suffix = f" ({date})" if date else ""
     console.print(f"#{meeting_id} {meeting['title']}{suffix}")
-    console.print(f"open: mm open {meeting_id}")
+    meeting_ref = cast("dict[str, object]", meeting["ref"])
+    print_text_block(
+        "open: "
+        + stable_meeting_open_command(
+            meeting_ref["source_uuid"],
+            meeting_ref["external_id"],
+        )
+    )
 
 
 def print_search_excerpt(result: dict[str, object]) -> None:

@@ -1,6 +1,7 @@
 from typing import cast
 
 from meetily_memory.cli.common import compact_date, print_text_block
+from meetily_memory.open_commands import stable_meeting_open_command
 
 
 def print_topic_memory(memory: dict[str, object]) -> None:
@@ -118,7 +119,12 @@ def print_search_meeting_summaries(rows: list[dict[str, object]]) -> None:
         seen.add(meeting_id)
         date = compact_date(row.get("updated_at") or row.get("created_at"))
         suffix = f" ({date})" if date else ""
-        print_text_block(f"- #{meeting_id} {row['title']}{suffix} | open: mm open {meeting_id}")
+        meeting_ref = cast("dict[str, object]", row["meeting_ref"])
+        open_command = stable_meeting_open_command(
+            meeting_ref["source_uuid"],
+            meeting_ref["external_id"],
+        )
+        print_text_block(f"- #{meeting_id} {row['title']}{suffix} | open: {open_command}")
 
 
 def print_entity_bullets(rows: list[dict[str, object]]) -> None:
@@ -272,7 +278,11 @@ def print_evidence_bullets(
         if row.get("speaker"):
             prefix_parts.append(str(row["speaker"]))
         prefix = f"{' | '.join(prefix_parts)}: " if prefix_parts else ""
+        meeting_ref = cast("dict[str, object]", row["meeting_ref"])
+        open_command = stable_meeting_open_command(
+            meeting_ref["source_uuid"],
+            meeting_ref["external_id"],
+        )
         print_text_block(
-            f"- {prefix}{row['text']} | Source: {entity_source(row)} "
-            f"| open: mm open {row['meeting_local_id']}"
+            f"- {prefix}{row['text']} | Source: {entity_source(row)} | open: {open_command}"
         )

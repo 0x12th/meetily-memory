@@ -42,11 +42,9 @@ class FixedEvaluationStrategy:
         query: str,
         limit: int = 10,
         *,
-        meeting_id: int | None = None,
-        context: int = 0,
         filters: MeetingSearchFilters | None = None,
     ) -> tuple[SearchHit, ...]:
-        del query, meeting_id, context, filters
+        del query, filters
         return self.hits[:limit]
 
 
