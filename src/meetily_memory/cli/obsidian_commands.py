@@ -7,6 +7,7 @@ import typer
 from meetily_memory.cli.common import make_typer, print_json, print_text_block
 from meetily_memory.config.settings import ObsidianSettings, load_app_settings, update_app_settings
 from meetily_memory.integrations import obsidian_root_dir, sync_obsidian_vault
+from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
 
 obsidian_app = make_typer("Sync Meetily Memory into Obsidian.")
 
@@ -66,16 +67,20 @@ def obsidian_sync(
     if not settings.obsidian.vault_path:
         message = "Obsidian is not configured. Run `mm obsidian init`."
         raise typer.BadParameter(message)
-    result = sync_obsidian_vault(
-        ctx.obj["index_path"],
-        Path(settings.obsidian.vault_path),
-        settings.obsidian.folder,
-    )
-    update_app_settings(
-        settings_path=ctx.obj["settings_path"],
-        expected_obsidian=settings.obsidian,
-        obsidian_last_sync_at=utc_now_iso(),
-    )
+    try:
+        with RefreshLock(ctx.obj["index_path"]):
+            result = sync_obsidian_vault(
+                ctx.obj["index_path"],
+                Path(settings.obsidian.vault_path),
+                settings.obsidian.folder,
+            )
+            update_app_settings(
+                settings_path=ctx.obj["settings_path"],
+                expected_obsidian=settings.obsidian,
+                obsidian_last_sync_at=utc_now_iso(),
+            )
+    except RefreshLockBusyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if json_output:
         print_json(result.as_payload())
         return

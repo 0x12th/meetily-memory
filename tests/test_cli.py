@@ -10,6 +10,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
+from meetily_memory.cli import obsidian_commands
 from meetily_memory.cli.app import app
 from meetily_memory.cli.common import open_path
 from meetily_memory.cli.search_commands import parse_search_filters
@@ -19,7 +20,9 @@ from meetily_memory.config.settings import (
 )
 from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.db.repository import IndexRepository
+from meetily_memory.integrations import ObsidianSyncResult
 from meetily_memory.json_codec import loads_json
+from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
 from meetily_memory.tagging import TagRepository
 
 
@@ -821,7 +824,11 @@ def test_cli_removed_public_commands_are_not_available() -> None:
         assert result.exit_code != 0
 
 
-def test_cli_init_status_and_obsidian_sync(meetily_db: Path, tmp_path: Path) -> None:
+def test_cli_init_status_and_obsidian_sync(
+    meetily_db: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     index_path = tmp_path / "index.sqlite"
     data_dir = tmp_path / "data"
     vault_dir = tmp_path / "vault"
@@ -860,6 +867,21 @@ def test_cli_init_status_and_obsidian_sync(meetily_db: Path, tmp_path: Path) -> 
     assert obsidian_init.exit_code == 0
     assert "obsidian vault:" in obsidian_init.stdout
 
+    original_sync = obsidian_commands.sync_obsidian_vault
+    lock_checked = False
+
+    def sync_while_lock_is_held(
+        index: Path,
+        vault: Path,
+        folder: str,
+    ) -> ObsidianSyncResult:
+        nonlocal lock_checked
+        with pytest.raises(RefreshLockBusyError), RefreshLock(index_path):
+            pass
+        lock_checked = True
+        return original_sync(index, vault, folder)
+
+    monkeypatch.setattr(obsidian_commands, "sync_obsidian_vault", sync_while_lock_is_held)
     obsidian_sync = runner.invoke(
         app,
         [
@@ -871,6 +893,7 @@ def test_cli_init_status_and_obsidian_sync(meetily_db: Path, tmp_path: Path) -> 
         env=env,
     )
     assert obsidian_sync.exit_code == 0
+    assert lock_checked
     assert "obsidian files synced:" in obsidian_sync.stdout
     meeting_note = next(
         (vault_dir / "Meetily Memory" / "Meetings").glob("Dobrynya Follow-up--m-*.md")
