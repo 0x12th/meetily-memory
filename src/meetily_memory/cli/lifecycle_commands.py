@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import shutil
-import sqlite3
 import subprocess
-from dataclasses import replace
 from datetime import UTC, datetime
 from locale import getlocale
 from pathlib import Path
-from shlex import join as shell_join
 from typing import Annotated
 
 import typer
@@ -26,30 +23,25 @@ from meetily_memory.config.settings import (
     normalize_ui_language,
     update_app_settings,
 )
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
-from meetily_memory.db.repository import IndexRepository
+from meetily_memory.db.schema_family import INDEX_SCHEMA_USER_VERSION
+from meetily_memory.db.state_schema import StateSchemaError
 from meetily_memory.diagnostics import (
     DatabaseDiagnostic,
     inspect_database_status,
     inspect_local_databases,
     inspect_source_database,
 )
-from meetily_memory.integrations import sync_obsidian_vault
-from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
-from meetily_memory.repositories.records import PostPublishIssue
-from meetily_memory.scanner.meetily_sqlite import (
-    MeetilySQLiteScanner,
-    ScanResult,
-    inspect_meetily_schema,
-    meeting_external_ids,
-    previous_index_backup_path,
+from meetily_memory.refresh import (
+    PublishedIndex,
+    relocate_selected_source_locked,
+    switch_selected_source_locked,
 )
+from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
+from meetily_memory.scanner.meetily_sqlite import inspect_meetily_schema
 from meetily_memory.user_state import (
     AmbiguousSourceIdentityError,
-    SourcePathClaim,
     UserStateRepository,
     find_existing_source_by_uuid,
-    find_existing_source_for_settings_path,
 )
 
 app = make_typer("Local Meetily history lifecycle commands.")
@@ -62,61 +54,6 @@ def utc_now_iso() -> str:
 
 
 SOURCE_KIND = "meetily_sqlite"
-
-
-def _rebind_compensation_checkpoint(_name: str) -> None:
-    return
-
-
-class PostPublishRefreshError(RuntimeError):
-    run_id: int
-    issues: tuple[PostPublishIssue, ...]
-
-    def __init__(self, run_id: int, issues: tuple[PostPublishIssue, ...]) -> None:
-        message = (
-            f"Index run #{run_id} completed, but post-publish work failed. "
-            "The searchable index is current; run `mm status` for a safe retry action."
-        )
-        super().__init__(message)
-        self.run_id = run_id
-        self.issues = issues
-
-
-def settings_update_issue(
-    source_uuid: str,
-    source_path: Path,
-    retry_command: tuple[str, ...],
-) -> PostPublishIssue:
-    return PostPublishIssue(
-        phase="settings_update",
-        error_type="SettingsUpdateError",
-        action="Retry the published source after fixing settings file access.",
-        source_uuid=source_uuid,
-        source_path=str(source_path),
-        retry_command=retry_command,
-    )
-
-
-def obsidian_sync_issue(
-    index_path: Path,
-    source_uuid: str,
-    source_path: Path,
-) -> PostPublishIssue:
-    return PostPublishIssue(
-        phase="obsidian_sync",
-        error_type="ObsidianSyncError",
-        action="Retry Obsidian sync for the published source after fixing its configuration.",
-        source_uuid=source_uuid,
-        source_path=str(source_path),
-        retry_command=(
-            "mm",
-            "--index",
-            str(index_path),
-            "refresh",
-            "--source",
-            str(source_path),
-        ),
-    )
 
 
 def require_canonical_source_path(path: Path) -> Path:
@@ -153,47 +90,9 @@ def resolve_existing_rebind_source_uuid(
             message = f"Source UUID {source_uuid} has an incompatible source kind."
             raise typer.BadParameter(message)
         return source_uuid
-    if settings.source_path:
-        try:
-            source = find_existing_source_for_settings_path(
-                state_path,
-                SOURCE_KIND,
-                settings.source_path,
-            )
-        except AmbiguousSourceIdentityError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        if source is not None:
-            return str(source["uuid"])
-        message = (
-            f"No state-owned source has the exact legacy path: {settings.source_path}. "
-            "Pass --source-uuid UUID to choose the identity to repair."
-        )
-        raise typer.BadParameter(message)
+
     message = "No source identity is selected. Pass --source-uuid UUID with --rebind."
     raise typer.BadParameter(message)
-
-
-def migrated_source_settings(index_path: Path, settings_path: Path) -> AppSettings:
-    settings = load_app_settings(settings_path)
-    if settings.source_uuid:
-        return settings
-    if not settings.source_path:
-        return settings
-    state_source = find_existing_source_for_settings_path(
-        Path(index_path).with_name("state.sqlite"),
-        SOURCE_KIND,
-        settings.source_path,
-    )
-    if state_source is None:
-        message = (
-            "Legacy settings source_path has no exact state-owned current_path or pending "
-            f"projected_path match: {settings.source_path}. Select the source explicitly with "
-            "`mm config source PATH`, or repair an existing UUID with "
-            "`mm config source PATH --rebind --source-uuid UUID`."
-        )
-        raise typer.BadParameter(message)
-    source_uuid = str(state_source["uuid"])
-    return replace(settings, source_uuid=source_uuid, source_path=None)
 
 
 def configured_source_path(
@@ -203,7 +102,7 @@ def configured_source_path(
 ) -> Path | None:
     if explicit_source is not None:
         return require_canonical_source_path(explicit_source)
-    settings = migrated_source_settings(index_path, settings_path)
+    settings = load_app_settings(settings_path)
     if settings.source_uuid:
         source = find_existing_source_by_uuid(
             Path(index_path).with_name("state.sqlite"),
@@ -241,84 +140,26 @@ def configured_source_path(
 def scan_update(
     index_path: Path,
     source_path: Path,
-    *,
-    finalize: bool = True,
-) -> tuple[dict[str, object], ScanResult]:
-    result = MeetilySQLiteScanner(index_path).scan(
-        source_path,
-        analyze=False,
-        finalize=finalize,
-    )
-
+) -> tuple[dict[str, object], PublishedIndex]:
+    user_state = source_state_repository(index_path)
+    source_uuid = resolve_source_uuid(user_state, source_path)
+    result = switch_selected_source_locked(index_path, user_state, source_uuid)
     payload: dict[str, object] = {
-        "source_uuid": result.source_uuid,
-        "source_local_id": result.source_id,
-        "meetings_seen": result.meetings_seen,
-        "meetings_inserted": result.meetings_inserted,
-        "meetings_updated": result.meetings_updated,
-        "meetings_analyzed": result.meetings_analyzed,
-        "chunks_seen": result.chunks_seen,
-        "chunks_inserted": result.chunks_inserted,
-        "chunks_updated": result.chunks_updated,
+        "source_uuid": result.source.source_uuid,
+        "source_revision": result.source.source_revision,
+        "meetings_seen": result.meetings,
+        "chunks_seen": result.chunks,
+        "fts_rows": result.fts_rows,
+        "index_bytes": result.bytes,
     }
-
     return payload, result
 
 
 def print_update_payload(payload: dict[str, object]) -> None:
-    console.print(f"meetings seen: {payload['meetings_seen']}")
-    console.print(f"meetings inserted: {payload['meetings_inserted']}")
-    console.print(f"meetings updated: {payload['meetings_updated']}")
-    console.print(f"meetings analyzed: {payload['meetings_analyzed']}")
-    console.print(f"chunks seen: {payload['chunks_seen']}")
-
-
-def post_publish_retry_commands(details: object) -> tuple[tuple[str, ...], ...]:
-    if not isinstance(details, dict):
-        return ()
-    issues = details.get("issues")
-    if not isinstance(issues, list):
-        return ()
-    retry_commands: set[tuple[str, ...]] = set()
-    for issue in issues:
-        if not isinstance(issue, dict):
-            continue
-        command = issue.get("retry_command")
-        if not isinstance(command, list):
-            continue
-        typed_command: list[str] = []
-        for argument in command:
-            if not isinstance(argument, str):
-                break
-            typed_command.append(argument)
-        else:
-            retry_commands.add(tuple(typed_command))
-    return tuple(sorted(retry_commands))
-
-
-def print_scan_diagnostics(diagnostics: dict[str, dict[str, object] | None]) -> None:
-    completed = diagnostics["last_completed_run"]
-    failed = diagnostics["last_failed_run"]
-    running = diagnostics["last_running_run"]
-    post_publish = diagnostics.get("last_post_publish_error")
-    if completed:
-        print_text_block(f"last completed run: #{completed['id']} at {completed['finished_at']}")
-    if failed:
-        print_text_block(
-            f"last failed run: #{failed['id']} during {failed['phase']} ({failed['error_message']})"
-        )
-    if running:
-        started_at = running.get("started_at") or "unknown"
-        phase = running.get("phase") or "unknown"
-        print_text_block(f"running run: #{running['id']} since {started_at} during {phase}")
-    if post_publish:
-        print_text_block(
-            "post-publish error: "
-            f"run #{post_publish['id']} during {post_publish['phase']} "
-            f"({post_publish['error_message']})"
-        )
-        for retry_command in post_publish_retry_commands(post_publish.get("post_publish")):
-            print_text_block(f"post-publish retry: {shell_join(retry_command)}")
+    console.print(f"meetings: {payload['meetings_seen']}")
+    console.print(f"chunks: {payload['chunks_seen']}")
+    console.print(f"fts rows: {payload['fts_rows']}")
+    console.print(f"source revision: {payload['source_revision']}")
 
 
 def print_database_diagnostic(label: str, diagnostic: DatabaseDiagnostic) -> None:
@@ -366,33 +207,12 @@ def init(
                 message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
                 raise typer.BadParameter(message)
             payload, result = scan_update(ctx.obj["index_path"], source_path)
-            source_uuid = str(payload["source_uuid"])
-            repo = IndexRepository(ctx.obj["index_path"])
-            try:
-                settings = update_app_settings(
-                    settings_path=ctx.obj["settings_path"],
-                    source_uuid=source_uuid,
-                    source_path=None,
-                    last_update_at=utc_now_iso(),
-                )
-            except Exception:  # noqa: BLE001
-                settings = None
-            if settings is None:
-                issue = settings_update_issue(
-                    source_uuid,
-                    source_path,
-                    (
-                        "mm",
-                        "--index",
-                        str(ctx.obj["index_path"]),
-                        "init",
-                        "--source",
-                        str(source_path),
-                    ),
-                )
-                repo.record_post_publish_failure(result.run_id, (issue,))
-                raise PostPublishRefreshError(result.run_id, (issue,)) from None
-            repo.resolve_post_publish_failures(source_uuid, ("settings_update",))
+            update_app_settings(
+                settings_path=ctx.obj["settings_path"],
+                source_uuid=result.source.source_uuid,
+                source_path=None,
+                last_update_at=utc_now_iso(),
+            )
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -423,7 +243,6 @@ def status(
     configured_source = diagnostic_source_path(settings, diagnostics.configured_source_path)
     source_path = str(configured_source) if configured_source else None
     stats = diagnostics.stats
-    scan_diagnostics = diagnostics.scan_runs
     obsidian_configured = bool(settings.obsidian.vault_path)
     resolved_ui_language = resolve_diagnostic_ui_language(
         settings, diagnostics.dominant_meeting_language
@@ -437,7 +256,6 @@ def status(
         "resolved_ui_language": resolved_ui_language,
         "last_update_at": settings.last_update_at,
         "obsidian_configured": obsidian_configured,
-        **scan_diagnostics,
         **stats,
     }
     if json_output:
@@ -453,7 +271,6 @@ def status(
     print_text_block(f"obsidian: {'configured' if obsidian_configured else 'not configured'}")
     print_text_block(f"meetings: {stats['meetings']}")
     print_text_block(f"chunks: {stats['chunks']}")
-    print_scan_diagnostics(scan_diagnostics)
 
 
 @config_app.command("language")
@@ -528,29 +345,42 @@ def config_source(
                 except (AmbiguousSourceIdentityError, ValueError, RuntimeError) as exc:
                     raise typer.BadParameter(str(exc)) from exc
                 try:
-                    repo = IndexRepository(index_path, state_path=user_state.state_path)
-                    repo.heal_pending_source_path_projection(rebind_uuid)
-                    claim = user_state.claim_source_path(
+                    relocated = relocate_selected_source_locked(
+                        index_path,
+                        user_state,
                         rebind_uuid,
-                        SOURCE_KIND,
                         new_path,
                         now=utc_now_iso(),
                     )
-                    payload = rebind_source_identity(
-                        index_path,
-                        user_state,
-                        claim,
-                        new_path,
-                        ctx.obj["settings_path"],
-                        repo=repo,
+                    update_app_settings(
+                        settings_path=ctx.obj["settings_path"],
+                        source_uuid=rebind_uuid,
+                        source_path=None,
+                        last_update_at=utc_now_iso(),
                     )
+                    payload = {
+                        "source_uuid": rebind_uuid,
+                        "old_source_path": str(relocated.previous_path),
+                        "new_source_path": str(relocated.published.source.source_path),
+                        "matching_meetings": relocated.published.meetings,
+                        "source_revision": relocated.published.source.source_revision,
+                        "rebound": True,
+                    }
                 except (AmbiguousSourceIdentityError, ValueError, RuntimeError) as exc:
                     raise typer.BadParameter(str(exc)) from exc
             else:
-                payload = select_source(
-                    source_state_repository(index_path),
-                    new_path,
-                    ctx.obj["settings_path"],
+                payload, selected = scan_update(index_path, new_path)
+                update_app_settings(
+                    settings_path=ctx.obj["settings_path"],
+                    source_uuid=selected.source.source_uuid,
+                    source_path=None,
+                    last_update_at=utc_now_iso(),
+                )
+                payload.update(
+                    {
+                        "source_path": str(selected.source.source_path),
+                        "rebound": False,
+                    }
                 )
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -566,93 +396,6 @@ def config_source(
     print_text_block(f"source uuid: {payload['source_uuid']}")
 
 
-def select_source(
-    user_state: UserStateRepository,
-    new_path: Path,
-    settings_path: Path,
-) -> dict[str, object]:
-    new_path = require_canonical_source_path(new_path)
-    source_uuid = resolve_source_uuid(user_state, new_path)
-    update_app_settings(
-        settings_path=settings_path,
-        source_uuid=source_uuid,
-        source_path=None,
-    )
-    return {"source_uuid": source_uuid, "source_path": str(new_path), "rebound": False}
-
-
-def finalize_source_path_claim(
-    user_state: UserStateRepository,
-    claim: SourcePathClaim,
-) -> None:
-    if user_state.finalize_source_path_claim(claim):
-        return
-    message = f"Source path claim for UUID {claim.source_uuid} changed before finalization."
-    raise RuntimeError(message)
-
-
-def rebind_source_identity(
-    index_path: Path,
-    user_state: UserStateRepository,
-    claim: SourcePathClaim,
-    new_path: Path,
-    settings_path: Path,
-    *,
-    repo: IndexRepository | None = None,
-) -> dict[str, object]:
-    new_path = require_canonical_source_path(new_path)
-    try:
-        repo = repo or IndexRepository(index_path, state_path=user_state.state_path)
-        target_ids = meeting_external_ids(new_path)
-        indexed_ids = repo.rebind_source_path_projection(claim)
-        matching = indexed_ids & target_ids
-        update_app_settings(
-            settings_path=settings_path,
-            source_uuid=claim.source_uuid,
-            source_path=None,
-        )
-        finalize_source_path_claim(user_state, claim)
-    except BaseException as exc:
-        try:
-            rollback_claim = user_state.begin_source_path_rollback(
-                claim,
-                now=utc_now_iso(),
-            )
-        except (RuntimeError, sqlite3.Error):
-            rollback_claim = None
-        projection_restored = False
-        state_finalized = False
-        if rollback_claim is not None:
-            _rebind_compensation_checkpoint("rollback_pending")
-            if repo is not None:
-                try:
-                    projection_restored = repo.restore_source_path_projection(rollback_claim)
-                except (OSError, RuntimeError, ValueError, sqlite3.Error):
-                    projection_restored = False
-            if projection_restored:
-                _rebind_compensation_checkpoint("index_rolled_back")
-                try:
-                    state_finalized = user_state.finalize_source_path_claim(rollback_claim)
-                except (RuntimeError, sqlite3.Error):
-                    state_finalized = False
-        if rollback_claim is None or not projection_restored or not state_finalized:
-            message = (
-                "Source rebind failed and automatic compensation was incomplete. "
-                f"State UUID {claim.source_uuid} remains authoritative; a newer claim or a "
-                "persisted rollback-pending claim was not fully reconciled. Inspect state/index "
-                "paths and rerun refresh or explicit --rebind before scanning."
-            )
-            raise RuntimeError(message) from exc
-        raise
-    return {
-        "source_uuid": claim.source_uuid,
-        "old_source_path": claim.previous_path,
-        "new_source_path": claim.claimed_path,
-        "matching_meetings": len(matching),
-        "rebound": True,
-    }
-
-
 @app.command(hidden=True)
 def scan(
     ctx: typer.Context,
@@ -661,14 +404,6 @@ def scan(
         typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
-    force: Annotated[
-        bool,
-        typer.Option("--force", help="Reindex unchanged meetings and rebuild FTS rows."),
-    ] = False,
-    analyze_output: Annotated[
-        bool,
-        typer.Option("--analyze/--no-analyze", help="Analyze new or changed meetings."),
-    ] = True,
 ) -> None:
     try:
         with RefreshLock(ctx.obj["index_path"]):
@@ -678,92 +413,42 @@ def scan(
             if source_path is None:
                 message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
                 raise typer.BadParameter(message)
-            result = MeetilySQLiteScanner(ctx.obj["index_path"]).scan(
-                source_path,
-                force=force,
-                analyze=analyze_output,
+            payload, result = scan_update(ctx.obj["index_path"], source_path)
+            update_app_settings(
+                settings_path=ctx.obj["settings_path"],
+                source_uuid=result.source.source_uuid,
+                source_path=None,
+                last_update_at=utc_now_iso(),
             )
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    payload = {
-        "source_uuid": result.source_uuid,
-        "source_local_id": result.source_id,
-        "meetings_seen": result.meetings_seen,
-        "meetings_inserted": result.meetings_inserted,
-        "meetings_updated": result.meetings_updated,
-        "meetings_analyzed": result.meetings_analyzed,
-        "chunks_seen": result.chunks_seen,
-        "chunks_inserted": result.chunks_inserted,
-        "chunks_updated": result.chunks_updated,
-    }
     if json_output:
         print_json(payload)
         return
-    console.print(f"meetings seen: {result.meetings_seen}")
-    console.print(f"meetings inserted: {result.meetings_inserted}")
-    console.print(f"meetings updated: {result.meetings_updated}")
-    console.print(f"meetings analyzed: {result.meetings_analyzed}")
-    console.print(f"chunks seen: {result.chunks_seen}")
+    print_update_payload(payload)
 
 
 def run_refresh(
     index_path: Path,
     settings_path: Path,
     source_path: Path,
-) -> tuple[dict[str, object], bool]:
+) -> dict[str, object]:
     source_path = require_canonical_source_path(source_path)
-    previous_backup = previous_index_backup_path(index_path)
-    discard_previous_backup = previous_backup.exists()
-    settings = load_app_settings(settings_path)
-    payload, result = scan_update(
-        index_path,
-        source_path,
-        finalize=False,
-    )
-    repo = IndexRepository(index_path)
-    source_uuid = result.source_uuid
-    obsidian_synced_at: str | None = None
-    obsidian_synced = False
-    failures: list[PostPublishIssue] = []
-    if settings.obsidian.vault_path and settings.obsidian.sync_after_update:
-        try:
-            sync_obsidian_vault(
-                index_path,
-                Path(settings.obsidian.vault_path),
-                settings.obsidian.folder,
-            )
-            obsidian_synced_at = utc_now_iso()
-            obsidian_synced = True
-        except Exception:  # noqa: BLE001
-            failures.append(obsidian_sync_issue(index_path, source_uuid, source_path))
-        else:
-            repo.resolve_post_publish_failures(source_uuid, ("obsidian_sync",))
+    payload, result = scan_update(index_path, source_path)
     try:
         update_app_settings(
             settings_path=settings_path,
-            expected_obsidian=settings.obsidian if obsidian_synced_at else None,
-            obsidian_last_sync_at=obsidian_synced_at,
-            source_uuid=source_uuid,
+            source_uuid=result.source.source_uuid,
             source_path=None,
             last_update_at=utc_now_iso(),
         )
-    except Exception:  # noqa: BLE001
-        failures.append(
-            settings_update_issue(
-                source_uuid,
-                source_path,
-                ("mm", "--index", str(index_path), "refresh", "--source", str(source_path)),
-            )
+    except Exception as exc:
+        message = (
+            "The fresh index was published and must not be rolled back, but state settings could "
+            "not record the refresh timestamp. Fix state.sqlite access and rerun `mm refresh`."
         )
-    else:
-        repo.resolve_post_publish_failures(source_uuid, ("settings_update",))
-    if failures:
-        issues = tuple(failures)
-        repo.record_post_publish_failure(result.run_id, issues)
-        raise PostPublishRefreshError(result.run_id, issues) from None
-    if discard_previous_backup:
-        previous_backup.unlink(missing_ok=True)
-    return payload, obsidian_synced
+        raise RuntimeError(message) from exc
+    return payload
 
 
 @app.command("refresh")
@@ -783,7 +468,7 @@ def refresh(
             if source_path is None:
                 message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
                 raise typer.BadParameter(message)
-            payload, obsidian_synced = run_refresh(
+            payload = run_refresh(
                 ctx.obj["index_path"],
                 ctx.obj["settings_path"],
                 source_path,
@@ -791,12 +476,9 @@ def refresh(
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
-        payload["obsidian_synced"] = obsidian_synced
         print_json(payload)
         return
     print_update_payload(payload)
-    if obsidian_synced:
-        console.print("obsidian sync: yes")
 
 
 @app.command("update")
@@ -827,26 +509,17 @@ def db_status(
     diagnostics = status_diagnostics.local
     index_database = diagnostics.index_database
     state_database = diagnostics.state_database
-    migration_report = status_diagnostics.migration_report
     orphaned_tag_assignments = status_diagnostics.orphaned_tag_assignments
-    migration_status = {
-        "current": "current",
-        "legacy": "rebuild_required",
-        "missing": "missing",
-        "incompatible": "incompatible",
-    }[index_database.status]
     payload = {
         "index_path": str(index_path),
         "state_path": str(state_path),
         "schema_version": index_database.schema_version,
-        "current_schema_version": CURRENT_SCHEMA_VERSION,
+        "current_schema_version": INDEX_SCHEMA_USER_VERSION,
         "schema_status": index_database.status,
         "state_schema_version": state_database.schema_version,
         "state_schema_status": state_database.status,
-        "migration_status": migration_status,
         "index_database": index_database.as_payload(),
         "state_database": state_database.as_payload(),
-        "user_state_migration": migration_report,
         "orphaned_tag_assignments": orphaned_tag_assignments,
         "details_error": status_diagnostics.details_error,
     }
@@ -859,9 +532,8 @@ def db_status(
     print_text_block(
         f"schema version: {schema_version if schema_version is not None else 'missing'}"
     )
-    print_text_block(f"current schema version: {CURRENT_SCHEMA_VERSION}")
+    print_text_block(f"current schema version: {INDEX_SCHEMA_USER_VERSION}")
     print_text_block(f"schema status: {index_database.status}")
-    print_text_block(f"migration status: {migration_status}")
     orphaned_label = (
         str(orphaned_tag_assignments) if orphaned_tag_assignments is not None else "unavailable"
     )
@@ -872,12 +544,6 @@ def db_status(
         print_text_block(f"state database error: {state_database.error}")
     if status_diagnostics.details_error:
         print_text_block(f"database details error: {status_diagnostics.details_error}")
-    if migration_report:
-        print_text_block(
-            "user state migration: "
-            f"{migration_report['migrated']} migrated, "
-            f"{migration_report['orphaned']} orphaned"
-        )
 
 
 @app.command()
@@ -887,14 +553,16 @@ def doctor(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     index_path = ctx.obj["index_path"]
-    settings = load_app_settings(ctx.obj["settings_path"])
+    try:
+        settings = load_app_settings(ctx.obj["settings_path"])
+    except StateSchemaError:
+        settings = AppSettings()
     diagnostics = inspect_local_databases(index_path, settings.source_uuid)
     configured_source = diagnostic_source_path(settings, diagnostics.configured_source_path)
     source_path = source.expanduser() if source else configured_source or discover_meetily_db()
     source_diagnostic = inspect_source_database(source_path)
     fts5 = sqlite_has_fts5()
     stats = diagnostics.stats
-    scan_diagnostics = diagnostics.scan_runs
     payload = {
         "index_path": str(index_path),
         "index_database": diagnostics.index_database.as_payload(),
@@ -905,7 +573,6 @@ def doctor(
         "source_schema_error": source_diagnostic.schema_error,
         "source_read_error": source_diagnostic.read_error,
         "fts5": fts5,
-        **scan_diagnostics,
         **stats,
     }
     if json_output:
@@ -924,8 +591,3 @@ def doctor(
     console.print(f"fts5: {'yes' if fts5 else 'no'}")
     console.print(f"meetings: {stats['meetings']}")
     console.print(f"chunks: {stats['chunks']}")
-    console.print(f"decisions: {stats['decisions']}")
-    console.print(f"action items: {stats['action_items']}")
-    console.print(f"risks: {stats['risks']}")
-    console.print(f"open questions: {stats['open_questions']}")
-    print_scan_diagnostics(scan_diagnostics)

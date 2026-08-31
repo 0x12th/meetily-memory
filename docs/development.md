@@ -56,11 +56,9 @@ creation, release-asset upload, and the publish job.
 
 Repository boundary:
 
-`IndexRepository` is a compatibility facade for the public core API and legacy
-call sites. New low-level persistence behavior should live in concrete
-repositories such as search, meetings, knowledge, entities, or task status.
-New user-facing workflows should be added in `core`, not as pass-through
-methods on the facade.
+`IndexRepository` is a compatibility facade for the public Core API. New low-level persistence
+behavior should live in the focused search or meeting repositories. New user-facing workflows
+belong in `core`, not as pass-through methods on the facade.
 
 Enable pre-commit hooks:
 

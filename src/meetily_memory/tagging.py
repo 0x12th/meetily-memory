@@ -8,26 +8,22 @@ from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from meetily_memory.db.row_decode import decode_required_integer, decode_required_text
 from meetily_memory.db.schema import (
     OPERATION_STATE_SCHEMA,
     IndexReadError,
     missing_user_state_message,
 )
+from meetily_memory.db.state_schema import StateSchemaError
 from meetily_memory.domain import MeetingRef
-from meetily_memory.user_state import (
-    ensure_user_state_schema,
-    validate_existing_user_state_schema,
-)
+from meetily_memory.user_state import UserStateRepository, validate_existing_user_state_schema
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterator
+    from collections.abc import Generator
 
     from meetily_memory.repositories.index import IndexRepository
-    from meetily_memory.semantic_search import EmbeddingProvider
 
 TAG_SUGGESTION_LIMIT = 5
-SEMANTIC_SUGGESTION_CANDIDATES = 50
-SEMANTIC_SUGGESTION_QUERY_LENGTH = 8_000
 TAG_READ_BATCH_SIZE = 200
 
 
@@ -54,14 +50,6 @@ class TagMatch:
     meeting_ref: MeetingRef
     tag: Tag
     kind: str
-
-    @property
-    def source_uuid(self) -> str:
-        return self.meeting_ref.source_uuid
-
-    @property
-    def meeting_external_id(self) -> str:
-        return self.meeting_ref.external_id
 
 
 @dataclass(frozen=True)
@@ -91,12 +79,9 @@ class TagRepository:
         if self.read_only:
             if not self.state_path.is_file():
                 raise IndexReadError(missing_user_state_message(self.state_path))
-            with self._connect() as conn:
-                validate_existing_user_state_schema(conn)
+            UserStateRepository.open_existing(self.state_path)
             return
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            ensure_user_state_schema(conn)
+        UserStateRepository(self.state_path)
 
     @classmethod
     def open_existing(cls, state_path: Path) -> TagRepository:
@@ -131,7 +116,7 @@ class TagRepository:
             for tag in tags:
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO tags (
+                    INSERT OR IGNORE INTO manual_tags (
                       normalized_name, display_name, created_at
                     ) VALUES (?, ?, ?)
                     """,
@@ -140,30 +125,35 @@ class TagRepository:
                 stored = conn.execute(
                     """
                     SELECT id, display_name
-                    FROM tags
+                    FROM manual_tags
                     WHERE normalized_name = ?
                     """,
                     (tag.normalized_name,),
                 ).fetchone()
-                tag_id = int(stored["id"])
+                if stored is None:
+                    message = f"Manual tag disappeared after insert: {tag.normalized_name}"
+                    raise StateSchemaError(message)
+                tag_id = _tag_integer(stored["id"], "manual_tags", "id", "tag assignment")
                 tag_added_links = 0
                 for identity in identities:
                     cursor = conn.execute(
                         """
                         INSERT OR IGNORE INTO meeting_tags (
-                          source_uuid, meeting_external_id, tag_id, source, created_at
-                        ) VALUES (?, ?, ?, 'manual', ?)
+                          source_uuid, meeting_external_id, manual_tag_id, created_at
+                        ) VALUES (?, ?, ?, ?)
                         """,
                         (
                             identity.source_uuid,
-                            identity.meeting_external_id,
+                            identity.external_id,
                             tag_id,
                             now,
                         ),
                     )
                     added_links += cursor.rowcount
                     tag_added_links += cursor.rowcount
-                display_name = str(stored["display_name"])
+                display_name = _tag_text(
+                    stored["display_name"], "manual_tags", "display_name", "tag assignment"
+                )
                 if tag_added_links:
                     added_tags.append(display_name)
                 if tag_added_links < len(identities):
@@ -201,13 +191,13 @@ class TagRepository:
         with self._connect() as conn:
             for tag in tags:
                 row = conn.execute(
-                    "SELECT id FROM tags WHERE normalized_name = ?",
+                    "SELECT id FROM manual_tags WHERE normalized_name = ?",
                     (tag.normalized_name,),
                 ).fetchone()
                 if row is None:
                     missing_tags.append(tag.display_name)
                     continue
-                tag_id = int(row["id"])
+                tag_id = _tag_integer(row["id"], "manual_tags", "id", "tag removal")
                 tag_removed_links = 0
                 for identity in identities:
                     cursor = conn.execute(
@@ -215,11 +205,11 @@ class TagRepository:
                         DELETE FROM meeting_tags
                         WHERE source_uuid = ?
                           AND meeting_external_id = ?
-                          AND tag_id = ?
+                          AND manual_tag_id = ?
                         """,
                         (
                             identity.source_uuid,
-                            identity.meeting_external_id,
+                            identity.external_id,
                             tag_id,
                         ),
                     )
@@ -231,10 +221,11 @@ class TagRepository:
                     missing_tags.append(tag.display_name)
                 conn.execute(
                     """
-                    DELETE FROM tags
+                    DELETE FROM manual_tags
                     WHERE id = ?
                       AND NOT EXISTS (
-                        SELECT 1 FROM meeting_tags WHERE meeting_tags.tag_id = tags.id
+                        SELECT 1 FROM meeting_tags
+                        WHERE meeting_tags.manual_tag_id = manual_tags.id
                       )
                     """,
                     (tag_id,),
@@ -258,13 +249,24 @@ class TagRepository:
                 """
                 SELECT t.normalized_name, t.display_name
                 FROM meeting_tags mt
-                JOIN tags t ON t.id = mt.tag_id
+                JOIN manual_tags t ON t.id = mt.manual_tag_id
                 WHERE mt.source_uuid = ? AND mt.meeting_external_id = ?
                 ORDER BY t.id
                 """,
                 (source_uuid, meeting_external_id),
             ).fetchall()
-        return tuple(Tag(str(row["normalized_name"]), str(row["display_name"])) for row in rows)
+        return tuple(
+            Tag(
+                _tag_text(
+                    row["normalized_name"],
+                    "manual_tags",
+                    "normalized_name",
+                    "meeting tag list",
+                ),
+                _tag_text(row["display_name"], "manual_tags", "display_name", "meeting tag list"),
+            )
+            for row in rows
+        )
 
     def list_for_meetings(self, refs: tuple[MeetingRef, ...]) -> dict[MeetingRef, tuple[Tag, ...]]:
         unique_refs = tuple(dict.fromkeys(refs))
@@ -292,14 +294,36 @@ class TagRepository:
                     JOIN meeting_tags mt
                       ON mt.source_uuid = requested.source_uuid
                      AND mt.meeting_external_id = requested.external_id
-                    JOIN tags t ON t.id = mt.tag_id
+                    JOIN manual_tags t ON t.id = mt.manual_tag_id
                     ORDER BY requested.request_order, t.id
                     """  # noqa: S608
                 rows = conn.execute(sql, params).fetchall()
                 for row in rows:
-                    ref = MeetingRef(str(row["source_uuid"]), str(row["external_id"]))
+                    context = "meeting tag batch list"
+                    ref = MeetingRef(
+                        _tag_text(row["source_uuid"], "meeting_tags", "source_uuid", context),
+                        _tag_text(
+                            row["external_id"],
+                            "meeting_tags",
+                            "meeting_external_id",
+                            context,
+                        ),
+                    )
                     tags_by_ref[ref].append(
-                        Tag(str(row["normalized_name"]), str(row["display_name"]))
+                        Tag(
+                            _tag_text(
+                                row["normalized_name"],
+                                "manual_tags",
+                                "normalized_name",
+                                context,
+                            ),
+                            _tag_text(
+                                row["display_name"],
+                                "manual_tags",
+                                "display_name",
+                                context,
+                            ),
+                        )
                     )
         return {ref: tuple(tags) for ref, tags in tags_by_ref.items()}
 
@@ -336,13 +360,16 @@ class TagRepository:
               t.normalized_name,
               t.display_name
             FROM {schema}.meeting_tags mt
-            JOIN {schema}.tags t ON t.id = mt.tag_id
+            JOIN {schema}.manual_tags t ON t.id = mt.manual_tag_id
             ORDER BY mt.meeting_external_id, t.normalized_name
             """  # noqa: S608
         ).fetchall()
         matches: list[TagMatch] = []
         for row in rows:
-            normalized_name = str(row["normalized_name"])
+            context = "tag search"
+            normalized_name = _tag_text(
+                row["normalized_name"], "manual_tags", "normalized_name", context
+            )
             kind = (
                 "exact"
                 if normalized_name == normalized_query
@@ -355,17 +382,27 @@ class TagRepository:
             matches.append(
                 TagMatch(
                     meeting_ref=MeetingRef(
-                        source_uuid=str(row["source_uuid"]),
-                        external_id=str(row["meeting_external_id"]),
+                        source_uuid=_tag_text(
+                            row["source_uuid"], "meeting_tags", "source_uuid", context
+                        ),
+                        external_id=_tag_text(
+                            row["meeting_external_id"],
+                            "meeting_tags",
+                            "meeting_external_id",
+                            context,
+                        ),
                     ),
-                    tag=Tag(normalized_name, str(row["display_name"])),
+                    tag=Tag(
+                        normalized_name,
+                        _tag_text(row["display_name"], "manual_tags", "display_name", context),
+                    ),
                     kind=kind,
                 )
             )
         return tuple(
             sorted(
                 matches,
-                key=lambda match: (match.kind != "exact", match.meeting_external_id),
+                key=lambda match: (match.kind != "exact", match.meeting_ref.external_id),
             )
         )
 
@@ -379,19 +416,39 @@ class TagRepository:
                   t.normalized_name,
                   t.display_name
                 FROM meeting_tags mt
-                JOIN tags t ON t.id = mt.tag_id
+                JOIN manual_tags t ON t.id = mt.manual_tag_id
                 ORDER BY t.id, mt.source_uuid, mt.meeting_external_id
                 """
             ).fetchall()
         return tuple(
             TagAssignment(
                 identity=MeetingRef(
-                    source_uuid=str(row["source_uuid"]),
-                    external_id=str(row["meeting_external_id"]),
+                    source_uuid=_tag_text(
+                        row["source_uuid"],
+                        "meeting_tags",
+                        "source_uuid",
+                        "tag assignment list",
+                    ),
+                    external_id=_tag_text(
+                        row["meeting_external_id"],
+                        "meeting_tags",
+                        "meeting_external_id",
+                        "tag assignment list",
+                    ),
                 ),
                 tag=Tag(
-                    normalized_name=str(row["normalized_name"]),
-                    display_name=str(row["display_name"]),
+                    normalized_name=_tag_text(
+                        row["normalized_name"],
+                        "manual_tags",
+                        "normalized_name",
+                        "tag assignment list",
+                    ),
+                    display_name=_tag_text(
+                        row["display_name"],
+                        "manual_tags",
+                        "display_name",
+                        "tag assignment list",
+                    ),
                 ),
             )
             for row in rows
@@ -399,17 +456,36 @@ class TagRepository:
 
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        if self.read_only:
-            physical_path = self.state_path.resolve(strict=True)
-            connection = sqlite3.connect(f"{physical_path.as_uri()}?mode=ro", uri=True)
-        else:
-            connection = sqlite3.connect(self.state_path)
+        physical_path = self.state_path.resolve(strict=True)
+        mode = "ro" if self.read_only else "rw"
+        connection = sqlite3.connect(f"{physical_path.as_uri()}?mode={mode}", uri=True)
         with closing(connection) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys=ON")
             if self.read_only:
                 conn.execute("PRAGMA query_only=ON")
+            validate_existing_user_state_schema(conn)
             yield conn
+
+
+def _tag_text(value: object, table: str, column: str, context: str) -> str:
+    return decode_required_text(
+        value,
+        table=table,
+        column=column,
+        context=context,
+        error_type=StateSchemaError,
+    )
+
+
+def _tag_integer(value: object, table: str, column: str, context: str) -> int:
+    return decode_required_integer(
+        value,
+        table=table,
+        column=column,
+        context=context,
+        error_type=StateSchemaError,
+    )
 
 
 def normalize_tag_name(value: str) -> str:
@@ -467,7 +543,7 @@ class TagService:
         self._require_meetings((identity,))
         return self.repository.list_for_meeting(
             identity.source_uuid,
-            identity.meeting_external_id,
+            identity.external_id,
         )
 
     def list_all(self) -> tuple[TagCount, ...]:
@@ -487,12 +563,7 @@ class TagService:
         active_refs = self._active_assignment_refs(assignments)
         return sum(assignment.identity not in active_refs for assignment in assignments)
 
-    def suggest(
-        self,
-        identity: MeetingRef,
-        *,
-        embedding_provider: EmbeddingProvider | None = None,
-    ) -> tuple[TagSuggestion, ...]:
+    def suggest(self, identity: MeetingRef) -> tuple[TagSuggestion, ...]:
         meeting = self.index_repository.get_meeting_by_ref(identity)
         if meeting is None:
             message = f"Meeting not found: {identity.source_uuid}/{identity.external_id}"
@@ -501,7 +572,7 @@ class TagService:
             tag.normalized_name
             for tag in self.repository.list_for_meeting(
                 identity.source_uuid,
-                identity.meeting_external_id,
+                identity.external_id,
             )
         }
         active_tags = tuple(
@@ -509,7 +580,13 @@ class TagService:
             for item in self.list_all()
             if item.normalized_name not in assigned
         )
-        title = str(meeting["title"])
+        title = decode_required_text(
+            meeting["title"],
+            table="meetings",
+            column="title",
+            context="tag suggestion meeting",
+            error_type=IndexReadError,
+        )
         text = self.index_repository.meeting_transcript_text(identity)
         suggestions: list[TagSuggestion] = []
         self._append_text_suggestions(
@@ -529,17 +606,7 @@ class TagService:
             text,
             "text match",
         )
-        if len(suggestions) >= TAG_SUGGESTION_LIMIT:
-            return tuple(suggestions)
-        if embedding_provider is None:
-            return tuple(suggestions)
-        return self._append_semantic_suggestions(
-            suggestions,
-            identity,
-            f"{title}\n{text}",
-            embedding_provider,
-            assigned,
-        )
+        return tuple(suggestions)
 
     def _append_text_suggestions(
         self,
@@ -553,95 +620,6 @@ class TagService:
                 return
             if normalized_phrase_in_text(tag.normalized_name, text):
                 suggestions.append(TagSuggestion(tag, reason))
-
-    def _append_semantic_suggestions(
-        self,
-        suggestions: list[TagSuggestion],
-        identity: MeetingRef,
-        document: str,
-        provider: EmbeddingProvider,
-        assigned: set[str],
-    ) -> tuple[TagSuggestion, ...]:
-        from meetily_memory.semantic_search import semantic_index_coverage  # noqa: PLC0415
-
-        try:
-            coverage = semantic_index_coverage(
-                self.index_repository.index_path,
-                provider,
-            )
-        except (RuntimeError, sqlite3.Error):
-            return tuple(suggestions)
-        if not coverage.complete:
-            return tuple(suggestions)
-        source = self._semantic_suggestion_source(identity, document, provider)
-        if source is None:
-            return tuple(suggestions)
-        similar_meeting_id, tags = source
-        suggested = {item.tag.normalized_name for item in suggestions}
-        for tag in tags:
-            if len(suggestions) >= TAG_SUGGESTION_LIMIT:
-                break
-            if tag.normalized_name in assigned or tag.normalized_name in suggested:
-                continue
-            suggestions.append(
-                TagSuggestion(
-                    tag=tag,
-                    reason="similar meeting",
-                    similar_meeting_id=similar_meeting_id,
-                )
-            )
-            suggested.add(tag.normalized_name)
-        return tuple(suggestions)
-
-    def _semantic_suggestion_source(
-        self,
-        identity: MeetingRef,
-        document: str,
-        provider: EmbeddingProvider,
-    ) -> tuple[int, tuple[Tag, ...]] | None:
-        target_ref = identity
-        try:
-            batches = self._semantic_candidate_batches(document, provider)
-            for rows in batches:
-                hits = tuple(
-                    self.index_repository.search_hit_from_row(row)
-                    for row in rows
-                    if MeetingRef(
-                        source_uuid=str(row["source_uuid"]),
-                        external_id=str(row["meeting_external_id"]),
-                    )
-                    != target_ref
-                )
-                tags_by_ref = self.repository.list_for_meetings(
-                    tuple(dict.fromkeys(hit.meeting.ref for hit in hits))
-                )
-                for hit in hits:
-                    tags = tags_by_ref.get(hit.meeting.ref, ())
-                    if tags:
-                        return hit.meeting.id, tags
-        except (RuntimeError, sqlite3.Error):
-            return None
-        return None
-
-    def _semantic_candidate_batches(
-        self,
-        document: str,
-        provider: EmbeddingProvider,
-    ) -> Iterator[list[dict[str, object]]]:
-        from meetily_memory.semantic_search import semantic_search  # noqa: PLC0415
-
-        candidate_limit = SEMANTIC_SUGGESTION_CANDIDATES
-        while True:
-            rows = semantic_search(
-                self.index_repository.index_path,
-                document[:SEMANTIC_SUGGESTION_QUERY_LENGTH],
-                candidate_limit,
-                embedding_provider=provider,
-            )
-            yield rows
-            if len(rows) < candidate_limit:
-                return
-            candidate_limit *= 2
 
     def _active_assignment_refs(
         self,

@@ -11,10 +11,10 @@ from statistics import median
 from time import perf_counter
 from typing import Any, ClassVar
 
-from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import existing_index_connection
 from meetily_memory.domain import MeetingRef, MeetingSearchResult, RetrievalSource, SearchHit
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
+from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.retrieval import (
     LexicalRetrievalStrategy,
     MeetingRetrievalStrategy,
@@ -198,16 +198,6 @@ class EvaluationManifest:
     retrieval_mode: str
     retrieval_parameters: dict[str, Any]
     tag_state_fingerprint: str = ""
-    semantic_provider: str | None = None
-    semantic_model: str | None = None
-    semantic_dimension: int | None = None
-    semantic_model_digest: str | None = None
-    semantic_query_instruction: str | None = None
-    semantic_document_instruction: str | None = None
-    semantic_index_fingerprint: str | None = None
-    chunk_fingerprint: str | None = None
-    semantic_refresh_ms: float | None = None
-    semantic_index_size_bytes: int | None = None
 
     COMPATIBILITY_FIELDS: ClassVar[tuple[str, ...]] = (
         "dataset_fingerprint",
@@ -216,14 +206,6 @@ class EvaluationManifest:
         "retrieval_mode",
         "retrieval_parameters",
         "tag_state_fingerprint",
-        "semantic_provider",
-        "semantic_model",
-        "semantic_dimension",
-        "semantic_model_digest",
-        "semantic_query_instruction",
-        "semantic_document_instruction",
-        "semantic_index_fingerprint",
-        "chunk_fingerprint",
     )
 
     @classmethod
@@ -255,16 +237,6 @@ class EvaluationRetrievalConfig:
     meeting_strategy: MeetingRetrievalStrategy | None = None
     mode: str = "fts5"
     parameters: dict[str, Any] = field(default_factory=dict)
-    semantic_provider: str | None = None
-    semantic_model: str | None = None
-    semantic_dimension: int | None = None
-    semantic_model_digest: str | None = None
-    semantic_query_instruction: str | None = None
-    semantic_document_instruction: str | None = None
-    semantic_index_fingerprint: str | None = None
-    chunk_fingerprint: str | None = None
-    semantic_refresh_ms: float | None = None
-    semantic_index_size_bytes: int | None = None
     repository_root: Path | None = None
     warmup: bool = False
 
@@ -739,16 +711,6 @@ def build_manifest(
         tag_state_fingerprint=tag_state_fingerprint(
             IndexRepository.open_existing(index_path).state_path
         ),
-        semantic_provider=config.semantic_provider,
-        semantic_model=config.semantic_model,
-        semantic_dimension=config.semantic_dimension,
-        semantic_model_digest=config.semantic_model_digest,
-        semantic_query_instruction=config.semantic_query_instruction,
-        semantic_document_instruction=config.semantic_document_instruction,
-        semantic_index_fingerprint=config.semantic_index_fingerprint,
-        chunk_fingerprint=config.chunk_fingerprint,
-        semantic_refresh_ms=config.semantic_refresh_ms,
-        semantic_index_size_bytes=config.semantic_index_size_bytes,
     )
 
 
@@ -756,12 +718,13 @@ def corpus_fingerprint(index_path: Path) -> str:
     with existing_index_connection(index_path) as conn:
         rows = conn.execute(
             """
-            SELECT s.kind, s.path, m.external_id, m.fingerprint, c.external_id,
+            SELECT 'meetily_sqlite' AS kind, i.source_path AS path,
+                   m.external_id, m.fingerprint, c.external_id,
                    c.kind, c.ordinal, c.fingerprint
             FROM chunks c
             JOIN meetings m ON m.id = c.meeting_id
-            JOIN sources s ON s.id = m.source_id
-            ORDER BY s.kind, s.path, m.external_id, c.kind, c.ordinal
+            JOIN index_meta i ON i.singleton = 1
+            ORDER BY kind, path, m.external_id, c.kind, c.ordinal
             """
         ).fetchall()
     return sha256_payload([list(row) for row in rows])
@@ -773,7 +736,7 @@ def tag_state_fingerprint(state_path: Path) -> str:
         [
             [
                 assignment.identity.source_uuid,
-                assignment.identity.meeting_external_id,
+                assignment.identity.external_id,
                 assignment.tag.normalized_name,
             ]
             for assignment in assignments

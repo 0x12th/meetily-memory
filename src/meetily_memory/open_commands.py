@@ -1,5 +1,7 @@
 import shlex
 
+from meetily_memory.domain import MeetingRef
+
 
 def markdown_inline_code(value: str) -> str:
     backtick_count = value.count("`")
@@ -8,14 +10,5 @@ def markdown_inline_code(value: str) -> str:
     return f"{delimiter}{padding}{value}{padding}{delimiter}"
 
 
-def stable_meeting_open_command(source_uuid: object, external_id: object) -> str:
-    return shlex.join(
-        [
-            "mm",
-            "open",
-            "--source-uuid",
-            str(source_uuid),
-            "--external-id",
-            str(external_id),
-        ]
-    )
+def stable_meeting_open_command(meeting_ref: MeetingRef) -> str:
+    return shlex.join(["mm", "open", str(meeting_ref)])

@@ -1,7 +1,21 @@
+import shlex
 import sqlite3
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture
+def platform_opener(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    capture_path = tmp_path / "opener-calls.txt"
+    script = f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(capture_path))}\n"
+    for command in ("open", "xdg-open"):
+        executable = bin_dir / command
+        executable.write_text(script, encoding="utf-8")
+        executable.chmod(0o755)
+    return {"PATH": str(bin_dir)}, capture_path
 
 
 @pytest.fixture

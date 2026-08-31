@@ -1,19 +1,11 @@
 import errno
 import os
-import sqlite3
 import stat
 from pathlib import Path
 
 import pytest
 
-import meetily_memory.durable_files as durable_files_module
-import meetily_memory.scanner.meetily_sqlite as scanner_module
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
 from meetily_memory.durable_files import durable_replace
-from meetily_memory.scanner.meetily_sqlite import (
-    MeetilySQLiteScanner,
-    previous_index_backup_path,
-)
 
 
 def test_durable_replace_orders_file_fsync_replace_and_directory_fsync(
@@ -119,28 +111,3 @@ def test_durable_replace_propagates_directory_io_failure_after_replace(
 
     assert destination_path.read_bytes() == b"rebuilt"
     assert not temporary_path.exists()
-
-
-def test_legacy_rebuild_routes_backup_then_primary_through_durable_replace(
-    meetily_db: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    scanner = MeetilySQLiteScanner(index_path)
-    _ = scanner.scan(meetily_db)
-    with sqlite3.connect(index_path) as conn:
-        _ = conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION - 1}")
-        conn.commit()
-    destinations: list[Path] = []
-    real_durable_replace = durable_files_module.durable_replace
-
-    def recording_durable_replace(temporary_path: Path, destination_path: Path) -> None:
-        destinations.append(destination_path)
-        real_durable_replace(temporary_path, destination_path)
-
-    monkeypatch.setattr(scanner_module, "durable_replace", recording_durable_replace)
-
-    _ = scanner.scan(meetily_db)
-
-    assert destinations == [previous_index_backup_path(index_path), index_path]

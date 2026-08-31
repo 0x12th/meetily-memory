@@ -1,7 +1,7 @@
 [project]
 name = "meetily-memory"
 version = "0.7.0"
-description = "Local-first Meetily history index and CLI"
+description = "Search past Meetily meetings locally and open the original"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -11,11 +11,6 @@ dependencies = [
   "platformdirs>=4.3.0",
   "rich>=13.9.0",
   "typer>=0.12.0",
-]
-
-[project.optional-dependencies]
-semantic = [
-  "sqlite-vec>=0.1.9,<0.2.0",
 ]
 
 
@@ -29,7 +24,6 @@ dev = [
   "pyinstaller>=6.11.0",
   "pytest>=8.3.0",
   "ruff>=0.8.0",
-  "sqlite-vec>=0.1.9,<0.2.0",
   "ty>=0.0.1a21",
 ]
 
@@ -83,17 +77,6 @@ ignore = [
   "ANN401",
   "SLF001",
 ]
-"src/meetily_memory/memory/entities.py" = [
-  "ANN401",
-  "SLF001",
-]
-"src/meetily_memory/memory/knowledge.py" = [
-  "PLR0913",
-  "S608",
-]
-"src/meetily_memory/memory/task_status.py" = [
-  "ANN401",
-]
 "src/meetily_memory/repositories/meetings.py" = [
   "ANN401",
   "S608",
@@ -102,12 +85,8 @@ ignore = [
 "src/meetily_memory/repositories/search.py" = [
   "S608",
 ]
-"src/meetily_memory/semantic_search.py" = [
-  "S608",
-]
-"src/meetily_memory/db/migrations.py" = [
-  "S608",
-]
+
+
 "src/meetily_memory/scanner/meetily_sqlite.py" = [
   "ANN401",
 ]

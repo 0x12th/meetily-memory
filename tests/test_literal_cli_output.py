@@ -8,8 +8,8 @@ from typer.testing import CliRunner
 
 from meetily_memory.cli import lifecycle_commands
 from meetily_memory.cli.app import app
-from meetily_memory.cli.common import console, print_meeting_table
 from meetily_memory.diagnostics import SourceDatabaseDiagnostic
+from meetily_memory.domain import MeetingRef
 from meetily_memory.json_codec import loads_json
 from meetily_memory.open_commands import stable_meeting_open_command
 from meetily_memory.repositories.index import IndexRepository
@@ -44,7 +44,7 @@ def test_search_prints_source_values_literally_and_keeps_json_unchanged(
     runner = CliRunner()
     scan = runner.invoke(
         app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db), "--no-analyze"],
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
     assert scan.exit_code == 0, scan.output
 
@@ -90,35 +90,10 @@ def test_search_prints_source_values_literally_and_keeps_json_unchanged(
     assert excerpt["timestamp_label"] == TIMESTAMP
 
 
-def test_meeting_table_prints_titles_literally(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    rows: list[dict[str, object]] = [
-        {
-            "id": 1,
-            "created_at": "2026-08-28T10:00:00Z",
-            "chunk_count": 1,
-            "source_uuid": "source uuid",
-            "external_id": "meeting'1",
-            "title": TAG,
-        }
-    ]
+def test_open_command_quotes_canonical_ref_as_one_argument() -> None:
+    command = stable_meeting_open_command(MeetingRef("source uuid", "meeting'1"))
 
-    with console.capture() as capture:
-        print_meeting_table(rows)
-
-    output = capture.get() + capsys.readouterr().out
-    assert TAG in output
-    command = stable_meeting_open_command("source uuid", "meeting'1")
-    assert command in output
-    assert shlex.split(command) == [
-        "mm",
-        "open",
-        "--source-uuid",
-        "source uuid",
-        "--external-id",
-        "meeting'1",
-    ]
+    assert shlex.split(command) == ["mm", "open", "source uuid/meeting'1"]
 
 
 def test_doctor_prints_filesystem_paths_and_diagnostic_errors_literally(

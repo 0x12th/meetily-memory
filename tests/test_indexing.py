@@ -1,128 +1,78 @@
+from __future__ import annotations
+
 import sqlite3
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from meetily_memory.db.migrations import (
-    CURRENT_SCHEMA_VERSION,
-    LATEST_IN_PLACE_SCHEMA_VERSION,
-    MIGRATIONS,
-    migrate_to_v1,
-)
-from meetily_memory.db.repository import IndexRepository, build_fts_query
-from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.db.fts import build_fts_query
+from meetily_memory.db.index_snapshot import INDEX_APPLICATION_TABLES
+from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
+from tests.index_helpers import publish_fresh_index
 
-EMPTY_ENTITY_COUNT_SQL = (
-    "SELECT COUNT(*) FROM decisions",
-    "SELECT COUNT(*) FROM action_items",
-    "SELECT COUNT(*) FROM risks",
-    "SELECT COUNT(*) FROM open_questions",
-)
-EMPTY_KNOWLEDGE_COUNT_SQL = (
-    "SELECT COUNT(*) FROM knowledge_nodes",
-    "SELECT COUNT(*) FROM knowledge_edges",
-    "SELECT COUNT(*) FROM topic_aliases",
-)
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def _application_tables(path: Path) -> set[str]:
+    with sqlite3.connect(path) as connection:
+        return {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
 
 
 def test_readonly_meetily_connection_is_context_managed(meetily_db: Path) -> None:
-    with readonly_sqlite_connection(meetily_db) as conn:
-        row = conn.execute(
+    with readonly_sqlite_connection(meetily_db) as connection:
+        row = connection.execute(
             "SELECT title FROM meetings WHERE id = ?",
             ("meeting-1",),
         ).fetchone()
-        title = row[0]
-        assert title == "Launch Planning"
+        assert row[0] == "Launch Planning"
         with pytest.raises(sqlite3.OperationalError):
-            conn.execute("CREATE TABLE should_not_write (id INTEGER)")
+            connection.execute("CREATE TABLE should_not_write (id INTEGER)")
 
     with pytest.raises(sqlite3.ProgrammingError):
-        conn.execute("SELECT 1")
+        connection.execute("SELECT 1")
 
 
-def test_index_schema_uses_builtin_sqlite_migration(tmp_path: Path) -> None:
+def test_scan_builds_exact_fresh_index_with_upstream_ids(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
     index_path = tmp_path / "index.sqlite"
 
-    repo = IndexRepository(index_path)
+    result = publish_fresh_index(index_path, meetily_db)
+    repository = IndexRepository.open_existing(index_path)
 
-    with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
-        assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0
-        for sql in EMPTY_ENTITY_COUNT_SQL:
-            assert conn.execute(sql).fetchone()[0] == 0
-        for sql in EMPTY_KNOWLEDGE_COUNT_SQL:
-            assert conn.execute(sql).fetchone()[0] == 0
-        repo.stats()
-
-
-def test_index_schema_runs_explicit_migrations_from_v1(tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    with sqlite3.connect(index_path) as conn:
-        migrate_to_v1(conn)
-        conn.execute("PRAGMA user_version = 1")
-        conn.commit()
-
-    repo = IndexRepository(index_path)
-
-    assert repo.requires_rebuild is True
-    with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
-        for target_version in range(1, LATEST_IN_PLACE_SCHEMA_VERSION + 1):
-            assert target_version in MIGRATIONS
-        for sql in EMPTY_ENTITY_COUNT_SQL:
-            assert conn.execute(sql).fetchone()[0] == 0
-        for sql in EMPTY_KNOWLEDGE_COUNT_SQL:
-            assert conn.execute(sql).fetchone()[0] == 0
-
-
-def test_index_schema_adds_scan_lifecycle_columns_to_v4_database(tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    with sqlite3.connect(index_path) as conn:
-        for version in range(1, 5):
-            MIGRATIONS[version](conn)
-        conn.execute("DROP TABLE scan_runs")
-        conn.execute(
-            """
-            CREATE TABLE scan_runs (
-              id INTEGER PRIMARY KEY,
-              source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL,
-              started_at TEXT NOT NULL,
-              finished_at TEXT,
-              status TEXT NOT NULL,
-              meetings_seen INTEGER DEFAULT 0,
-              meetings_inserted INTEGER DEFAULT 0,
-              meetings_updated INTEGER DEFAULT 0,
-              chunks_seen INTEGER DEFAULT 0,
-              chunks_inserted INTEGER DEFAULT 0,
-              chunks_updated INTEGER DEFAULT 0,
-              errors_json TEXT
-            )
-            """
-        )
-        conn.execute("PRAGMA user_version = 4")
-        conn.commit()
-
-    repo = IndexRepository(index_path)
-
-    assert repo.requires_rebuild is True
-    with sqlite3.connect(index_path) as conn:
-        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(scan_runs)")}
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
-    assert {"phase", "error_message"} <= columns
-
-
-def test_index_repository_upgrades_v1_database_to_current_tables(tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    with sqlite3.connect(index_path) as conn:
-        migrate_to_v1(conn)
-        conn.execute("PRAGMA user_version = 1")
-        conn.commit()
-
-    repo = IndexRepository(index_path)
-
-    assert repo.requires_rebuild is True
-    expected_tables = {
+    assert result.meetings == 2
+    assert result.chunks >= 4
+    meeting_ref = repository.meeting_ref_for_local_id(1)
+    assert meeting_ref is not None
+    meeting = repository.get_meeting_by_ref(meeting_ref)
+    assert meeting is not None
+    assert meeting["title"] == "Launch Planning"
+    chunks = repository.get_chunks_for_meeting(int(meeting["id"]))
+    assert {chunk["external_id"] for chunk in chunks} >= {
+        "transcript-1",
+        "summary:meeting-1",
+    }
+    assert repository.stats() == {
+        "meetings": 2,
+        "chunks": result.chunks,
+        "sources": 1,
+    }
+    assert _application_tables(index_path) >= INDEX_APPLICATION_TABLES
+    assert {
+        "sources",
+        "scan_runs",
+        "index_generation",
         "decisions",
         "action_items",
         "risks",
@@ -130,65 +80,11 @@ def test_index_repository_upgrades_v1_database_to_current_tables(tmp_path: Path)
         "knowledge_nodes",
         "knowledge_edges",
         "topic_aliases",
-    }
-    with sqlite3.connect(index_path) as conn:
-        actual_tables = {
-            row[0]
-            for row in conn.execute(
-                """
-                SELECT name
-                FROM sqlite_master
-                WHERE type = 'table'
-                """
-            )
-        }
-        assert expected_tables <= actual_tables
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
+    }.isdisjoint(_application_tables(index_path))
 
-
-def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-
-    result = MeetilySQLiteScanner(index_path).scan(meetily_db)
-
-    assert result.meetings_seen == 2
-    assert result.meetings_inserted == 2
-    assert result.chunks_inserted >= 4
-
-    repo = IndexRepository(index_path)
-    source = repo.get_source("meetily_sqlite", str(meetily_db))
-    assert source is not None
-
-    meeting = repo.get_meeting_by_source_id(source["id"], "meeting-1")
-    assert meeting is not None
-    assert meeting["title"] == "Launch Planning"
-
-    chunks = repo.get_chunks_for_meeting(meeting["id"])
-    assert {chunk["external_id"] for chunk in chunks} >= {
-        "transcript-1",
-        "summary:meeting-1",
-    }
-
-    structured_entities = repo.list_structured_entities(meeting["id"])
-    assert {entity["kind"] for entity in structured_entities} >= {
-        "decisions",
-        "open_questions",
-    }
-
-    stats = repo.stats()
-    assert stats["decisions"] >= 1
-    assert stats["action_items"] >= 1
-    assert stats["risks"] >= 1
-    assert stats["open_questions"] >= 1
-    assert stats["knowledge_nodes"] >= 1
-    assert stats["knowledge_edges"] >= 1
-
-    search_results = repo.search("pricing decision")
+    search_results = repository.search("pricing decision")
     assert search_results[0]["meeting_external_id"] == "meeting-1"
     assert "pricing decision" in search_results[0]["text"]
-
-    question_results = repo.search("What was the pricing decision?")
-    assert question_results[0]["meeting_external_id"] == "meeting-1"
 
 
 def test_fts_query_filters_natural_language_noise() -> None:
@@ -199,13 +95,13 @@ def test_fts_query_filters_natural_language_noise() -> None:
 
 
 def test_search_prefers_strict_token_matches_before_or_fallback(
-    meetily_db: Path, tmp_path: Path
+    meetily_db: Path,
+    tmp_path: Path,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
-    scanner = MeetilySQLiteScanner(index_path)
-    scanner.scan(meetily_db)
-    with sqlite3.connect(meetily_db) as conn:
-        conn.execute(
+    publish_fresh_index(index_path, meetily_db)
+    with sqlite3.connect(meetily_db) as connection:
+        connection.execute(
             """
             INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
             VALUES (?, ?, ?, ?, ?)
@@ -218,7 +114,7 @@ def test_search_prefers_strict_token_matches_before_or_fallback(
                 str(tmp_path / "Migration Only"),
             ),
         )
-        conn.execute(
+        connection.execute(
             """
             INSERT INTO transcripts (
                 id, meeting_id, transcript, timestamp, audio_start_time,
@@ -237,22 +133,27 @@ def test_search_prefers_strict_token_matches_before_or_fallback(
                 "Alice",
             ),
         )
-        conn.commit()
-    scanner.scan(meetily_db)
+        connection.commit()
+    publish_fresh_index(index_path, meetily_db)
 
-    results = IndexRepository(index_path).search("migration risks")
+    results = IndexRepository.open_existing(index_path).search("migration risks")
 
     assert results[0]["meeting_external_id"] == "meeting-2"
     assert "migration risks" in str(results[0]["text"])
 
 
 def test_neighbor_context_keeps_lexical_match_before_adjacent_chunks(
-    meetily_db: Path, tmp_path: Path
+    meetily_db: Path,
+    tmp_path: Path,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db)
 
-    results = IndexRepository(index_path).search("partner review", limit=1, context=1)
+    results = IndexRepository.open_existing(index_path).search(
+        "partner review",
+        limit=1,
+        context=1,
+    )
 
     assert results[0]["chunk_external_id"] == "transcript-3"
     assert results[0]["is_context"] is False
@@ -262,57 +163,37 @@ def test_neighbor_context_keeps_lexical_match_before_adjacent_chunks(
 
 def test_scan_reports_unsupported_meetily_schema(tmp_path: Path) -> None:
     source_path = tmp_path / "meeting_minutes.sqlite"
-    with sqlite3.connect(source_path) as conn:
-        conn.execute("CREATE TABLE meetings (id TEXT PRIMARY KEY)")
-        conn.commit()
+    with sqlite3.connect(source_path) as connection:
+        connection.execute("CREATE TABLE meetings (id TEXT PRIMARY KEY)")
+        connection.commit()
 
     with pytest.raises(RuntimeError, match="Meetily DB schema is unsupported"):
-        MeetilySQLiteScanner(tmp_path / "index.sqlite").scan(source_path)
+        publish_fresh_index(tmp_path / "index.sqlite", source_path)
 
 
-def test_scan_is_incremental_and_replaces_changed_meeting_chunks(
-    meetily_db: Path, tmp_path: Path
+def test_second_scan_publishes_fresh_snapshot_with_changed_source_data(
+    meetily_db: Path,
+    tmp_path: Path,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
-    scanner = MeetilySQLiteScanner(index_path)
+    first = publish_fresh_index(index_path, meetily_db)
+    first_inode = index_path.stat().st_ino
 
-    first = scanner.scan(meetily_db)
-    second = scanner.scan(meetily_db)
+    with sqlite3.connect(meetily_db) as connection:
+        connection.execute(
+            "UPDATE transcripts SET transcript = ? WHERE id = ?",
+            (
+                "Dobrynya agreed to send migration risks and budget notes by Friday.",
+                "transcript-2",
+            ),
+        )
+        connection.commit()
 
-    assert first.meetings_inserted == 2
-    assert second.meetings_inserted == 0
-    assert second.meetings_updated == 0
+    second = publish_fresh_index(index_path, meetily_db)
+    results = IndexRepository.open_existing(index_path).search("budget notes")
 
-    conn = sqlite3.connect(meetily_db)
-    conn.execute(
-        "UPDATE transcripts SET transcript = ? WHERE id = ?",
-        ("Dobrynya agreed to send migration risks and budget notes by Friday.", "transcript-2"),
-    )
-    conn.execute(
-        "UPDATE meetings SET updated_at = ? WHERE id = ?",
-        ("2026-07-02T10:00:00Z", "meeting-2"),
-    )
-    conn.commit()
-    conn.close()
-
-    third = scanner.scan(meetily_db)
-
-    assert third.meetings_inserted == 0
-    assert third.meetings_updated == 1
-
-    repo = IndexRepository(index_path)
-    results = repo.search("budget notes")
+    assert second.source.source_uuid == first.source.source_uuid
+    assert second.meetings == 2
+    assert index_path.stat().st_ino != first_inode
     assert len(results) == 1
     assert results[0]["meeting_external_id"] == "meeting-2"
-
-
-def test_force_scan_reindexes_unchanged_meetings(meetily_db: Path, tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    scanner = MeetilySQLiteScanner(index_path)
-
-    scanner.scan(meetily_db)
-    result = scanner.scan(meetily_db, force=True)
-
-    assert result.meetings_inserted == 0
-    assert result.meetings_updated == 2
-    assert result.chunks_updated >= 4

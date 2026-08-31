@@ -1,470 +1,574 @@
 import base64
-import hashlib
 import sqlite3
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
 import meetily_memory.integrations as integrations_module
-from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.db.schema import IndexReadError
+from meetily_memory.domain import MeetingRef
 from meetily_memory.integrations import (
+    LEGACY_OBSIDIAN_MARKER_VERSION,
     MANAGED_MARKER,
     MAX_FILENAME_COMPONENT_BYTES,
+    OBJECT_KEY_VERSION,
+    OBSIDIAN_DIRS,
+    OBSIDIAN_MARKER_VERSION,
     NoteRef,
+    ObsidianMeetingSnapshot,
     PlannedNote,
     apply_obsidian_note_plan,
     build_obsidian_note_plan,
+    build_obsidian_snapshot,
+    legacy_object_key_from_note_text,
     object_key_from_note_text,
     paths_are_same_case_variant,
-    person_stable_key,
     rename_case_variant_exactly,
     render_obsidian_meeting_note,
-    stable_content_fingerprint,
     sync_obsidian_vault,
 )
 from meetily_memory.json_codec import dumps_json, loads_json
-from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.repositories.index import IndexRepository
+from meetily_memory.repositories.snapshot import SnapshotRepository
+from meetily_memory.tagging import TagRepository
+from tests.index_helpers import publish_fresh_index
 
 
-def scan_fixture(meetily_db: Path, tmp_path: Path) -> tuple[Path, MeetilySQLiteScanner]:
+def scan_fixture(meetily_db: Path, tmp_path: Path) -> Path:
     index_path = tmp_path / "index.sqlite"
-    scanner = MeetilySQLiteScanner(index_path)
-    scanner.scan(meetily_db)
-    return index_path, scanner
+    publish_fresh_index(index_path, meetily_db)
+    return index_path
 
 
-def meeting_refs(index_path: Path) -> dict[str, NoteRef]:
-    return {
-        meeting.external_id: NoteRef.meeting(
-            meeting.ref.source_uuid,
-            meeting.external_id,
-            meeting.title,
-        )
-        for meeting in MeetilyMemoryCore(index_path).meetings(limit=100)
-    }
+def assign_tags(
+    index_path: Path,
+    source_uuid: str,
+    meeting_ids: tuple[str, ...],
+    tags: tuple[str, ...],
+) -> None:
+    TagRepository(index_path.with_name("state.sqlite")).assign(
+        source_uuid,
+        meeting_ids,
+        tags,
+        now="2026-08-31T12:00:00Z",
+    )
 
 
 def planned_text(ref: NoteRef) -> str:
     return f"# {ref.display_label}\n\n{ref.identity_marker}\n"
 
 
-def marker_text(payload: object) -> str:
+def marker_text(payload: object, *, version: int) -> str:
     object_key = dumps_json(payload)
     encoded = base64.urlsafe_b64encode(object_key.encode()).decode().rstrip("=")
-    return f"<!-- meetily-memory:managed:v1:{encoded} -->\n"
+    return f"<!-- meetily-memory:managed:v{version}:{encoded} -->\n"
 
 
-def managed_paths(root: Path) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            path.relative_to(root).as_posix()
-            for path in root.glob("*/*.md")
-            if MANAGED_MARKER in path.read_text(encoding="utf-8")
+def legacy_payload(kind: str, **identity: object) -> dict[str, object]:
+    return {"version": 1, "kind": kind, **identity}
+
+
+def meeting_note_refs(index_path: Path) -> dict[str, NoteRef]:
+    snapshot = build_obsidian_snapshot(index_path, 100)
+    return {
+        meeting.ref.external_id: NoteRef.meeting(
+            meeting.ref.source_uuid,
+            meeting.ref.external_id,
+            meeting.title,
         )
-    )
-
-
-def test_obsidian_sync_creates_stable_managed_note_network(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path, _scanner = scan_fixture(meetily_db, tmp_path)
-    vault_path = tmp_path / "vault"
-
-    result = sync_obsidian_vault(index_path, vault_path, "Meetily Memory")
-
-    root = vault_path / "Meetily Memory"
-    refs = meeting_refs(index_path)
-    assert result.root_dir == root
-    assert result.files_written >= 6
-    assert all((root / ref.relative_path).exists() for ref in refs.values())
-    assert (root / "Tasks").is_dir()
-    task_notes = list((root / "Tasks").glob("*.md"))
-    assert task_notes
-    task_text = task_notes[0].read_text(encoding="utf-8")
-    assert MANAGED_MARKER in task_text
-    assert any(ref.wikilink in task_text for ref in refs.values())
-    assert "/meeting-" in task_text
-    assert "Confidence:" not in task_text
-    for external_id, ref in refs.items():
-        note = (root / ref.relative_path).read_text(encoding="utf-8")
-        source_uuid = loads_json(ref.object_key)["source_uuid"]
-        command = f"mm open --source-uuid {source_uuid} --external-id {external_id}"
-        assert command in note
-        assert "mm open 1" not in note
-        assert "mm open 2" not in note
-
-
-def test_duplicate_titles_create_distinct_notes_and_unambiguous_links(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    with sqlite3.connect(meetily_db) as conn:
-        conn.execute("UPDATE meetings SET title = 'Duplicate title'")
-    index_path, _scanner = scan_fixture(meetily_db, tmp_path)
-    vault_path = tmp_path / "vault"
-
-    sync_obsidian_vault(index_path, vault_path)
-
-    root = vault_path / "Meetily Memory"
-    refs = meeting_refs(index_path)
-    assert len({ref.relative_path for ref in refs.values()}) == 2
-    assert all((root / ref.relative_path).exists() for ref in refs.values())
-    assert len({ref.wikilink for ref in refs.values()}) == 2
-    assert all("|Duplicate title]]" in ref.wikilink for ref in refs.values())
-
-
-def test_sanitization_collisions_and_same_entity_prefixes_remain_distinct(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    with sqlite3.connect(meetily_db) as conn:
-        conn.execute("UPDATE meetings SET title = 'A/B' WHERE id = 'meeting-1'")
-        conn.execute("UPDATE meetings SET title = 'A:B' WHERE id = 'meeting-2'")
-    index_path, _scanner = scan_fixture(meetily_db, tmp_path)
-    refs = meeting_refs(index_path)
-    assert len({ref.relative_path for ref in refs.values()}) == 2
-
-    prefix = "same readable prefix " * 8
-    first = NoteRef.entity(
-        source_uuid="source",
-        meeting_external_id="meeting",
-        chunk_evidence_id="evidence:one",
-        kind="action_items",
-        stable_content_fingerprint=stable_content_fingerprint(f"{prefix}alpha"),
-        text=f"{prefix}alpha",
-        directory="Tasks",
-    )
-    second = NoteRef.entity(
-        source_uuid="source",
-        meeting_external_id="meeting",
-        chunk_evidence_id="evidence:two",
-        kind="action_items",
-        stable_content_fingerprint=stable_content_fingerprint(f"{prefix}beta"),
-        text=f"{prefix}beta",
-        directory="Tasks",
-    )
-    first_key = loads_json(first.object_key)
-    assert first.relative_path != second.relative_path
-    assert first.stem[:80] == second.stem[:80]
-    assert set(first_key) == {
-        "version",
-        "kind",
-        "source_uuid",
-        "meeting_external_id",
-        "chunk_evidence_id",
-        "entity_kind",
-        "stable_content_fingerprint",
-    }
-    assert "local_id" not in first.object_key
-
-
-def test_forbidden_filename_and_wikilink_characters_are_safe() -> None:
-    ref = NoteRef.meeting("source", "meeting", "Roadmap: A/B | [Q3] #1 ^ \\")
-
-    assert not set('<>:"/\\|?*#^[]').intersection(ref.stem)
-    assert ref.wikilink.count("|") == 1
-    assert ref.wikilink.startswith(f"[[{ref.stem}|")
-    assert ref.wikilink[-2:] == "]]"
-    assert not set("|[]#^").intersection(ref.wikilink.split("|", maxsplit=1)[1][:-2])
-
-
-@pytest.mark.parametrize("title", ["CON", "nul.txt", "LPT9", "name. "])
-def test_note_ref_obeys_cross_platform_filename_constraints(title: str) -> None:
-    ref = NoteRef.meeting("source", title, title)
-    component = ref.relative_path.name
-
-    assert len(component.encode()) <= MAX_FILENAME_COMPONENT_BYTES
-    assert not component.removesuffix(".md").endswith((".", " "))
-    assert component.casefold().split(".", maxsplit=1)[0] not in {
-        "con",
-        "nul",
-        "lpt9",
+        for meeting in snapshot.meetings
     }
 
 
-def test_composed_and_decomposed_long_unicode_is_normalized_and_byte_bounded() -> None:
-    composed = "é" * 300
-    decomposed = unicodedata.normalize("NFD", composed)
-
-    first = NoteRef.meeting("source", "meeting", composed)
-    second = NoteRef.meeting("source", "meeting", decomposed)
-
-    assert first.relative_path == second.relative_path
-    assert first.wikilink == second.wikilink
-    assert unicodedata.is_normalized("NFC", first.relative_path.name)
-    assert len(first.relative_path.name.encode()) <= MAX_FILENAME_COMPONENT_BYTES
-    assert first.relative_path.name.encode().decode() == first.relative_path.name
-
-
-def test_opaque_identity_values_preserve_canonically_equivalent_bytes() -> None:
-    composed = "é"
-    decomposed = unicodedata.normalize("NFD", composed)
-    pairs = (
-        (
-            NoteRef.meeting("source", composed, "Same title"),
-            NoteRef.meeting("source", decomposed, "Same title"),
-            "external_id",
-        ),
-        (
-            NoteRef.entity(
-                source_uuid="source",
-                meeting_external_id="meeting",
-                chunk_evidence_id=composed,
-                kind="action_items",
-                stable_content_fingerprint="fingerprint",
-                text="Same entity",
-                directory="Tasks",
-            ),
-            NoteRef.entity(
-                source_uuid="source",
-                meeting_external_id="meeting",
-                chunk_evidence_id=decomposed,
-                kind="action_items",
-                stable_content_fingerprint="fingerprint",
-                text="Same entity",
-                directory="Tasks",
-            ),
-            "chunk_evidence_id",
-        ),
-        (
-            NoteRef.topic(composed, "Same topic"),
-            NoteRef.topic(decomposed, "Same topic"),
-            "stable_key",
-        ),
-        (
-            NoteRef.person(composed, "Same person"),
-            NoteRef.person(decomposed, "Same person"),
-            "stable_key",
-        ),
-    )
-
-    for first, second, field in pairs:
-        assert loads_json(first.object_key)[field] == composed
-        assert loads_json(second.object_key)[field] == decomposed
-        assert first.object_key != second.object_key
-        assert first.relative_path != second.relative_path
-
-
-def test_rename_reconciles_only_the_same_meeting_identity(
+def test_snapshot_is_immutable_and_contains_only_active_manual_assignments(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
-    with sqlite3.connect(meetily_db) as conn:
-        conn.execute("UPDATE meetings SET title = 'Shared title'")
-    index_path, scanner = scan_fixture(meetily_db, tmp_path)
-    vault_path = tmp_path / "vault"
-    root = vault_path / "Meetily Memory"
-    sync_obsidian_vault(index_path, vault_path)
-    before = meeting_refs(index_path)
-    renamed_old_path = root / before["meeting-1"].relative_path
-    isolated_path = root / before["meeting-2"].relative_path
-    isolated_text = isolated_path.read_text(encoding="utf-8")
-
-    with sqlite3.connect(meetily_db) as conn:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    initial = build_obsidian_snapshot(index_path, 100)
+    source_uuid = initial.meetings[0].ref.source_uuid
+    assign_tags(index_path, source_uuid, ("meeting-1",), (" Project X ",))
+    state_path = index_path.with_name("state.sqlite")
+    with sqlite3.connect(state_path) as conn:
+        orphan_tag_id = conn.execute(
+            """
+            INSERT INTO manual_tags (normalized_name, display_name, created_at)
+            VALUES ('orphan', 'Orphan', '2026-08-31T12:00:00Z')
+            RETURNING id
+            """
+        ).fetchone()[0]
         conn.execute(
-            "UPDATE meetings SET title = ?, updated_at = ? WHERE id = ?",
-            ("Renamed meeting", "2026-07-03T09:30:00Z", "meeting-1"),
+            """
+            INSERT INTO meeting_tags (
+              source_uuid, meeting_external_id, manual_tag_id, created_at
+            ) VALUES (?, 'missing-meeting', ?, '2026-08-31T12:00:00Z')
+            """,
+            (source_uuid, orphan_tag_id),
         )
-    scanner.scan(meetily_db)
+
+    snapshot = build_obsidian_snapshot(index_path, 100)
+
+    meeting = next(item for item in snapshot.meetings if item.ref.external_id == "meeting-1")
+    assert tuple(tag.display_name for tag in meeting.manual_tags) == ("Project X",)
+    assert tuple(tag.tag.display_name for tag in snapshot.tags) == ("Project X",)
+    assert snapshot.tags[0].meetings == (meeting,)
+    attribute = "title"
+    with pytest.raises(FrozenInstanceError):
+        setattr(meeting, attribute, "changed")
+
+
+def test_snapshot_uses_one_pinned_index_and_state_read_transaction(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    seed = build_obsidian_snapshot(index_path, 100)
+    source_uuid = seed.meetings[0].ref.source_uuid
+    state_path = index_path.with_name("state.sqlite")
+    with sqlite3.connect(state_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+    assign_tags(index_path, source_uuid, ("meeting-1",), ("Before",))
+
+    index_repository = IndexRepository.open_existing(index_path)
+    snapshot_repository = SnapshotRepository(index_path)
+    with index_repository.operation_snapshot() as pinned:
+        assert pinned.execute("SELECT COUNT(*) FROM meetings").fetchone()[0] == 2
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            writer = executor.submit(
+                assign_tags,
+                index_path,
+                source_uuid,
+                ("meeting-1",),
+                ("After",),
+            )
+            writer.result(timeout=5)
+        pinned_snapshot = snapshot_repository.read_in_snapshot(pinned, 100)
+        pinned_meeting = next(
+            item for item in pinned_snapshot.meetings if item.ref.external_id == "meeting-1"
+        )
+        assert tuple(tag.display_name for tag in pinned_meeting.manual_tags) == ("Before",)
+
+    refreshed = snapshot_repository.read(100)
+    refreshed_meeting = next(
+        item for item in refreshed.meetings if item.ref.external_id == "meeting-1"
+    )
+    assert tuple(tag.display_name for tag in refreshed_meeting.manual_tags) == (
+        "After",
+        "Before",
+    )
+
+
+def test_obsidian_snapshot_strictly_decodes_nullable_meeting_text(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    with sqlite3.connect(index_path) as conn:
+        conn.execute(
+            "UPDATE meetings SET started_at = NULL, summary_text = '' "
+            "WHERE external_id = 'meeting-1'"
+        )
+        conn.commit()
+
+    snapshot = build_obsidian_snapshot(index_path, 100)
+    meeting = next(item for item in snapshot.meetings if item.ref.external_id == "meeting-1")
+    assert meeting.started_at is None
+    assert meeting.source_summary == ""
+
+    with sqlite3.connect(index_path) as conn:
+        conn.execute(
+            "UPDATE meetings SET summary_text = ? WHERE external_id = 'meeting-1'",
+            (sqlite3.Binary(b"not-text"),),
+        )
+        conn.commit()
+    with pytest.raises(
+        IndexReadError,
+        match=r"meetings\.summary_text must be TEXT, got BLOB",
+    ):
+        build_obsidian_snapshot(index_path, 100)
+
+
+def test_sync_creates_only_meetings_and_tags_snapshot(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    snapshot = build_obsidian_snapshot(index_path, 100)
+    source_uuid = snapshot.meetings[0].ref.source_uuid
+    assign_tags(index_path, source_uuid, ("meeting-1", "meeting-2"), ("Roadmap",))
+    assign_tags(index_path, source_uuid, ("meeting-1",), ("Launch",))
+    vault_path = tmp_path / "vault"
+
     result = sync_obsidian_vault(index_path, vault_path)
-    after = meeting_refs(index_path)
 
-    assert result.files_removed >= 1
-    assert not renamed_old_path.exists()
-    assert (root / after["meeting-1"].relative_path).exists()
-    assert isolated_path == root / after["meeting-2"].relative_path
-    assert isolated_path.read_text(encoding="utf-8") == isolated_text
+    root = vault_path / "Meetily Memory"
+    assert result.root_dir == root
+    assert {path.name for path in root.iterdir()} == set(OBSIDIAN_DIRS)
+    assert len(list((root / "Meetings").glob("*.md"))) == 2
+    assert len(list((root / "Tags").glob("*.md"))) == 2
+    assert not any(
+        (root / directory).exists() for directory in integrations_module.LEGACY_OBSIDIAN_DIRS
+    )
 
 
-def test_case_only_rename_never_unlinks_same_filesystem_object(
+def test_meeting_notes_include_ref_dates_summary_open_command_and_manual_tags(
+    meetily_db: Path,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    snapshot = build_obsidian_snapshot(index_path, 100)
+    source_uuid = snapshot.meetings[0].ref.source_uuid
+    assign_tags(index_path, source_uuid, ("meeting-1",), ("Launch", "Roadmap"))
+
+    sync_obsidian_vault(index_path, tmp_path / "vault")
+
+    root = tmp_path / "vault" / "Meetily Memory"
+    refs = meeting_note_refs(index_path)
+    note = (root / refs["meeting-1"].relative_path).read_text(encoding="utf-8")
+    assert f"- MeetingRef: `{source_uuid}/meeting-1`" in note
+    assert "- Title: Launch Planning" in note
+    assert "- Created at: 2026-07-01T10:00:00Z" in note
+    assert "- Updated at: 2026-07-01T11:00:00Z" in note
+    assert f"`mm open {source_uuid}/meeting-1`" in note
+    assert "Launch checklist approved." in note
+    assert "## Source summary" in note
+    assert NoteRef.tag("launch", "Launch").wikilink in note
+    assert NoteRef.tag("roadmap", "Roadmap").wikilink in note
+    open_commands = [
+        line.removeprefix("- Open: `").removesuffix("`")
+        for line in note.splitlines()
+        if line.startswith("- Open: ")
+    ]
+    assert open_commands == [f"mm open {source_uuid}/meeting-1"]
+    assert not any(command.removeprefix("mm open ").isdigit() for command in open_commands)
+
+    note_without_source_summary = (root / refs["meeting-2"].relative_path).read_text(
+        encoding="utf-8"
+    )
+    assert "## Source summary" not in note_without_source_summary
+
+
+def test_tag_notes_list_meetings_deterministically(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    snapshot = build_obsidian_snapshot(index_path, 100)
+    source_uuid = snapshot.meetings[0].ref.source_uuid
+    assign_tags(index_path, source_uuid, ("meeting-1", "meeting-2"), ("Roadmap",))
+
+    sync_obsidian_vault(index_path, tmp_path / "vault")
+
+    root = tmp_path / "vault" / "Meetily Memory"
+    tag_ref = NoteRef.tag("roadmap", "Roadmap")
+    tag_note = (root / tag_ref.relative_path).read_text(encoding="utf-8")
+    meeting_links = [
+        line.removeprefix("- ") for line in tag_note.splitlines() if line.startswith("- [[")
+    ]
+    refs = meeting_note_refs(index_path)
+    assert meeting_links == [refs["meeting-2"].wikilink, refs["meeting-1"].wikilink]
+
+    second = sync_obsidian_vault(index_path, tmp_path / "vault")
+    assert second.files_written == 0
+    assert second.files_removed == 0
+
+
+def test_source_summary_cannot_spoof_a_second_managed_marker() -> None:
+    fake_marker = "<!-- meetily-memory:managed:v2:Zm9yZWlnbg -->"
+    meeting = ObsidianMeetingSnapshot(
+        ref=MeetingRef("source", "meeting"),
+        title="Marker safety",
+        started_at=None,
+        ended_at=None,
+        created_at="2026-08-31",
+        updated_at="2026-08-31",
+        source_summary=f"Summary\n{fake_marker}",
+        manual_tags=(),
+    )
+
+    note = render_obsidian_meeting_note(meeting)
+
+    assert f"> {fake_marker}" in note
+    assert (
+        object_key_from_note_text(note)
+        == NoteRef.meeting("source", "meeting", "Marker safety").object_key
+    )
+
+
+def test_marker_v2_and_object_key_v2_are_explicit_and_strict() -> None:
+    meeting = NoteRef.meeting("source", "meeting", "Meeting")
+    tag = NoteRef.tag("project x", "Project X")
+
+    assert OBSIDIAN_MARKER_VERSION == 2
+    assert OBJECT_KEY_VERSION == 2
+    assert LEGACY_OBSIDIAN_MARKER_VERSION == 1
+    assert MANAGED_MARKER.startswith("<!-- meetily-memory:managed:v2:")
+    assert loads_json(meeting.object_key) == {
+        "external_id": "meeting",
+        "kind": "meeting",
+        "source_uuid": "source",
+        "version": 2,
+    }
+    assert loads_json(tag.object_key) == {
+        "kind": "tag",
+        "normalized_name": "project x",
+        "version": 2,
+    }
+    assert object_key_from_note_text(meeting.identity_marker) == meeting.object_key
+    assert object_key_from_note_text(tag.identity_marker) == tag.object_key
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"version": 2, "kind": "meeting", "source_uuid": "source"},
+        {
+            "version": 2,
+            "kind": "meeting",
+            "source_uuid": "source",
+            "external_id": "meeting",
+            "extra": "foreign",
+        },
+        {"version": 2, "kind": "tag", "normalized_name": ""},
+        {"version": 2, "kind": "topic", "stable_key": "legacy"},
+        {"version": "2", "kind": "tag", "normalized_name": "tag"},
+    ],
+)
+def test_malformed_v2_markers_are_foreign(payload: object) -> None:
+    text = marker_text(payload, version=2)
+
+    assert object_key_from_note_text(text) is None
+
+
+def test_legacy_v1_migration_updates_meeting_and_removes_owned_graph_notes(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    snapshot = build_obsidian_snapshot(index_path, 100)
+    meeting = next(item for item in snapshot.meetings if item.ref.external_id == "meeting-1")
+    root = tmp_path / "vault" / "Meetily Memory"
+    legacy_notes = {
+        root / "Meetings" / "Old meeting.md": legacy_payload(
+            "meeting",
+            source_uuid=meeting.ref.source_uuid,
+            external_id=meeting.ref.external_id,
+        ),
+        root / "Topics" / "Old topic.md": legacy_payload("topic", stable_key="topic:old"),
+        root / "People" / "Old person.md": legacy_payload("person", stable_key="person:old"),
+        root / "Tasks" / "Old task.md": legacy_payload(
+            "entity",
+            source_uuid=meeting.ref.source_uuid,
+            meeting_external_id=meeting.ref.external_id,
+            chunk_evidence_id="evidence:1",
+            entity_kind="action_items",
+            stable_content_fingerprint="fingerprint",
+        ),
+    }
+    for path, payload in legacy_notes.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(marker_text(payload, version=1), encoding="utf-8")
+
+    result = sync_obsidian_vault(index_path, tmp_path / "vault")
+
+    current_ref = NoteRef.meeting(
+        meeting.ref.source_uuid,
+        meeting.ref.external_id,
+        meeting.title,
+    )
+    current_path = root / current_ref.relative_path
+    assert result.files_removed == len(legacy_notes)
+    assert current_path.exists()
+    assert (
+        object_key_from_note_text(current_path.read_text(encoding="utf-8"))
+        == current_ref.object_key
+    )
+    assert all(not path.exists() for path in legacy_notes)
+
+
+def test_legacy_migration_completes_preflight_before_first_mutation(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    snapshot = build_obsidian_snapshot(index_path, 100)
+    plan = build_obsidian_note_plan(snapshot)
+    expected = next(note for note in plan if note.ref.directory == "Meetings")
+    foreign = NoteRef.meeting("foreign-source", "foreign-meeting", "Foreign")
+    root = tmp_path / "vault" / "Meetily Memory"
+    destination = root / expected.ref.relative_path
+    destination.parent.mkdir(parents=True)
+    destination.write_text(planned_text(foreign), encoding="utf-8")
+    legacy_topic = root / "Topics" / "Legacy.md"
+    legacy_topic.parent.mkdir()
+    legacy_text = marker_text(legacy_payload("topic", stable_key="topic:legacy"), version=1)
+    legacy_topic.write_text(legacy_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="belongs to another managed object"):
+        sync_obsidian_vault(index_path, tmp_path / "vault")
+
+    assert destination.read_text(encoding="utf-8") == planned_text(foreign)
+    assert legacy_topic.read_text(encoding="utf-8") == legacy_text
+    assert not (root / "Tags").exists()
+
+
+def test_unmanaged_malformed_foreign_and_wrong_directory_markers_are_untouched(
+    tmp_path: Path,
 ) -> None:
     root = tmp_path / "vault" / "Meetily Memory"
-    old_ref = NoteRef.meeting("source", "meeting", "Case title")
-    new_ref = NoteRef.meeting("source", "meeting", "case title")
-    old_path = root / old_ref.relative_path
-    destination = root / new_ref.relative_path
-    temporary = old_path.parent / ".case-rename-temp.md"
-    old_path.parent.mkdir(parents=True)
-    old_path.write_text(planned_text(new_ref), encoding="utf-8")
-    monkeypatch.setattr(Path, "samefile", lambda _self, _other: True)
+    protected = {
+        root / "Meetings" / "Personal.md": "personal\n",
+        root / "Topics" / "Malformed.md": marker_text(
+            legacy_payload("topic", stable_key=""),
+            version=1,
+        ),
+        root / "People" / "Foreign.md": marker_text(
+            legacy_payload("person", stable_key="person:x"),
+            version=3,
+        ),
+        root / "People" / "Wrong directory.md": marker_text(
+            legacy_payload("topic", stable_key="topic:x"),
+            version=1,
+        ),
+    }
+    for path, text in protected.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
 
-    assert paths_are_same_case_variant(old_path, destination)
-    rename_case_variant_exactly(old_path, temporary, destination)
+    result = apply_obsidian_note_plan(root, (), destructive=True)
 
-    names = {path.name for path in destination.parent.iterdir()}
-    assert destination.name in names
-    assert old_path.name not in names
-    assert temporary.name not in names
-    assert destination.read_text(encoding="utf-8") == planned_text(new_ref)
+    assert result.files_removed == 0
+    assert {path: path.read_text(encoding="utf-8") for path in protected} == protected
 
 
-def test_case_only_rename_removes_distinct_case_sensitive_old_path(
+def test_strict_legacy_parser_accepts_only_canonical_v1_shape() -> None:
+    payload = legacy_payload("topic", stable_key="topic:roadmap")
+    canonical = marker_text(payload, version=1)
+    noncanonical_key = '{"version":1,"kind":"topic","stable_key":"topic:roadmap"}'
+    encoded = base64.urlsafe_b64encode(noncanonical_key.encode()).decode().rstrip("=")
+
+    assert legacy_object_key_from_note_text(canonical) == dumps_json(payload)
+    assert legacy_object_key_from_note_text(f"<!-- meetily-memory:managed:v1:{encoded} -->") is None
+    assert legacy_object_key_from_note_text(canonical + canonical) is None
+    assert legacy_object_key_from_note_text("<!-- meetily-memory:managed:v1:a -->") is None
+
+
+def test_stale_current_owned_notes_are_removed(tmp_path: Path) -> None:
+    root = tmp_path / "vault" / "Meetily Memory"
+    stale = NoteRef.meeting("old-source", "old-meeting", "Stale")
+    stale_path = root / stale.relative_path
+    stale_path.parent.mkdir(parents=True)
+    stale_path.write_text(planned_text(stale), encoding="utf-8")
+
+    result = apply_obsidian_note_plan(root, (), destructive=True)
+
+    assert result.files_removed == 1
+    assert not stale_path.exists()
+
+
+def test_unmanaged_expected_destination_is_skipped_without_removing_owned_old_path(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "vault" / "Meetily Memory"
-    old_ref = NoteRef.meeting("source", "meeting", "Case title")
-    new_ref = NoteRef.meeting("source", "meeting", "case title")
-    old_path = root / old_ref.relative_path
-    destination = root / new_ref.relative_path
+    ref = NoteRef.meeting("source", "meeting", "New title")
+    old_path = root / "Meetings" / "Old title.md"
+    destination = root / ref.relative_path
     old_path.parent.mkdir(parents=True)
-    old_path.write_text(planned_text(old_ref), encoding="utf-8")
-    unlinked: list[Path] = []
-
-    def record_unlink(path: Path) -> None:
-        unlinked.append(path)
-
-    monkeypatch.setattr(Path, "samefile", lambda _self, _other: False)
-    monkeypatch.setattr(Path, "unlink", record_unlink)
+    old_path.write_text(planned_text(ref), encoding="utf-8")
+    destination.write_text("personal content\n", encoding="utf-8")
 
     result = apply_obsidian_note_plan(
         root,
-        (PlannedNote(new_ref, planned_text(new_ref)),),
+        (PlannedNote(ref, planned_text(ref)),),
         destructive=True,
     )
 
-    assert result.files_removed == 1
-    assert unlinked == [old_path]
-    assert destination not in unlinked
-    assert destination.read_text(encoding="utf-8") == planned_text(new_ref)
-    assert not paths_are_same_case_variant(old_path, destination)
+    assert result.files_skipped == 1
+    assert result.files_removed == 0
+    assert old_path.exists()
+    assert destination.read_text(encoding="utf-8") == "personal content\n"
 
 
-def test_case_only_rename_failure_restores_original_note(
+def test_limited_sync_is_non_destructive(
+    meetily_db: Path,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    directory = tmp_path / "Meetings"
-    directory.mkdir()
-    old_path = directory / "Case title--m-identity.md"
-    temporary = directory / ".case-rename-temp.md"
-    destination = directory / "case title--m-identity.md"
-    old_path.write_text("managed content", encoding="utf-8")
-    original_rename = Path.rename
-
-    def fail_exact_destination(path: Path, target: Path) -> Path:
-        if path == temporary and target == destination:
-            message = "injected exact rename failure"
-            raise OSError(message)
-        return original_rename(path, target)
-
-    monkeypatch.setattr(Path, "rename", fail_exact_destination)
-    monkeypatch.setattr(Path, "samefile", lambda _self, _other: True)
-
-    with pytest.raises(OSError, match="injected exact rename failure"):
-        rename_case_variant_exactly(old_path, temporary, destination)
-
-    names = {path.name for path in directory.iterdir()}
-    assert old_path.name in names
-    assert temporary.name not in names
-    assert destination.name not in names
-    assert old_path.read_text(encoding="utf-8") == "managed content"
-
-
-def test_case_only_rename_restore_failure_keeps_note_at_temporary_path(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    directory = tmp_path / "Meetings"
-    directory.mkdir()
-    old_path = directory / "Case title--m-identity.md"
-    temporary = directory / ".case-rename-temp.md"
-    destination = directory / "case title--m-identity.md"
-    old_path.write_text("managed content", encoding="utf-8")
-    original_rename = Path.rename
-
-    def fail_destination_and_restore(path: Path, target: Path) -> Path:
-        if path == temporary and target in {destination, old_path}:
-            message = f"injected rename failure for {target.name}"
-            raise OSError(message)
-        return original_rename(path, target)
-
-    monkeypatch.setattr(Path, "rename", fail_destination_and_restore)
-    monkeypatch.setattr(Path, "samefile", lambda _self, _other: True)
-
-    with pytest.raises(OSError, match="injected rename failure"):
-        rename_case_variant_exactly(old_path, temporary, destination)
-
-    assert temporary.read_text(encoding="utf-8") == "managed content"
-    assert not any(entry.name == old_path.name for entry in directory.iterdir())
-    assert not any(entry.name == destination.name for entry in directory.iterdir())
-
-
-def test_case_only_rename_destination_race_preserves_foreign_and_managed_notes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    directory = tmp_path / "Meetings"
-    directory.mkdir()
-    old_path = directory / "Case title--m-identity.md"
-    temporary = directory / ".case-rename-temp.md"
-    destination = directory / "case title--m-identity.md"
-    old_path.write_text("managed content", encoding="utf-8")
-    original_rename = Path.rename
-
-    def occupy_destination_after_first_rename(path: Path, target: Path) -> Path:
-        result = original_rename(path, target)
-        if path == old_path and target == temporary:
-            destination.write_text("personal content", encoding="utf-8")
-        return result
-
-    monkeypatch.setattr(Path, "rename", occupy_destination_after_first_rename)
-    monkeypatch.setattr(Path, "samefile", lambda _self, _other: True)
-
-    with pytest.raises(FileExistsError, match="destination is no longer free"):
-        rename_case_variant_exactly(old_path, temporary, destination)
-
-    assert destination.read_text(encoding="utf-8") == "personal content"
-    managed_locations = [
-        path
-        for path in (old_path, temporary)
-        if any(entry.name == path.name for entry in directory.iterdir())
-    ]
-    assert len(managed_locations) == 1
-    assert managed_locations[0].read_text(encoding="utf-8") == "managed content"
-
-
-def test_case_only_rename_failure_after_write_restores_updated_original(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
     root = tmp_path / "vault" / "Meetily Memory"
-    old_ref = NoteRef.meeting("source", "meeting", "Case title")
-    new_ref = NoteRef.meeting("source", "meeting", "case title")
-    old_path = root / old_ref.relative_path
-    destination = root / new_ref.relative_path
-    old_path.parent.mkdir(parents=True)
-    old_path.write_text(planned_text(old_ref), encoding="utf-8")
-    if not destination.exists():
-        pytest.skip("current filesystem does not alias case-only names")
-    original_rename = Path.rename
+    stale = NoteRef.meeting("old", "old", "Old")
+    stale_path = root / stale.relative_path
+    stale_path.parent.mkdir(parents=True)
+    stale_path.write_text(planned_text(stale), encoding="utf-8")
 
-    def fail_exact_destination(path: Path, target: Path) -> Path:
-        if path.name.startswith(".meetily-memory-rename-") and target == destination:
-            message = "injected exact rename failure after write"
-            raise OSError(message)
-        return original_rename(path, target)
+    result = sync_obsidian_vault(index_path, tmp_path / "vault", limit=1)
 
-    monkeypatch.setattr(Path, "rename", fail_exact_destination)
-
-    with pytest.raises(OSError, match="injected exact rename failure after write"):
-        apply_obsidian_note_plan(
-            root,
-            (PlannedNote(new_ref, planned_text(new_ref)),),
-            destructive=True,
-        )
-
-    names = {entry.name for entry in old_path.parent.iterdir()}
-    assert old_path.name in names
-    assert destination.name not in names
-    assert old_path.read_text(encoding="utf-8") == planned_text(new_ref)
+    assert result.files_removed == 0
+    assert stale_path.exists()
+    assert len(list((root / "Meetings").glob("*.md"))) == 2
 
 
-def test_case_only_rename_matches_real_filesystem_case_semantics(tmp_path: Path) -> None:
+def test_duplicate_plan_fails_before_any_write_or_removal(tmp_path: Path) -> None:
+    root = tmp_path / "vault" / "Meetily Memory"
+    stale = NoteRef.meeting("old", "old", "Old")
+    stale_path = root / stale.relative_path
+    stale_path.parent.mkdir(parents=True)
+    stale_path.write_text(planned_text(stale), encoding="utf-8")
+    duplicate = NoteRef.meeting("source", "meeting", "Meeting")
+    plan = (
+        PlannedNote(duplicate, planned_text(duplicate)),
+        PlannedNote(duplicate, planned_text(duplicate)),
+    )
+
+    with pytest.raises(ValueError, match="Duplicate Obsidian note object identity"):
+        apply_obsidian_note_plan(root, plan, destructive=True)
+
+    assert stale_path.exists()
+    assert not (root / duplicate.relative_path).exists()
+
+
+@pytest.mark.parametrize("folder", ["../outside", "/absolute-outside"])
+def test_sync_rejects_folder_outside_vault(
+    meetily_db: Path,
+    tmp_path: Path,
+    folder: str,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    protected = tmp_path / "outside" / "Protected.md"
+    protected.parent.mkdir()
+    protected.write_text("protected\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="configured vault"):
+        sync_obsidian_vault(index_path, tmp_path / "vault", folder)
+
+    assert protected.read_text(encoding="utf-8") == "protected\n"
+
+
+@pytest.mark.parametrize("directory", ["Meetings", "Tags", "Topics", "Tasks"])
+def test_sync_rejects_snapshot_directory_symlinks_before_mutation(
+    meetily_db: Path,
+    tmp_path: Path,
+    directory: str,
+) -> None:
+    index_path = scan_fixture(meetily_db, tmp_path)
+    root = tmp_path / "vault" / "Meetily Memory"
+    root.mkdir(parents=True)
+    outside = tmp_path / f"outside-{directory}"
+    outside.mkdir()
+    protected = outside / "Protected.md"
+    protected.write_text("protected\n", encoding="utf-8")
+    (root / directory).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        sync_obsidian_vault(index_path, tmp_path / "vault")
+
+    assert protected.read_text(encoding="utf-8") == "protected\n"
+    assert not any((root / managed).exists() for managed in OBSIDIAN_DIRS if managed != directory)
+
+
+def test_case_only_rename_matches_real_filesystem_semantics(tmp_path: Path) -> None:
     probe = tmp_path / "case-probe"
     probe.write_text("probe", encoding="utf-8")
     case_sensitive = not (tmp_path / "CASE-PROBE").exists()
@@ -484,120 +588,44 @@ def test_case_only_rename_matches_real_filesystem_case_semantics(tmp_path: Path)
     )
 
     names = {path.name for path in destination.parent.iterdir()}
-    wikilink_target = new_ref.wikilink.removeprefix("[[").split("|", maxsplit=1)[0]
     assert result.files_removed == int(case_sensitive)
     assert destination.name in names
     assert old_path.name not in names
     assert destination.read_text(encoding="utf-8") == planned_text(new_ref)
-    assert wikilink_target == destination.stem
-
-    second = apply_obsidian_note_plan(
-        root,
-        (PlannedNote(new_ref, planned_text(new_ref)),),
-        destructive=True,
-    )
-
-    assert second.files_written == 0
-    assert second.files_removed == 0
 
 
-def test_unicode_spelling_rename_matches_exact_note_ref_filename(tmp_path: Path) -> None:
-    root = tmp_path / "vault" / "Meetily Memory"
-    ref = NoteRef.meeting("source", "meeting", "Café")
-    destination = root / ref.relative_path
-    old_name = unicodedata.normalize("NFD", destination.name)
-    if old_name == destination.name:
-        pytest.skip("test filename has no distinct normalization spelling")
-    old_path = destination.with_name(old_name)
-    old_path.parent.mkdir(parents=True)
-    old_path.write_text(planned_text(ref), encoding="utf-8")
-    if not destination.exists():
-        pytest.skip("current filesystem does not alias Unicode-normalized names")
-
-    result = apply_obsidian_note_plan(
-        root,
-        (PlannedNote(ref, planned_text(ref)),),
-        destructive=True,
-    )
-
-    names = {entry.name for entry in destination.parent.iterdir()}
-    wikilink_target = ref.wikilink.removeprefix("[[").split("|", maxsplit=1)[0]
-    assert result.files_written == 0
-    assert result.files_removed == 0
-    assert destination.name in names
-    assert old_path.name not in names
-    assert wikilink_target == destination.stem
-
-    second = apply_obsidian_note_plan(
-        root,
-        (PlannedNote(ref, planned_text(ref)),),
-        destructive=True,
-    )
-    assert second.files_written == 0
-    assert second.files_removed == 0
-
-
-def test_rebuild_preserves_all_note_identities(meetily_db: Path, tmp_path: Path) -> None:
-    index_path, scanner = scan_fixture(meetily_db, tmp_path)
-    vault_path = tmp_path / "vault"
-    root = vault_path / "Meetily Memory"
-    sync_obsidian_vault(index_path, vault_path)
-    paths_before = managed_paths(root)
-    markers_before = {
-        path.relative_to(root).as_posix(): next(
-            line
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.startswith(MANAGED_MARKER)
-        )
-        for path in root.glob("*/*.md")
-        if MANAGED_MARKER in path.read_text(encoding="utf-8")
-    }
-
-    index_path.unlink()
-    scanner.scan(meetily_db)
-    sync_obsidian_vault(index_path, vault_path)
-
-    assert managed_paths(root) == paths_before
-    assert {
-        path.relative_to(root).as_posix(): next(
-            line
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.startswith(MANAGED_MARKER)
-        )
-        for path in root.glob("*/*.md")
-        if MANAGED_MARKER in path.read_text(encoding="utf-8")
-    } == markers_before
-
-
-@pytest.mark.parametrize("duplicate_kind", ["object", "path"])
-def test_duplicate_plan_fails_before_any_write_or_removal(
+def test_case_only_rename_failure_restores_original_note(
     tmp_path: Path,
-    duplicate_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    root = tmp_path / "vault" / "Meetily Memory"
-    meetings_dir = root / "Meetings"
-    meetings_dir.mkdir(parents=True)
-    stale_ref = NoteRef.meeting("stale-source", "stale-meeting", "Stale")
-    stale_path = meetings_dir / "stale.md"
-    stale_path.write_text(planned_text(stale_ref), encoding="utf-8")
-    first = NoteRef.meeting("source", "one", "One")
-    second = first if duplicate_kind == "object" else NoteRef.meeting("source", "two", "Two")
-    if duplicate_kind == "path":
-        object.__setattr__(second, "relative_path", first.relative_path)
-    plan = (
-        PlannedNote(first, planned_text(first)),
-        PlannedNote(second, planned_text(second)),
-    )
-    before = tuple(sorted(path.relative_to(root).as_posix() for path in root.rglob("*")))
+    directory = tmp_path / "Meetings"
+    directory.mkdir()
+    old_path = directory / "Case title.md"
+    temporary = directory / ".case-rename-temp.md"
+    destination = directory / "case title.md"
+    old_path.write_text("managed content", encoding="utf-8")
+    original_rename = Path.rename
 
-    with pytest.raises(ValueError, match="Duplicate Obsidian note"):
-        apply_obsidian_note_plan(root, plan, destructive=True)
+    def fail_exact_destination(path: Path, target: Path) -> Path:
+        if path == temporary and target == destination:
+            message = "injected exact rename failure"
+            raise OSError(message)
+        return original_rename(path, target)
 
-    assert stale_path.exists()
-    assert tuple(sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))) == before
+    monkeypatch.setattr(Path, "rename", fail_exact_destination)
+    monkeypatch.setattr(Path, "samefile", lambda _self, _other: True)
+
+    with pytest.raises(OSError, match="injected exact rename failure"):
+        rename_case_variant_exactly(old_path, temporary, destination)
+
+    names = {entry.name for entry in directory.iterdir()}
+    assert old_path.read_text(encoding="utf-8") == "managed content"
+    assert temporary.name not in names
+    assert old_path.name in names
+    assert destination.name not in names
 
 
-def test_case_rename_temp_collision_fails_preflight_without_mutation(
+def test_case_only_rename_never_unlinks_same_filesystem_object(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -605,284 +633,40 @@ def test_case_rename_temp_collision_fails_preflight_without_mutation(
     old_ref = NoteRef.meeting("source", "meeting", "Case title")
     new_ref = NoteRef.meeting("source", "meeting", "case title")
     old_path = root / old_ref.relative_path
+    destination = root / new_ref.relative_path
+    temporary = old_path.parent / ".case-rename-temp.md"
     old_path.parent.mkdir(parents=True)
-    old_path.write_text(planned_text(old_ref), encoding="utf-8")
-    digest = hashlib.sha256(old_ref.object_key.encode()).hexdigest()[
-        : integrations_module.SUFFIX_DIGEST_HEX_LENGTH
-    ]
-    occupied_temp = old_path.parent / f".meetily-memory-rename-{digest}-0.md"
-    occupied_temp.write_text("personal temp", encoding="utf-8")
-    monkeypatch.setattr(integrations_module, "TEMP_PATH_ATTEMPTS", 1)
+    old_path.write_text(planned_text(new_ref), encoding="utf-8")
     monkeypatch.setattr(Path, "samefile", lambda _self, _other: True)
 
-    with pytest.raises(ValueError, match="reserve a safe Obsidian rename path"):
-        apply_obsidian_note_plan(
-            root,
-            (PlannedNote(new_ref, planned_text(new_ref)),),
-            destructive=True,
-        )
+    assert paths_are_same_case_variant(old_path, destination)
+    rename_case_variant_exactly(old_path, temporary, destination)
 
-    names = {path.name for path in old_path.parent.iterdir()}
-    assert names == {old_path.name, occupied_temp.name}
-    assert old_path.read_text(encoding="utf-8") == planned_text(old_ref)
-    assert occupied_temp.read_text(encoding="utf-8") == "personal temp"
+    names = {entry.name for entry in destination.parent.iterdir()}
+    assert destination.read_text(encoding="utf-8") == planned_text(new_ref)
+    assert destination.name in names
+    assert old_path.name not in names
+    assert temporary.name not in names
 
 
-def test_foreign_managed_destination_fails_preflight_without_mutation(tmp_path: Path) -> None:
-    root = tmp_path / "vault" / "Meetily Memory"
-    meetings_dir = root / "Meetings"
-    meetings_dir.mkdir(parents=True)
-    expected = NoteRef.meeting("source", "expected", "Expected")
-    foreign = NoteRef.meeting("source", "foreign", "Foreign")
-    destination = root / expected.relative_path
-    destination.write_text(planned_text(foreign), encoding="utf-8")
-    stale = meetings_dir / "stale.md"
-    stale.write_text(planned_text(NoteRef.meeting("old", "old", "Old")), encoding="utf-8")
-    original_destination = destination.read_text(encoding="utf-8")
+def test_note_refs_preserve_collision_resistance_and_portable_names() -> None:
+    first = NoteRef.meeting("source", "one", "A/B")
+    second = NoteRef.meeting("source", "two", "A:B")
+    reserved = NoteRef.meeting("source", "three", "CON")
+    long_unicode = NoteRef.meeting("source", "four", "é" * 300)
 
-    with pytest.raises(ValueError, match="belongs to another managed object"):
-        apply_obsidian_note_plan(
-            root,
-            (PlannedNote(expected, planned_text(expected)),),
-            destructive=True,
-        )
-
-    assert destination.read_text(encoding="utf-8") == original_destination
-    assert stale.exists()
-    assert not (root / "People").exists()
+    assert first.relative_path != second.relative_path
+    assert not set('<>:"/\\|?*#^[]').intersection(first.stem)
+    assert reserved.relative_path.name.startswith("_CON")
+    assert len(long_unicode.relative_path.name.encode()) <= MAX_FILENAME_COMPONENT_BYTES
+    assert unicodedata.is_normalized("NFC", long_unicode.relative_path.name)
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"version": 1, "kind": "meeting", "source_uuid": "source"},
-        {
-            "version": 1,
-            "kind": "meeting",
-            "source_uuid": "source",
-            "external_id": "meeting",
-            "extra": "foreign",
-        },
-        {
-            "version": 1,
-            "kind": "meeting",
-            "source_uuid": 7,
-            "external_id": "meeting",
-        },
-        {
-            "version": 1,
-            "kind": "meeting",
-            "source_uuid": "source",
-            "external_id": "",
-        },
-        {
-            "version": 1,
-            "kind": "entity",
-            "source_uuid": "source",
-            "meeting_external_id": "meeting",
-            "source_evidence_id": "legacy-field",
-            "entity_kind": "action_items",
-            "stable_content_fingerprint": "fingerprint",
-        },
-        {
-            "version": 1,
-            "kind": "entity",
-            "source_uuid": "source",
-            "meeting_external_id": "meeting",
-            "chunk_evidence_id": "evidence",
-            "entity_kind": "unknown",
-            "stable_content_fingerprint": "fingerprint",
-        },
-        {"version": 1, "kind": "topic", "stable_key": "topic:key", "id": 12},
-        {"version": 1, "kind": "person", "stable_key": None},
-        {"version": "1", "kind": "topic", "stable_key": "topic:key"},
-    ],
-)
-def test_malformed_kind_specific_v1_markers_are_foreign_and_untouched(
-    tmp_path: Path,
-    payload: object,
-) -> None:
-    root = tmp_path / "vault" / "Meetily Memory"
-    meetings = root / "Meetings"
-    meetings.mkdir(parents=True)
-    protected = meetings / "Protected.md"
-    text = marker_text(payload)
-    protected.write_text(text, encoding="utf-8")
+def test_canonically_equivalent_opaque_ids_remain_distinct() -> None:
+    composed = "é"
+    decomposed = unicodedata.normalize("NFD", composed)
+    first = NoteRef.meeting("source", composed, "Same title")
+    second = NoteRef.meeting("source", decomposed, "Same title")
 
-    assert object_key_from_note_text(text) is None
-    result = apply_obsidian_note_plan(root, (), destructive=True)
-
-    assert result.files_removed == 0
-    assert protected.read_text(encoding="utf-8") == text
-
-
-@pytest.mark.parametrize(
-    "ref",
-    [
-        NoteRef.meeting("source", "meeting", "Meeting"),
-        NoteRef.entity(
-            source_uuid="source",
-            meeting_external_id="meeting",
-            chunk_evidence_id="evidence",
-            kind="action_items",
-            stable_content_fingerprint="fingerprint",
-            text="Entity",
-            directory="Tasks",
-        ),
-        NoteRef.topic("topic:key", "Topic"),
-        NoteRef.person("person:key", "Person"),
-    ],
-)
-def test_exact_kind_specific_v1_markers_are_owned(ref: NoteRef) -> None:
-    assert object_key_from_note_text(ref.identity_marker) == ref.object_key
-
-
-def test_noncanonical_json_marker_is_foreign() -> None:
-    object_key = '{"version":1,"kind":"meeting","source_uuid":"source","external_id":"meeting"}'
-    encoded = base64.urlsafe_b64encode(object_key.encode()).decode().rstrip("=")
-    marker = f"<!-- meetily-memory:managed:v1:{encoded} -->"
-
-    assert object_key_from_note_text(marker) is None
-
-
-def test_invalid_base64_marker_and_direct_invalid_note_ref_are_rejected() -> None:
-    marker = "<!-- meetily-memory:managed:v1:a -->"
-
-    assert object_key_from_note_text(marker) is None
-    with pytest.raises(ValueError, match="canonical kind-specific v1 schema"):
-        NoteRef(
-            object_key="not-json",
-            directory="Meetings",
-            display_label="Invalid",
-            suffix_kind="m",
-        )
-
-
-def test_unmanaged_and_foreign_marker_notes_are_never_changed(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path, _scanner = scan_fixture(meetily_db, tmp_path)
-    vault_path = tmp_path / "vault"
-    root = vault_path / "Meetily Memory"
-    plan = build_obsidian_note_plan(MeetilyMemoryCore(index_path), 100)
-    meeting_note = next(note for note in plan if note.ref.directory == "Meetings")
-    destination = root / meeting_note.ref.relative_path
-    destination.parent.mkdir(parents=True)
-    destination.write_text("personal note", encoding="utf-8")
-    generic = destination.parent / "Old generic marker.md"
-    generic.write_text("<!-- meetily-memory:managed -->\n", encoding="utf-8")
-    foreign = destination.parent / "Foreign marker.md"
-    foreign.write_text("<!-- meetily-memory:managed:v2:foreign -->\n", encoding="utf-8")
-
-    result = sync_obsidian_vault(index_path, vault_path)
-
-    assert result.files_skipped == 1
-    assert destination.read_text(encoding="utf-8") == "personal note"
-    assert generic.read_text(encoding="utf-8") == "<!-- meetily-memory:managed -->\n"
-    assert foreign.read_text(encoding="utf-8") == "<!-- meetily-memory:managed:v2:foreign -->\n"
-
-
-def test_limited_sync_is_non_destructive_and_plan_order_is_deterministic(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path, _scanner = scan_fixture(meetily_db, tmp_path)
-    vault_path = tmp_path / "vault"
-    root = vault_path / "Meetily Memory"
-    stale_ref = NoteRef.person(person_stable_key("Stale Person"), "Stale Person")
-    stale_path = root / stale_ref.relative_path
-    stale_path.parent.mkdir(parents=True)
-    stale_path.write_text(planned_text(stale_ref), encoding="utf-8")
-
-    first_plan = build_obsidian_note_plan(MeetilyMemoryCore(index_path), 100)
-    second_plan = build_obsidian_note_plan(MeetilyMemoryCore(index_path), 100)
-    result = sync_obsidian_vault(index_path, vault_path, limit=1)
-
-    first_order = tuple(note.ref.relative_path.as_posix() for note in first_plan)
-    assert first_order == tuple(note.ref.relative_path.as_posix() for note in second_plan)
-    assert first_order == tuple(sorted(first_order, key=str.casefold))
-    assert result.files_removed == 0
-    assert stale_path.exists()
-
-
-def test_meeting_renderer_uses_safe_inline_code_for_identifiers_and_command() -> None:
-    note = render_obsidian_meeting_note(
-        {
-            "local_id": 41,
-            "ref": {"source_uuid": "source`a", "external_id": "meeting`a"},
-            "title": "Backtick meeting",
-        }
-    )
-
-    assert note.splitlines()[4:7] == [
-        "- Meetily ID: `` meeting`a ``",
-        "- Source UUID: `` source`a ``",
-        "- Date: ",
-    ]
-    assert "- Open: ``` mm open --source-uuid 'source`a' --external-id 'meeting`a' ```" in note
-
-
-def test_meeting_renderer_keeps_source_aware_persistent_open_command() -> None:
-    first = render_obsidian_meeting_note(
-        {
-            "local_id": 41,
-            "ref": {"source_uuid": "source-a", "external_id": "meeting-a"},
-            "title": "Duplicate title",
-        }
-    )
-    second = render_obsidian_meeting_note(
-        {
-            "local_id": 99,
-            "ref": {"source_uuid": "source-b", "external_id": "meeting-b"},
-            "title": "Duplicate title",
-        }
-    )
-
-    assert "`mm open --source-uuid source-a --external-id meeting-a`" in first
-    assert "`mm open --source-uuid source-b --external-id meeting-b`" in second
-    assert "mm open 41" not in first
-    assert "mm open 99" not in second
-
-
-@pytest.mark.parametrize("folder", ["../outside", "/absolute-outside"])
-def test_obsidian_sync_rejects_folders_outside_vault(
-    meetily_db: Path,
-    tmp_path: Path,
-    folder: str,
-) -> None:
-    index_path, _scanner = scan_fixture(meetily_db, tmp_path)
-    vault_path = tmp_path / "vault"
-    outside = tmp_path / "outside" / "Meetings"
-    outside.mkdir(parents=True)
-    protected = outside / "Protected.md"
-    protected.write_text("protected\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="configured vault"):
-        sync_obsidian_vault(index_path, vault_path, folder)
-
-    assert protected.exists()
-
-
-@pytest.mark.parametrize("target_location", ["outside", "inside"])
-def test_obsidian_sync_rejects_any_managed_directory_symlink_before_mutation(
-    meetily_db: Path,
-    tmp_path: Path,
-    target_location: str,
-) -> None:
-    index_path, _scanner = scan_fixture(meetily_db, tmp_path)
-    vault_path = tmp_path / "vault"
-    root = vault_path / "Meetily Memory"
-    root.mkdir(parents=True)
-    target = root / "Real Meetings" if target_location == "inside" else tmp_path / "outside"
-    target.mkdir()
-    protected = target / "Protected.md"
-    protected.write_text("protected\n", encoding="utf-8")
-    (root / "Meetings").symlink_to(target, target_is_directory=True)
-
-    with pytest.raises(ValueError, match="managed directory must not be a symlink"):
-        sync_obsidian_vault(index_path, vault_path)
-
-    assert protected.read_text(encoding="utf-8") == "protected\n"
-    assert not (root / "Topics").exists()
-    assert not (root / "People").exists()
+    assert first.object_key != second.object_key
+    assert first.relative_path != second.relative_path

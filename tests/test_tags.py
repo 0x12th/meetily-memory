@@ -1,9 +1,6 @@
 import importlib
 import importlib.util
 import sqlite3
-from collections.abc import Generator
-from contextlib import contextmanager
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,17 +9,12 @@ from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
-from meetily_memory.db.repository import IndexRepository
-from meetily_memory.db.schema import existing_index_connection
+from meetily_memory.db.state_schema import StateSchemaError
 from meetily_memory.domain import MeetingRef, MeetingSearchFilters, RetrievalSource
-from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
-from meetily_memory.semantic_search import (
-    LocalHashEmbeddingProvider,
-    index_semantic_embeddings,
-)
-from meetily_memory.tagging import TagService
+from meetily_memory.repositories.index import IndexRepository
+from meetily_memory.tagging import TagRepository, TagService
 from meetily_memory.user_state import UserStateRepository
-from tests.semantic_helpers import requires_sqlite_vec
+from tests.index_helpers import publish_fresh_index
 
 
 def indexed_ref(repository: IndexRepository, local_id: int) -> MeetingRef:
@@ -35,14 +27,20 @@ def indexed_refs(repository: IndexRepository, *local_ids: int) -> tuple[MeetingR
     return tuple(indexed_ref(repository, local_id) for local_id in local_ids)
 
 
-class TargetBiasedEmbeddingProvider:
-    name = "target-biased"
-    model = "target-biased-v1"
-    dims: int | None = 2
+def test_tag_repository_rejects_preexisting_empty_database_without_modifying_it(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state.sqlite"
+    state_path.write_bytes(b"")
+    before = (state_path.read_bytes(), state_path.stat().st_mtime_ns)
 
-    def embed(self, texts: list[str], *, role: str) -> list[list[float]]:
-        assert role in {"query", "document"}
-        return [[0.0, 1.0] if text == "other semantic topic" else [1.0, 0.0] for text in texts]
+    with pytest.raises(
+        StateSchemaError,
+        match=r"Deleting state permanently loses manual tags and application settings",
+    ):
+        TagRepository(state_path)
+
+    assert (state_path.read_bytes(), state_path.stat().st_mtime_ns) == before
 
 
 def test_tag_repository_normalizes_assigns_idempotently_and_removes_unused_tags(
@@ -79,6 +77,22 @@ def test_tag_repository_normalizes_assigns_idempotently_and_removes_unused_tags(
         "Сбер",
         "System Design",
     ]
+    with sqlite3.connect(state_path) as connection:
+        assert [row[1] for row in connection.execute("PRAGMA table_info(meeting_tags)")] == [
+            "source_uuid",
+            "meeting_external_id",
+            "manual_tag_id",
+            "created_at",
+        ]
+        assert connection.execute(
+            "SELECT source_uuid, meeting_external_id, manual_tag_id, created_at "
+            "FROM meeting_tags ORDER BY meeting_external_id, manual_tag_id"
+        ).fetchall() == [
+            (source_uuid, "meeting-1", 1, "2"),
+            (source_uuid, "meeting-1", 2, "2"),
+            (source_uuid, "meeting-2", 1, "2"),
+            (source_uuid, "meeting-2", 2, "2"),
+        ]
 
     first_remove = repository.remove(
         source_uuid,
@@ -95,7 +109,30 @@ def test_tag_repository_normalizes_assigns_idempotently_and_removes_unused_tags(
     )
     assert last_remove.removed_links == 1
     with sqlite3.connect(state_path) as conn:
-        assert conn.execute("SELECT 1 FROM tags WHERE normalized_name = 'сбер'").fetchone() is None
+        assert (
+            conn.execute("SELECT 1 FROM manual_tags WHERE normalized_name = 'сбер'").fetchone()
+            is None
+        )
+
+
+def test_tag_repository_strictly_rejects_wrong_stored_tag_type(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.sqlite"
+    state = UserStateRepository(state_path)
+    source_uuid = state.get_or_create_source("meetily_sqlite", "/source.sqlite", now="1")
+    repository = TagRepository(state_path)
+    repository.assign(source_uuid, ("meeting-1",), ("Manual",), now="2")
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "UPDATE manual_tags SET display_name = ? WHERE normalized_name = 'manual'",
+            (sqlite3.Binary(b"not-text"),),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        StateSchemaError,
+        match=r"manual_tags\.display_name must be TEXT, got BLOB",
+    ):
+        repository.list_for_meeting(source_uuid, "meeting-1")
 
 
 def test_tag_repository_finds_exact_before_token_matches(tmp_path: Path) -> None:
@@ -123,12 +160,12 @@ def test_tag_repository_finds_exact_before_token_matches(tmp_path: Path) -> None
 
     matches = repository.search("что решили по сбер")
 
-    assert [(match.meeting_external_id, match.kind) for match in matches] == [
+    assert [(match.meeting_ref.external_id, match.kind) for match in matches] == [
         ("meeting-1", "token"),
         ("meeting-2", "token"),
     ]
     exact = repository.search("  СБЕР  ")
-    assert [(match.meeting_external_id, match.kind) for match in exact] == [
+    assert [(match.meeting_ref.external_id, match.kind) for match in exact] == [
         ("meeting-1", "exact"),
         ("meeting-2", "token"),
     ]
@@ -144,7 +181,7 @@ def test_tag_service_validates_batch_and_persists_assignments(
 
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     service = service_class(IndexRepository(index_path, state_path=state_path))
 
     refs = indexed_refs(service.index_repository, 1, 2)
@@ -165,86 +202,36 @@ def test_tag_service_validates_batch_and_persists_assignments(
     assert service.repository.search("не записывать") == ()
 
 
-def test_tag_list_and_suggest_hydrate_assignments_with_bounded_queries(
+def test_tag_list_and_suggest_reopen_exact_persisted_assignments(
     meetily_db: Path,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     writer = TagService(IndexRepository(index_path, state_path=state_path))
     writer.assign(
         (indexed_ref(writer.index_repository, 2),),
         tuple(f"batch-only-tag-{index}" for index in range(16)),
     )
     service = TagService(IndexRepository.open_existing(index_path, state_path=state_path))
-    counts = {
-        "index_connections": 0,
-        "index_queries": 0,
-        "state_connections": 0,
-        "state_queries": 0,
-    }
-
-    @contextmanager
-    def counted_index_connection(path: Path) -> Generator[sqlite3.Connection, None, None]:
-        counts["index_connections"] += 1
-        with existing_index_connection(path) as conn:
-
-            def trace(statement: str) -> None:
-                if statement.lstrip().upper().startswith(("SELECT", "WITH")):
-                    counts["index_queries"] += 1
-
-            conn.set_trace_callback(trace)
-            yield conn
-
-    original_state_connection = service.repository._connect  # noqa: SLF001
-
-    @contextmanager
-    def counted_state_connection() -> Generator[sqlite3.Connection, None, None]:
-        counts["state_connections"] += 1
-        with original_state_connection() as conn:
-
-            def trace(statement: str) -> None:
-                if statement.lstrip().upper().startswith(("SELECT", "WITH")):
-                    counts["state_queries"] += 1
-
-            conn.set_trace_callback(trace)
-            yield conn
-
-    monkeypatch.setattr(
-        service.index_repository.meetings,
-        "context",
-        replace(
-            service.index_repository.meetings.context,
-            connection=counted_index_connection,
-        ),
-    )
-    monkeypatch.setattr(service.index_repository, "connection", counted_index_connection)
-    monkeypatch.setattr(service.repository, "_connect", counted_state_connection)
-
-    assert len(service.list_all()) == 16
-    assert counts == {
-        "index_connections": 1,
-        "index_queries": 1,
-        "state_connections": 1,
-        "state_queries": 1,
+    listed = service.list_all()
+    assert len(listed) == 16
+    assert {item.display_name for item in listed} == {
+        f"batch-only-tag-{index}" for index in range(16)
     }
 
     meeting_ref = indexed_ref(service.index_repository, 1)
-    counts.update(
-        index_connections=0,
-        index_queries=0,
-        state_connections=0,
-        state_queries=0,
-    )
     assert service.suggest(meeting_ref) == ()
-    assert counts == {
-        "index_connections": 4,
-        "index_queries": 4,
-        "state_connections": 2,
-        "state_queries": 2,
-    }
+
+    reopened = TagService(IndexRepository.open_existing(index_path, state_path=state_path))
+    assert reopened.list_all() == listed
+    assert reopened.suggest(meeting_ref) == ()
+    with sqlite3.connect(state_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM manual_tags").fetchone() == (16,)
+        assert conn.execute("SELECT COUNT(*) FROM meeting_tags").fetchone() == (16,)
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_manual_tags_survive_disposable_index_rebuild(
@@ -257,13 +244,13 @@ def test_manual_tags_survive_disposable_index_rebuild(
 
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     service = service_class(IndexRepository(index_path, state_path=state_path))
     meeting_ref = indexed_ref(service.index_repository, 1)
     service.assign((meeting_ref,), ("Сбер",))
 
     index_path.unlink()
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     rebuilt = service_class(IndexRepository(index_path, state_path=state_path))
 
     assert [tag.display_name for tag in rebuilt.list_for_meeting(meeting_ref)] == ["Сбер"]
@@ -278,7 +265,7 @@ def test_orphaned_tag_assignments_are_preserved_but_excluded_from_active_tags(
 
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     service = service_class(IndexRepository(index_path, state_path=state_path))
     identity = service.index_repository.meeting_ref_for_local_id(1)
     assert identity is not None
@@ -291,7 +278,7 @@ def test_orphaned_tag_assignments_are_preserved_but_excluded_from_active_tags(
 
     assert service.list_all() == ()
     assert service.orphaned_assignment_count() == 1
-    assert service.repository.search("сбер")[0].meeting_external_id == "missing-meeting"
+    assert service.repository.search("сбер")[0].meeting_ref.external_id == "missing-meeting"
 
 
 def test_cli_assigns_lists_and_removes_tags(meetily_db: Path, tmp_path: Path) -> None:
@@ -463,7 +450,7 @@ def test_search_returns_meetings_with_real_or_empty_evidence(
 
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     core = MeetilyMemoryCore(index_path, state_path=state_path)
     service = service_class(IndexRepository(index_path, state_path=state_path))
     service.assign((indexed_ref(service.index_repository, 2),), ("Сбер",))
@@ -488,7 +475,7 @@ def test_tag_only_search_uses_the_same_date_filter(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     repository = IndexRepository(index_path, state_path=state_path)
     TagService(repository).assign(indexed_refs(repository, 1, 2), ("product integration",))
     filters = MeetingSearchFilters(
@@ -515,7 +502,7 @@ def test_search_orders_exact_tag_before_lexical_before_token_tag(
 
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     core = MeetilyMemoryCore(index_path, state_path=state_path)
     service = service_class(IndexRepository(index_path, state_path=state_path))
     service.assign((indexed_ref(service.index_repository, 2),), ("pricing decision",))
@@ -567,175 +554,27 @@ def test_cli_search_explains_tag_only_match(meetily_db: Path, tmp_path: Path) ->
     assert "chunk #" not in result.stdout
     meeting = IndexRepository.open_existing(index_path).get_meeting_by_local_id(2)
     assert meeting is not None
-    assert (
-        "open: mm open --source-uuid "
-        f"{meeting['source_uuid']} --external-id {meeting['external_id']}" in result.stdout
-    )
+    assert f"open: mm open {meeting['source_uuid']}/{meeting['external_id']}" in result.stdout
 
 
-@requires_sqlite_vec
-def test_tag_suggestions_prioritize_title_text_then_similar_meeting(
+def test_tag_suggestions_use_existing_title_and_text_matches(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    provider = LocalHashEmbeddingProvider()
-    index_semantic_embeddings(index_path, embedding_provider=provider)
+    publish_fresh_index(index_path, meetily_db, state_path=state_path)
     service = TagService(IndexRepository(index_path, state_path=state_path))
     service.assign(
         (indexed_ref(service.index_repository, 2),),
         ("Launch Planning", "pricing decision", "migration-team"),
     )
 
-    suggestions = service.suggest(
-        indexed_ref(service.index_repository, 1),
-        embedding_provider=provider,
-    )
-
-    assert [
-        (item.tag.display_name, item.reason, item.similar_meeting_id) for item in suggestions
-    ] == [
-        ("Launch Planning", "title match", None),
-        ("pricing decision", "text match", None),
-        ("migration-team", "similar meeting", 2),
-    ]
-
-
-@requires_sqlite_vec
-def test_tag_suggestions_skip_all_target_chunks_to_find_another_meeting(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    with sqlite3.connect(meetily_db) as conn:
-        conn.execute("DELETE FROM transcripts")
-        conn.execute("DELETE FROM summary_processes")
-        conn.execute("DELETE FROM meeting_notes")
-        conn.executemany(
-            """
-            INSERT INTO transcripts (
-                id, meeting_id, transcript, timestamp, audio_start_time,
-                audio_end_time, duration, speaker
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    f"target-{ordinal}",
-                    "meeting-1",
-                    "target semantic topic",
-                    f"10:{ordinal:02d}:00",
-                    float(ordinal),
-                    float(ordinal + 1),
-                    1.0,
-                    "Alice",
-                )
-                for ordinal in range(60)
-            ]
-            + [
-                (
-                    "other-1",
-                    "meeting-2",
-                    "other semantic topic",
-                    "11:00:00",
-                    0.0,
-                    1.0,
-                    1.0,
-                    "Bob",
-                )
-            ],
-        )
-        conn.commit()
-    index_path = tmp_path / "index.sqlite"
-    state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    provider = TargetBiasedEmbeddingProvider()
-    index_semantic_embeddings(index_path, embedding_provider=provider)
-    service = TagService(IndexRepository(index_path, state_path=state_path))
-    service.assign((indexed_ref(service.index_repository, 2),), ("private-label",))
-
-    suggestions = service.suggest(
-        indexed_ref(service.index_repository, 1),
-        embedding_provider=provider,
-    )
-
-    assert [(item.tag.display_name, item.similar_meeting_id) for item in suggestions] == [
-        ("private-label", 2)
-    ]
-
-
-class ExplodingEmbeddingProvider:
-    name = "never"
-    model = "never"
-    dims: int | None = 128
-
-    def embed(self, texts: list[str], *, role: str) -> list[list[float]]:
-        del texts, role
-        message = "must not run"
-        raise AssertionError(message)
-
-
-class UnavailableHashProvider:
-    name = "hash"
-    model = "local-hash-v1"
-    dims: int | None = 128
-
-    def embed(self, texts: list[str], *, role: str) -> list[list[float]]:
-        del texts, role
-        message = "provider unavailable"
-        raise RuntimeError(message)
-
-
-def test_tag_suggestions_fall_back_without_complete_semantic_index(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    service = TagService(IndexRepository(index_path, state_path=state_path))
-    service.assign(
-        (indexed_ref(service.index_repository, 2),),
-        ("Launch Planning", "pricing decision", "migration-team"),
-    )
-    service.assign((indexed_ref(service.index_repository, 1),), ("pricing decision",))
-
-    suggestions = service.suggest(
-        indexed_ref(service.index_repository, 1),
-        embedding_provider=ExplodingEmbeddingProvider(),
-    )
+    suggestions = service.suggest(indexed_ref(service.index_repository, 1))
 
     assert [(item.tag.display_name, item.reason) for item in suggestions] == [
         ("Launch Planning", "title match"),
-    ]
-
-
-@requires_sqlite_vec
-def test_tag_suggestions_fall_back_when_ready_semantic_provider_fails(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    index_semantic_embeddings(
-        index_path,
-        embedding_provider=LocalHashEmbeddingProvider(),
-    )
-    service = TagService(IndexRepository(index_path, state_path=state_path))
-    service.assign(
-        (indexed_ref(service.index_repository, 2),),
-        ("Launch Planning", "migration-team"),
-    )
-
-    suggestions = service.suggest(
-        indexed_ref(service.index_repository, 1),
-        embedding_provider=UnavailableHashProvider(),
-    )
-
-    assert [(item.tag.display_name, item.reason) for item in suggestions] == [
-        ("Launch Planning", "title match"),
+        ("pricing decision", "text match"),
     ]
 
 

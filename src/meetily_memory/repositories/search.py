@@ -5,10 +5,16 @@ from pathlib import Path
 from typing import Any
 
 from meetily_memory.db.fts import build_fts_query, build_strict_fts_query
-from meetily_memory.db.rows import rows_to_dicts
+from meetily_memory.db.row_decode import (
+    decode_nullable_real,
+    decode_nullable_text,
+    decode_required_integer,
+    decode_required_text,
+)
 from meetily_memory.db.schema import (
     IndexConnectionFactory,
-    index_connection,
+    IndexReadError,
+    existing_index_connection,
     sqlite_read_snapshot,
 )
 from meetily_memory.domain import MeetingRef, MeetingSearchFilters
@@ -20,7 +26,7 @@ SQLITE_READ_BATCH_SIZE = 200
 SEARCH_DOMAIN_COLUMNS = """
   m.id AS meeting_id,
   m.external_id AS meeting_external_id,
-  s.source_uuid AS source_uuid,
+  m.source_uuid AS source_uuid,
   m.title AS title,
   m.started_at AS started_at,
   m.ended_at AS ended_at,
@@ -49,7 +55,6 @@ SELECT
   NULL AS rank
 FROM chunks c
 JOIN meetings m ON m.id = c.meeting_id
-JOIN sources s ON s.id = m.source_id
 WHERE c.evidence_id = ?
 """
 EvidenceReference = tuple[str, MeetingRef]
@@ -57,6 +62,88 @@ EvidenceReference = tuple[str, MeetingRef]
 
 class EvidenceResolutionError(LookupError):
     pass
+
+
+def _decode_search_rows(rows: list[Any], *, context: str) -> list[dict[str, Any]]:
+    return [_decode_search_row(row, context=context) for row in rows]
+
+
+def _decode_search_row(
+    row: sqlite3.Row | dict[str, Any],
+    *,
+    context: str,
+) -> dict[str, Any]:
+    decoded = dict(row)
+    required_integers = {
+        "meeting_id": ("meetings", "id"),
+        "chunk_count": ("meetings", "chunk_count"),
+        "chunk_id": ("chunks", "id"),
+        "ordinal": ("chunks", "ordinal"),
+    }
+    for key, (table, column) in required_integers.items():
+        decoded[key] = decode_required_integer(
+            row[key],
+            table=table,
+            column=column,
+            context=context,
+            error_type=IndexReadError,
+        )
+    required_text = {
+        "meeting_external_id": ("meetings", "external_id"),
+        "source_uuid": ("meetings", "source_uuid"),
+        "title": ("meetings", "title"),
+        "evidence_id": ("chunks", "evidence_id"),
+        "kind": ("chunks", "kind"),
+        "text": ("chunks", "text"),
+    }
+    for key, (table, column) in required_text.items():
+        decoded[key] = decode_required_text(
+            row[key],
+            table=table,
+            column=column,
+            context=context,
+            error_type=IndexReadError,
+        )
+    nullable_text = {
+        "started_at": ("meetings", "started_at"),
+        "ended_at": ("meetings", "ended_at"),
+        "created_at": ("meetings", "created_at"),
+        "updated_at": ("meetings", "updated_at"),
+        "folder_path": ("meetings", "folder_path"),
+        "source_path": ("meetings", "source_path"),
+        "language": ("meetings", "language"),
+        "summary_text": ("meetings", "summary_text"),
+        "chunk_external_id": ("chunks", "external_id"),
+        "speaker": ("chunks", "speaker"),
+        "timestamp_label": ("chunks", "timestamp_label"),
+    }
+    for key, (table, column) in nullable_text.items():
+        decoded[key] = decode_nullable_text(
+            row[key],
+            table=table,
+            column=column,
+            context=context,
+            error_type=IndexReadError,
+        )
+    for key in ("starts_at_seconds", "ends_at_seconds", "rank"):
+        decoded[key] = decode_nullable_real(
+            row[key],
+            table="chunks_fts" if key == "rank" else "chunks",
+            column=key,
+            context=context,
+            error_type=IndexReadError,
+        )
+    keys = set(row.keys())
+    for key in ("matched_chunk_id", "match_order", "context_distance"):
+        if key in keys:
+            decoded[key] = decode_required_integer(
+                row[key],
+                table="chunks",
+                column=key,
+                context=context,
+                error_type=IndexReadError,
+            )
+    return decoded
 
 
 def meeting_time_predicate(
@@ -82,7 +169,7 @@ class SearchRepository:
     def __init__(
         self,
         index_path: Path,
-        connection: IndexConnectionFactory = index_connection,
+        connection: IndexConnectionFactory = existing_index_connection,
     ) -> None:
         self.index_path = index_path
         self._connection = connection
@@ -150,25 +237,27 @@ class SearchRepository:
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         if strict_fts_query:
-            rows = rows_to_dicts(
+            rows = _decode_search_rows(
                 self._execute_search(
                     conn,
                     strict_fts_query,
                     limit,
                     meeting_id=meeting_id,
                     filters=filters,
-                )
+                ),
+                context="strict search result",
             )
             if len(rows) >= limit:
                 return rows
-        fallback_rows = rows_to_dicts(
+        fallback_rows = _decode_search_rows(
             self._execute_search(
                 conn,
                 fts_query,
                 limit,
                 meeting_id=meeting_id,
                 filters=filters,
-            )
+            ),
+            context="search result",
         )
         seen_chunk_ids = {row["chunk_id"] for row in rows}
         for row in fallback_rows:
@@ -199,7 +288,6 @@ class SearchRepository:
             FROM chunks_fts f
             JOIN chunks c ON c.id = f.chunk_id
             JOIN meetings m ON m.id = c.meeting_id
-            JOIN sources s ON s.id = m.source_id
             WHERE chunks_fts MATCH ?
               AND (? IS NULL OR m.id = ?)
               AND {time_sql}
@@ -218,20 +306,20 @@ class SearchRepository:
         if context <= 0 or not rows:
             return rows
         expanded: list[dict[str, Any]] = []
-        matched_chunk_ids = {int(row["chunk_id"]) for row in rows}
-        ranks_by_chunk_id = {int(row["chunk_id"]): row.get("rank") for row in rows}
+        matched_chunk_ids = {row["chunk_id"] for row in rows}
+        ranks_by_chunk_id = {row["chunk_id"]: row.get("rank") for row in rows}
         for row in rows:
             matched = dict(row)
-            matched["matched_chunk_id"] = int(row["chunk_id"])
+            matched["matched_chunk_id"] = row["chunk_id"]
             matched["is_context"] = False
             expanded.append(matched)
 
         seen_chunk_ids = set(matched_chunk_ids)
         for context_row in self._context_rows(conn, rows, context):
-            chunk_id = int(context_row["chunk_id"])
+            chunk_id = context_row["chunk_id"]
             if chunk_id in seen_chunk_ids:
                 continue
-            matched_chunk_id = int(context_row["matched_chunk_id"])
+            matched_chunk_id = context_row["matched_chunk_id"]
             context_row["rank"] = ranks_by_chunk_id.get(matched_chunk_id)
             context_row["is_context"] = True
             expanded.append(context_row)
@@ -253,9 +341,9 @@ class SearchRepository:
                 for match_order, row in row_batch
                 for value in (
                     match_order,
-                    int(row["chunk_id"]),
-                    int(row["meeting_id"]),
-                    int(row["ordinal"]),
+                    row["chunk_id"],
+                    row["meeting_id"],
+                    row["ordinal"],
                 )
             )
             batch_rows = conn.execute(
@@ -274,12 +362,11 @@ class SearchRepository:
                   ON c.meeting_id = matched.meeting_id
                  AND c.ordinal BETWEEN matched.ordinal - ? AND matched.ordinal + ?
                 JOIN meetings m ON m.id = c.meeting_id
-                JOIN sources s ON s.id = m.source_id
                 ORDER BY matched.match_order, context_distance, c.ordinal
                 """,
                 (*params, context, context),
             ).fetchall()
-            context_rows.extend(rows_to_dicts(batch_rows))
+            context_rows.extend(_decode_search_rows(batch_rows, context="search context result"))
         return context_rows
 
     def expand_evidence_refs(
@@ -322,12 +409,12 @@ class SearchRepository:
                   NULL AS rank
                 FROM chunks c
                 JOIN meetings m ON m.id = c.meeting_id
-                JOIN sources s ON s.id = m.source_id
                 WHERE c.evidence_id IN ({placeholders})
                 """,
                 evidence_id_batch,
             ).fetchall()
-            rows_by_evidence_id.update((str(row["evidence_id"]), dict(row)) for row in rows)
+            decoded_rows = _decode_search_rows(rows, context="evidence lookup")
+            rows_by_evidence_id.update((row["evidence_id"], row) for row in decoded_rows)
 
         missing = [
             evidence_id
@@ -336,7 +423,7 @@ class SearchRepository:
         ]
         if missing:
             message = (
-                "Evidence no longer exists in the current index generation: "
+                "Evidence no longer exists in the current index snapshot: "
                 f"{', '.join(missing)}. Re-run the search before requesting context or entities."
             )
             raise EvidenceResolutionError(message)
@@ -344,8 +431,8 @@ class SearchRepository:
         for evidence_id, expected_ref in evidence_refs:
             row = rows_by_evidence_id[evidence_id]
             actual_ref = MeetingRef(
-                source_uuid=str(row["source_uuid"]),
-                external_id=str(row["meeting_external_id"]),
+                source_uuid=row["source_uuid"],
+                external_id=row["meeting_external_id"],
             )
             if actual_ref == expected_ref:
                 continue
@@ -353,7 +440,7 @@ class SearchRepository:
                 f"Evidence identity mismatch for {evidence_id}: expected "
                 f"{expected_ref.source_uuid}/{expected_ref.external_id}, found "
                 f"{actual_ref.source_uuid}/{actual_ref.external_id}. Refusing to reuse a "
-                "generation-local chunk ID; re-run the search."
+                "snapshot-local chunk ID; re-run the search."
             )
             raise EvidenceResolutionError(message)
         return [rows_by_evidence_id[evidence_id] for evidence_id, _ in evidence_refs]
@@ -361,4 +448,4 @@ class SearchRepository:
     def evidence_by_id(self, evidence_id: str) -> dict[str, Any] | None:
         with self._connection(self.index_path) as conn:
             row = conn.execute(EVIDENCE_LOOKUP_SQL, (evidence_id,)).fetchone()
-        return dict(row) if row is not None else None
+        return _decode_search_row(row, context="evidence lookup") if row is not None else None

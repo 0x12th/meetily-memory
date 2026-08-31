@@ -9,32 +9,17 @@ from shutil import which
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
 from meetily_memory import __version__ as fallback_version
 from meetily_memory.config.paths import default_index_path
 from meetily_memory.config.settings import load_app_settings, normalize_ui_language
 from meetily_memory.core import MeetilyMemoryCore
-from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import IndexReadError
 from meetily_memory.json_codec import dumps_json
-from meetily_memory.open_commands import stable_meeting_open_command
+from meetily_memory.repositories.index import IndexRepository
 
 PACKAGE_NAME = "meetily-memory"
 console = Console(markup=False)
-
-ENTITY_COMMANDS = {
-    "decisions": "decisions",
-    "tasks": "action_items",
-    "risks": "risks",
-    "questions": "open_questions",
-}
-ENTITY_LABELS = {
-    "decisions": "Decisions",
-    "action_items": "Action items",
-    "risks": "Risks",
-    "open_questions": "Open questions",
-}
 
 
 def make_typer(help_text: str) -> typer.Typer:
@@ -111,23 +96,6 @@ def meeting_label(row: dict[str, object]) -> str:
     date = compact_date(row.get("updated_at") or row.get("created_at"))
     suffix = f" ({date})" if date else ""
     return f"#{row['id']} {row['title']}{suffix}"
-
-
-def print_meeting_table(rows: list[dict[str, object]]) -> None:
-    table = Table("id", "date", "chunks", "title")
-    for row in rows:
-        table.add_row(
-            str(row["id"]),
-            compact_date(row.get("updated_at") or row.get("created_at")),
-            str(row["chunk_count"]),
-            str(row["title"]),
-        )
-    console.print(table)
-    for row in rows:
-        print_text_block(
-            f"#{row['id']} open: "
-            + stable_meeting_open_command(row["source_uuid"], row["external_id"])
-        )
 
 
 def compact_date(value: object) -> str:

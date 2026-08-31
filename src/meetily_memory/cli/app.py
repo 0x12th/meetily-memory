@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from typing import Annotated
 
@@ -17,14 +16,14 @@ app = make_typer(
     "\b\n"
     "Main workflow:\n"
     "  mm s QUERY       Find meetings and source excerpts.\n"
-    "  mm open --source-uuid UUID --external-id ID\n"
+    "  mm open SOURCE_UUID/EXTERNAL_ID\n"
     "                     Open the original meeting.\n"
     "  mm tag ...       Mark related meetings."
 )
 app.add_typer(lifecycle_app)
 app.add_typer(search_app)
 app.add_typer(tag_app, name="tag")
-app.add_typer(obsidian_app, name="obsidian", hidden=True)
+app.add_typer(obsidian_app, name="obsidian")
 app.add_typer(config_app, name="config", hidden=True)
 app.add_typer(db_app, name="db", hidden=True)
 
@@ -48,12 +47,7 @@ def callback(
 ) -> None:
     del version_output
     index_path = index_option(index)
-    explicit_data_dir = os.environ.get("MEETILY_MEMORY_DATA_DIR")
-    settings_path = (
-        app_config_path()
-        if index is None or explicit_data_dir
-        else index_path.with_name("settings.json")
-    )
+    settings_path = app_config_path() if index is None else index_path.with_name("settings.json")
     ctx.obj = {"index_path": index_path, "settings_path": settings_path}
 
 

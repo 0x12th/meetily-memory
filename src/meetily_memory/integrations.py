@@ -8,30 +8,36 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.domain import MeetingRef
 from meetily_memory.json_codec import dumps_json, loads_json
 from meetily_memory.open_commands import markdown_inline_code, stable_meeting_open_command
-from meetily_memory.serializers import (
-    meeting_payload,
-    structured_signal_payload,
-    topic_memory_payload,
-)
+from meetily_memory.repositories.snapshot import SnapshotRepository
 
-OBSIDIAN_DIRS = (
+OBSIDIAN_MARKER_VERSION = 2
+OBJECT_KEY_VERSION = 2
+LEGACY_OBSIDIAN_MARKER_VERSION = 1
+LEGACY_OBJECT_KEY_VERSION = 1
+OBSIDIAN_DIRS = ("Meetings", "Tags")
+LEGACY_OBSIDIAN_DIRS = (
     "Topics",
-    "Meetings",
     "People",
     "Tasks",
     "Decisions",
     "Risks",
     "Questions",
 )
-MANAGED_MARKER = "<!-- meetily-memory:managed:v1:"
-MANAGED_MARKER_RE = re.compile(r"^<!-- meetily-memory:managed:v1:([A-Za-z0-9_-]+) -->$")
+OBSIDIAN_SCAN_DIRS = OBSIDIAN_DIRS + LEGACY_OBSIDIAN_DIRS
+MANAGED_MARKER = f"<!-- meetily-memory:managed:v{OBSIDIAN_MARKER_VERSION}:"
+MANAGED_MARKER_RE = re.compile(
+    rf"^<!-- meetily-memory:managed:v{OBSIDIAN_MARKER_VERSION}:([A-Za-z0-9_-]+) -->$"
+)
+LEGACY_MANAGED_MARKER_RE = re.compile(
+    rf"^<!-- meetily-memory:managed:v{LEGACY_OBSIDIAN_MARKER_VERSION}:"
+    r"([A-Za-z0-9_-]+) -->$"
+)
 MAX_FILENAME_COMPONENT_BYTES = 255
 NOTE_EXTENSION = ".md"
 SUFFIX_DIGEST_HEX_LENGTH = 20
-OBJECT_KEY_VERSION = 1
 ASCII_CONTROL_LIMIT = 32
 ASCII_DELETE = 127
 TEMP_PATH_ATTEMPTS = 1000
@@ -50,6 +56,10 @@ ENTITY_DIRS = {
 }
 IDENTITY_SCHEMAS = {
     "meeting": frozenset({"version", "kind", "source_uuid", "external_id"}),
+    "tag": frozenset({"version", "kind", "normalized_name"}),
+}
+LEGACY_IDENTITY_SCHEMAS = {
+    "meeting": frozenset({"version", "kind", "source_uuid", "external_id"}),
     "entity": frozenset(
         {
             "version",
@@ -64,6 +74,36 @@ IDENTITY_SCHEMAS = {
     "topic": frozenset({"version", "kind", "stable_key"}),
     "person": frozenset({"version", "kind", "stable_key"}),
 }
+
+
+@dataclass(frozen=True)
+class ObsidianTag:
+    normalized_name: str
+    display_name: str
+
+
+@dataclass(frozen=True)
+class ObsidianMeetingSnapshot:
+    ref: MeetingRef
+    title: str
+    started_at: str | None
+    ended_at: str | None
+    created_at: str | None
+    updated_at: str | None
+    source_summary: str | None
+    manual_tags: tuple[ObsidianTag, ...]
+
+
+@dataclass(frozen=True)
+class ObsidianTagSnapshot:
+    tag: ObsidianTag
+    meetings: tuple[ObsidianMeetingSnapshot, ...]
+
+
+@dataclass(frozen=True)
+class ObsidianSnapshot:
+    meetings: tuple[ObsidianMeetingSnapshot, ...]
+    tags: tuple[ObsidianTagSnapshot, ...]
 
 
 @dataclass(frozen=True)
@@ -98,7 +138,7 @@ class NoteRef:
             message = f"Unknown Obsidian note directory: {self.directory}"
             raise ValueError(message)
         if not is_canonical_object_key(self.object_key):
-            message = "Obsidian note object key must use a canonical kind-specific v1 schema."
+            message = "Obsidian note object key must use the canonical v2 meeting/tag schema."
             raise ValueError(message)
         label = normalize_display_label(self.display_label)
         digest = hashlib.sha256(self.object_key.encode()).hexdigest()
@@ -109,11 +149,7 @@ class NoteRef:
         object.__setattr__(self, "stem", stem)
         object.__setattr__(self, "relative_path", Path(self.directory) / f"{stem}{NOTE_EXTENSION}")
         object.__setattr__(self, "wikilink", f"[[{stem}|{wikilink_alias(label)}]]")
-        object.__setattr__(
-            self,
-            "identity_marker",
-            f"{MANAGED_MARKER}{encoded_key} -->",
-        )
+        object.__setattr__(self, "identity_marker", f"{MANAGED_MARKER}{encoded_key} -->")
 
     @classmethod
     def meeting(cls, source_uuid: str, external_id: str, title: str) -> "NoteRef":
@@ -129,47 +165,12 @@ class NoteRef:
         )
 
     @classmethod
-    def entity(  # noqa: PLR0913
-        cls,
-        *,
-        source_uuid: str,
-        meeting_external_id: str,
-        chunk_evidence_id: str,
-        kind: str,
-        stable_content_fingerprint: str,
-        text: str,
-        directory: str,
-    ) -> "NoteRef":
+    def tag(cls, normalized_name: str, display_name: str) -> "NoteRef":
         return cls(
-            object_key=note_object_key(
-                "entity",
-                source_uuid=source_uuid,
-                meeting_external_id=meeting_external_id,
-                chunk_evidence_id=chunk_evidence_id,
-                entity_kind=kind,
-                stable_content_fingerprint=stable_content_fingerprint,
-            ),
-            directory=directory,
-            display_label=text,
-            suffix_kind="e",
-        )
-
-    @classmethod
-    def topic(cls, stable_key: str, title: str) -> "NoteRef":
-        return cls(
-            object_key=note_object_key("topic", stable_key=stable_key),
-            directory="Topics",
-            display_label=title,
-            suffix_kind="t",
-        )
-
-    @classmethod
-    def person(cls, stable_key: str, display_name: str) -> "NoteRef":
-        return cls(
-            object_key=note_object_key("person", stable_key=stable_key),
-            directory="People",
+            object_key=note_object_key("tag", normalized_name=normalized_name),
+            directory="Tags",
             display_label=display_name,
-            suffix_kind="p",
+            suffix_kind="g",
         )
 
 
@@ -177,6 +178,13 @@ class NoteRef:
 class PlannedNote:
     ref: NoteRef
     text: str
+
+
+@dataclass(frozen=True)
+class _MarkerIdentity:
+    marker_version: int
+    object_key: str
+    payload: dict[object, object]
 
 
 @dataclass(frozen=True)
@@ -209,14 +217,6 @@ def normalize_display_label(value: str) -> str:
     normalized = unicodedata.normalize("NFC", value)
     label = " ".join(normalized.split())
     return label or "Untitled"
-
-
-def normalize_domain_key(value: str) -> str:
-    return " ".join(unicodedata.normalize("NFC", value).casefold().split())
-
-
-def stable_content_fingerprint(value: str) -> str:
-    return hashlib.sha256(normalize_domain_key(value).encode()).hexdigest()
 
 
 def filename_stem(label: str, suffix: str) -> str:
@@ -267,9 +267,9 @@ def sync_obsidian_vault(
     limit: int | None = None,
 ) -> ObsidianSyncResult:
     root_dir = obsidian_root_dir(vault_path, folder)
-    core = MeetilyMemoryCore(index_path)
     effective_limit = limit if limit is not None else 2**31 - 1
-    plan = build_obsidian_note_plan(core, effective_limit)
+    snapshot = build_obsidian_snapshot(index_path, effective_limit)
+    plan = build_obsidian_note_plan(snapshot)
     return apply_obsidian_note_plan(root_dir, plan, destructive=limit is None)
 
 
@@ -286,50 +286,129 @@ def obsidian_root_dir(vault_path: Path, folder: str) -> Path:
     return root_dir
 
 
-def build_obsidian_note_plan(core: MeetilyMemoryCore, limit: int) -> tuple[PlannedNote, ...]:
-    meetings = [meeting_payload(value) for value in core.meetings(limit=limit)]
-    topics = [topic_memory_payload(core.topic(topic.title)) for topic in core.topics(limit=limit)]
-    entities = [
-        structured_signal_payload(value)
-        for kind in ENTITY_DIRS
-        for value in core.structured_entities(kind, limit).entities
-    ]
-
-    notes: list[PlannedNote] = []
-    for meeting in meetings:
-        ref = meeting_note_ref(meeting)
-        notes.append(PlannedNote(ref, render_obsidian_meeting_note(meeting, ref)))
-
-    for topic in topics:
-        topic_definition = required_dict(topic, "topic")
-        ref = NoteRef.topic(str(topic_definition["stable_key"]), str(topic_definition["title"]))
-        notes.append(PlannedNote(ref, render_obsidian_topic_memory(topic, ref)))
-
-    for entity in entities:
-        ref = entity_note_ref(entity)
-        notes.append(PlannedNote(ref, render_obsidian_entity_note(entity, ref)))
-
-    people: dict[str, str] = {}
-    person_names = [
-        str(person["display_name"])
-        for topic in topics
-        for person in list_of_dicts(topic.get("related_people"))
-        if person.get("display_name")
-    ]
-    person_names.extend(person for entity in entities for person in payload_people(entity))
-    ordered_names = sorted(
-        person_names,
-        key=lambda value: (normalize_domain_key(value), value),
+def build_obsidian_snapshot(index_path: Path, limit: int) -> ObsidianSnapshot:
+    repository_snapshot = SnapshotRepository(index_path).read(limit)
+    meetings = tuple(
+        ObsidianMeetingSnapshot(
+            ref=meeting.ref,
+            title=meeting.title,
+            started_at=meeting.started_at,
+            ended_at=meeting.ended_at,
+            created_at=meeting.created_at,
+            updated_at=meeting.updated_at,
+            source_summary=meeting.source_summary,
+            manual_tags=tuple(
+                ObsidianTag(tag.normalized_name, tag.display_name) for tag in meeting.manual_tags
+            ),
+        )
+        for meeting in repository_snapshot.meetings
     )
-    for display_name in ordered_names:
-        people.setdefault(person_stable_key(display_name), display_name)
-    for stable_key, display_name in sorted(people.items()):
-        ref = NoteRef.person(stable_key, display_name)
-        notes.append(PlannedNote(ref, render_obsidian_person_note(ref)))
+    meetings_by_tag: dict[ObsidianTag, list[ObsidianMeetingSnapshot]] = {}
+    for meeting in meetings:
+        for tag in meeting.manual_tags:
+            meetings_by_tag.setdefault(tag, []).append(meeting)
+    tags = tuple(
+        ObsidianTagSnapshot(
+            tag=tag,
+            meetings=tuple(sorted(tag_meetings, key=meeting_snapshot_sort_key)),
+        )
+        for tag, tag_meetings in sorted(
+            meetings_by_tag.items(),
+            key=lambda item: (item[0].normalized_name, item[0].display_name),
+        )
+    )
+    return ObsidianSnapshot(meetings=meetings, tags=tags)
 
+
+def meeting_snapshot_sort_key(meeting: ObsidianMeetingSnapshot) -> tuple[str, str, str, str]:
+    return (
+        normalize_display_label(meeting.title).casefold(),
+        normalize_display_label(meeting.title),
+        meeting.ref.source_uuid,
+        meeting.ref.external_id,
+    )
+
+
+def build_obsidian_note_plan(snapshot: ObsidianSnapshot) -> tuple[PlannedNote, ...]:
+    notes: list[PlannedNote] = []
+    for meeting in snapshot.meetings:
+        ref = NoteRef.meeting(meeting.ref.source_uuid, meeting.ref.external_id, meeting.title)
+        notes.append(PlannedNote(ref, render_obsidian_meeting_note(meeting, ref)))
+    for tag_snapshot in snapshot.tags:
+        ref = NoteRef.tag(
+            tag_snapshot.tag.normalized_name,
+            tag_snapshot.tag.display_name,
+        )
+        notes.append(PlannedNote(ref, render_obsidian_tag_note(tag_snapshot, ref)))
     ordered = tuple(sorted(notes, key=note_plan_sort_key))
     validate_note_plan(ordered)
     return ordered
+
+
+def render_obsidian_meeting_note(
+    meeting: ObsidianMeetingSnapshot,
+    ref: NoteRef | None = None,
+) -> str:
+    note_ref = ref or NoteRef.meeting(
+        meeting.ref.source_uuid,
+        meeting.ref.external_id,
+        meeting.title,
+    )
+    lines = [
+        f"# {note_ref.display_label}",
+        "",
+        note_ref.identity_marker,
+        "",
+        "- MeetingRef: "
+        + markdown_inline_code(f"{meeting.ref.source_uuid}/{meeting.ref.external_id}"),
+        f"- Title: {note_ref.display_label}",
+        f"- Created at: {meeting.created_at or ''}",
+        f"- Updated at: {meeting.updated_at or ''}",
+    ]
+    if meeting.started_at is not None:
+        lines.append(f"- Started at: {meeting.started_at}")
+    if meeting.ended_at is not None:
+        lines.append(f"- Ended at: {meeting.ended_at}")
+    lines.append("- Open: " + markdown_inline_code(stable_meeting_open_command(meeting.ref)))
+    if meeting.manual_tags:
+        lines.extend(["", "## Tags", ""])
+        for tag in meeting.manual_tags:
+            tag_ref = NoteRef.tag(tag.normalized_name, tag.display_name)
+            lines.append(f"- {tag_ref.wikilink}")
+    if meeting.source_summary is not None:
+        lines.extend(["", "## Source summary", ""])
+        lines.extend(blockquote_lines(meeting.source_summary))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_obsidian_tag_note(tag_snapshot: ObsidianTagSnapshot, ref: NoteRef | None = None) -> str:
+    note_ref = ref or NoteRef.tag(
+        tag_snapshot.tag.normalized_name,
+        tag_snapshot.tag.display_name,
+    )
+    lines = [
+        f"# {note_ref.display_label}",
+        "",
+        note_ref.identity_marker,
+        "",
+        f"- Tag: {markdown_inline_code(tag_snapshot.tag.display_name)}",
+        f"- Normalized tag: {markdown_inline_code(tag_snapshot.tag.normalized_name)}",
+        "",
+        "## Meetings",
+        "",
+    ]
+    for meeting in tag_snapshot.meetings:
+        meeting_ref = NoteRef.meeting(
+            meeting.ref.source_uuid,
+            meeting.ref.external_id,
+            meeting.title,
+        )
+        lines.append(f"- {meeting_ref.wikilink}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def blockquote_lines(value: str) -> list[str]:
+    return [f"> {line}" if line else ">" for line in value.splitlines() or [""]]
 
 
 def note_plan_sort_key(note: PlannedNote) -> tuple[str, str]:
@@ -383,7 +462,7 @@ def preflight_obsidian_vault(
     *,
     destructive: bool,
 ) -> _VaultPreflight:
-    validate_managed_directories(root_dir)
+    validate_obsidian_scan_directories(root_dir)
     existing_by_identity = existing_managed_notes(root_dir)
     expected_paths = {note.ref.object_key: root_dir / note.ref.relative_path for note in plan}
     writable, skipped_keys = writable_notes(plan, expected_paths)
@@ -409,18 +488,51 @@ def preflight_obsidian_vault(
 
 def existing_managed_notes(root_dir: Path) -> dict[str, list[Path]]:
     notes: dict[str, list[Path]] = {}
-    for directory in OBSIDIAN_DIRS:
+    for directory in OBSIDIAN_SCAN_DIRS:
         directory_path = root_dir / directory
         if not directory_path.exists():
             continue
         for path in sorted(directory_path.glob(f"*{NOTE_EXTENSION}")):
-            if path.is_symlink():
-                message = f"Obsidian managed note must not be a symlink: {path}"
+            if path.is_symlink() or not path.is_file():
+                message = f"Obsidian managed note candidate must be a regular file: {path}"
                 raise ValueError(message)
-            object_key = managed_object_key(path)
-            if object_key is not None:
-                notes.setdefault(object_key, []).append(path)
+            identity = owned_marker_identity(path, directory)
+            if identity is None:
+                continue
+            object_key = migrated_object_key(identity)
+            notes.setdefault(object_key, []).append(path)
     return notes
+
+
+def owned_marker_identity(path: Path, directory: str) -> _MarkerIdentity | None:
+    identity = marker_identity_from_note_text(path.read_text(encoding="utf-8"))
+    if identity is None:
+        return None
+    kind = cast("str", identity.payload["kind"])
+    if identity.marker_version == OBSIDIAN_MARKER_VERSION:
+        expected_directory = "Meetings" if kind == "meeting" else "Tags"
+    elif kind == "meeting":
+        expected_directory = "Meetings"
+    elif kind == "topic":
+        expected_directory = "Topics"
+    elif kind == "person":
+        expected_directory = "People"
+    else:
+        expected_directory = ENTITY_DIRS[cast("str", identity.payload["entity_kind"])]
+    return identity if directory == expected_directory else None
+
+
+def migrated_object_key(identity: _MarkerIdentity) -> str:
+    if (
+        identity.marker_version == LEGACY_OBSIDIAN_MARKER_VERSION
+        and identity.payload["kind"] == "meeting"
+    ):
+        return note_object_key(
+            "meeting",
+            source_uuid=cast("str", identity.payload["source_uuid"]),
+            external_id=cast("str", identity.payload["external_id"]),
+        )
+    return identity.object_key
 
 
 def writable_notes(
@@ -480,7 +592,7 @@ def stale_managed_notes(
 def existing_portable_path_keys(root_dir: Path) -> set[str]:
     return {
         portable_path_key(path)
-        for directory in OBSIDIAN_DIRS
+        for directory in OBSIDIAN_SCAN_DIRS
         if (directory_path := root_dir / directory).exists()
         for path in directory_path.iterdir()
     }
@@ -584,33 +696,55 @@ def portable_path_key(path: Path) -> str:
     return unicodedata.normalize("NFC", path.as_posix()).casefold()
 
 
-def validate_managed_directories(root_dir: Path) -> None:
+def validate_obsidian_scan_directories(root_dir: Path) -> None:
     root = root_dir.resolve()
-    for directory in OBSIDIAN_DIRS:
+    for directory in OBSIDIAN_SCAN_DIRS:
         directory_path = root_dir / directory
         if directory_path.is_symlink():
-            message = f"Obsidian managed directory must not be a symlink: {directory}"
+            message = f"Obsidian snapshot directory must not be a symlink: {directory}"
             raise ValueError(message)
         if directory_path.exists() and not directory_path.is_dir():
-            message = f"Obsidian managed directory is not a directory: {directory}"
+            message = f"Obsidian snapshot directory is not a directory: {directory}"
             raise ValueError(message)
         if not directory_path.resolve().is_relative_to(root):
-            message = f"Obsidian managed directory escapes configured root: {directory}"
+            message = f"Obsidian snapshot directory escapes configured root: {directory}"
             raise ValueError(message)
 
 
 def managed_object_key(path: Path) -> str | None:
-    return object_key_from_note_text(path.read_text(encoding="utf-8"))
+    identity = marker_identity_from_note_text(path.read_text(encoding="utf-8"))
+    return identity.object_key if identity is not None else None
 
 
 def object_key_from_note_text(text: str) -> str | None:
+    identity = marker_identity_from_note_text(text)
+    if identity is None or identity.marker_version != OBSIDIAN_MARKER_VERSION:
+        return None
+    return identity.object_key
+
+
+def legacy_object_key_from_note_text(text: str) -> str | None:
+    identity = marker_identity_from_note_text(text)
+    if identity is None or identity.marker_version != LEGACY_OBSIDIAN_MARKER_VERSION:
+        return None
+    return identity.object_key
+
+
+def marker_identity_from_note_text(text: str) -> _MarkerIdentity | None:
     managed_lines = [line for line in text.splitlines() if line.startswith("<!-- meetily-memory:")]
     if len(managed_lines) != 1:
         return None
-    match = MANAGED_MARKER_RE.fullmatch(managed_lines[0])
-    if match is None:
+    line = managed_lines[0]
+    current_match = MANAGED_MARKER_RE.fullmatch(line)
+    legacy_match = LEGACY_MANAGED_MARKER_RE.fullmatch(line)
+    if current_match is not None:
+        marker_version = OBSIDIAN_MARKER_VERSION
+        encoded = current_match.group(1)
+    elif legacy_match is not None:
+        marker_version = LEGACY_OBSIDIAN_MARKER_VERSION
+        encoded = legacy_match.group(1)
+    else:
         return None
-    encoded = match.group(1)
     try:
         padding = "=" * (-len(encoded) % 4)
         object_key = base64.urlsafe_b64decode(f"{encoded}{padding}").decode()
@@ -618,9 +752,23 @@ def object_key_from_note_text(text: str) -> str | None:
     except (binascii.Error, ValueError, UnicodeDecodeError):
         return None
     canonical_encoded = base64.urlsafe_b64encode(object_key.encode()).decode().rstrip("=")
-    if canonical_encoded != encoded or not is_canonical_object_key(object_key, payload=payload):
+    if canonical_encoded != encoded or not is_canonical_marker_payload(
+        object_key,
+        payload,
+        marker_version,
+    ):
         return None
-    return object_key
+    return _MarkerIdentity(marker_version, object_key, cast("dict[object, object]", payload))
+
+
+def is_canonical_marker_payload(object_key: str, payload: object, marker_version: int) -> bool:
+    if marker_version == OBSIDIAN_MARKER_VERSION:
+        valid = is_valid_identity_payload(payload)
+    elif marker_version == LEGACY_OBSIDIAN_MARKER_VERSION:
+        valid = is_valid_legacy_identity_payload(payload)
+    else:
+        return False
+    return valid and dumps_json(payload) == object_key
 
 
 def is_canonical_object_key(object_key: str, *, payload: object | None = None) -> bool:
@@ -632,207 +780,36 @@ def is_canonical_object_key(object_key: str, *, payload: object | None = None) -
 
 
 def is_valid_identity_payload(payload: object) -> bool:
+    return is_valid_kind_payload(payload, OBJECT_KEY_VERSION, IDENTITY_SCHEMAS)
+
+
+def is_valid_legacy_identity_payload(payload: object) -> bool:
+    if not is_valid_kind_payload(payload, LEGACY_OBJECT_KEY_VERSION, LEGACY_IDENTITY_SCHEMAS):
+        return False
+    identity = cast("dict[object, object]", payload)
+    return identity["kind"] != "entity" or identity["entity_kind"] in ENTITY_DIRS
+
+
+def is_valid_kind_payload(
+    payload: object,
+    version: int,
+    schemas: dict[str, frozenset[str]],
+) -> bool:
     if type(payload) is not dict:
         return False
     identity = cast("dict[object, object]", payload)
-    if type(identity.get("version")) is not int or identity["version"] != OBJECT_KEY_VERSION:
+    if type(identity.get("version")) is not int or identity["version"] != version:
         return False
     kind = identity.get("kind")
-    if type(kind) is not str or kind not in IDENTITY_SCHEMAS:
+    if type(kind) is not str or kind not in schemas:
         return False
-    if set(identity) != IDENTITY_SCHEMAS[kind]:
+    if set(identity) != schemas[kind]:
         return False
-    string_fields = IDENTITY_SCHEMAS[kind] - {"version"}
-    if any(type(identity.get(field)) is not str or not identity[field] for field in string_fields):
-        return False
-    return kind != "entity" or identity["entity_kind"] in ENTITY_DIRS
+    string_fields = schemas[kind] - {"version"}
+    return not any(
+        type(identity.get(field)) is not str or not identity[field] for field in string_fields
+    )
 
 
 def has_managed_marker(path: Path) -> bool:
     return managed_object_key(path) is not None
-
-
-def meeting_note_ref(meeting: dict[str, Any]) -> NoteRef:
-    meeting_ref = required_dict(meeting, "ref")
-    return NoteRef.meeting(
-        str(meeting_ref["source_uuid"]),
-        str(meeting_ref["external_id"]),
-        str(meeting["title"]),
-    )
-
-
-def entity_note_ref(entity: dict[str, Any]) -> NoteRef:
-    meeting_ref = required_dict(entity, "meeting_ref")
-    kind = str(entity["kind"])
-    try:
-        directory = ENTITY_DIRS[kind]
-    except KeyError as exc:
-        message = f"Unknown Obsidian entity kind: {kind}"
-        raise ValueError(message) from exc
-    return NoteRef.entity(
-        source_uuid=str(meeting_ref["source_uuid"]),
-        meeting_external_id=str(meeting_ref["external_id"]),
-        chunk_evidence_id=str(entity["chunk_evidence_id"]),
-        kind=kind,
-        stable_content_fingerprint=stable_content_fingerprint(str(entity["text"])),
-        text=str(entity["text"]),
-        directory=directory,
-    )
-
-
-def meeting_ref_from_row(row: dict[str, Any]) -> NoteRef:
-    meeting_ref = required_dict(row, "meeting_ref")
-    return NoteRef.meeting(
-        str(meeting_ref["source_uuid"]),
-        str(meeting_ref["external_id"]),
-        str(row.get("title") or row.get("meeting_title") or "Untitled"),
-    )
-
-
-def person_stable_key(display_name: str) -> str:
-    return f"person:{normalize_domain_key(display_name)}"
-
-
-def render_obsidian_meeting_note(
-    meeting: dict[str, Any],
-    ref: NoteRef | None = None,
-) -> str:
-    note_ref = ref or meeting_note_ref(meeting)
-    meeting_ref = required_dict(meeting, "ref")
-    lines = [
-        f"# {note_ref.display_label}",
-        "",
-        note_ref.identity_marker,
-        "",
-        f"- Meetily ID: {markdown_inline_code(str(meeting_ref['external_id']))}",
-        f"- Source UUID: {markdown_inline_code(str(meeting_ref['source_uuid']))}",
-        f"- Date: {meeting.get('updated_at') or meeting.get('created_at') or ''}",
-        "- Open: "
-        + markdown_inline_code(
-            stable_meeting_open_command(
-                meeting_ref["source_uuid"],
-                meeting_ref["external_id"],
-            )
-        ),
-    ]
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def render_obsidian_topic_memory(topic_payload: dict[str, Any], ref: NoteRef) -> str:
-    lines = [
-        f"# {ref.display_label}",
-        "",
-        ref.identity_marker,
-        "",
-        "## Meetings",
-        "",
-    ]
-    meeting_refs = unique_meeting_refs(topic_payload.get("meetings"))
-    lines.extend(f"- {meeting_ref.wikilink}" for meeting_ref in meeting_refs)
-    lines.extend(render_signal_sections(topic_payload.get("structured_signals")))
-    people = list_of_dicts(topic_payload.get("related_people"))
-    if people:
-        lines.extend(["", "## People", ""])
-        for person in people:
-            display_name = str(person["display_name"])
-            person_ref = NoteRef.person(person_stable_key(display_name), display_name)
-            lines.append(f"- {person_ref.wikilink}")
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def render_obsidian_entity_note(entity: dict[str, Any], ref: NoteRef) -> str:
-    meeting_ref = meeting_ref_from_row(entity)
-    lines = [
-        f"# {ref.display_label}",
-        "",
-        ref.identity_marker,
-        "",
-        f"- Kind: `{entity['kind']}`",
-        f"- Meeting: {meeting_ref.wikilink}",
-        f"- Source: {source_label(entity)}",
-        "",
-        ref.display_label,
-    ]
-    if entity.get("status"):
-        lines.insert(6, f"- Status: `{entity['status']}`")
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def render_obsidian_person_note(ref: NoteRef) -> str:
-    lines = [
-        f"# {ref.display_label}",
-        "",
-        ref.identity_marker,
-        "",
-        f"- Person: {ref.display_label}",
-    ]
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def payload_people(entity: dict[str, Any]) -> list[str]:
-    value = entity.get("assignee") or entity.get("owner") or entity.get("person")
-    return [str(value)] if value else []
-
-
-def render_signal_sections(rows: object) -> list[str]:
-    row_dicts = list_of_dicts(rows)
-    groups = {
-        "decisions": "Latest Decisions",
-        "action_items": "Unresolved Tasks",
-        "risks": "Active Risks",
-        "open_questions": "Open Questions",
-    }
-    lines: list[str] = []
-    for kind, heading in groups.items():
-        matching = [row for row in row_dicts if row.get("kind") == kind]
-        if not matching:
-            continue
-        lines.extend(["", f"## {heading}", ""])
-        for row in matching:
-            text = str(row["text"])
-            source = source_label(row)
-            if isinstance(row.get("meeting_ref"), dict):
-                lines.append(f"- {text} - {meeting_ref_from_row(row).wikilink} - Source: {source}")
-            else:
-                lines.append(f"- {text} - Source: {source}")
-    return lines
-
-
-def unique_meeting_refs(rows: object) -> tuple[NoteRef, ...]:
-    refs: dict[str, NoteRef] = {}
-    for row in list_of_dicts(rows):
-        ref = meeting_ref_from_row(row)
-        refs.setdefault(ref.object_key, ref)
-    return tuple(refs[key] for key in sorted(refs))
-
-
-def source_label(row: dict[str, Any]) -> str:
-    meeting_ref = row.get("meeting_ref")
-    if isinstance(meeting_ref, dict):
-        source_uuid = str(meeting_ref.get("source_uuid") or "")
-        external_id = str(meeting_ref.get("external_id") or "")
-        meeting_source = "/".join(part for part in (source_uuid, external_id) if part)
-    else:
-        meeting_source = str(row.get("meeting_external_id") or row.get("meeting_local_id") or "")
-    source_parts = [
-        meeting_source,
-        str(row.get("chunk_external_id") or row.get("chunk_evidence_id") or ""),
-    ]
-    source = " / ".join(part for part in source_parts if part)
-    if row.get("chunk_timestamp_label"):
-        return f"{source} @ {row['chunk_timestamp_label']}"
-    return source
-
-
-def required_dict(payload: dict[str, Any], key: str) -> dict[str, Any]:
-    value = payload.get(key)
-    if not isinstance(value, dict):
-        message = f"Serialized {key} must be an object."
-        raise TypeError(message)
-    return cast("dict[str, Any]", value)
-
-
-def list_of_dicts(value: object) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    return [cast("dict[str, Any]", row) for row in value if isinstance(row, dict)]

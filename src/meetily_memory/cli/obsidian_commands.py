@@ -27,13 +27,6 @@ def obsidian_init(
         str,
         typer.Option("--folder", help="Folder inside the vault."),
     ] = "Meetily Memory",
-    sync_after_update: Annotated[
-        bool,
-        typer.Option(
-            "--sync-after-refresh/--no-sync-after-refresh",
-            help="Run Obsidian sync after mm refresh.",
-        ),
-    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
     try:
@@ -45,7 +38,6 @@ def obsidian_init(
         obsidian=ObsidianSettings(
             vault_path=str(vault.expanduser()),
             folder=folder,
-            sync_after_update=sync_after_update,
         ),
     )
     payload = settings.obsidian.__dict__
@@ -54,8 +46,6 @@ def obsidian_init(
         return
     print_text_block(f"obsidian vault: {settings.obsidian.vault_path}")
     print_text_block(f"obsidian folder: {settings.obsidian.folder}")
-    sync_after_refresh = "yes" if settings.obsidian.sync_after_update else "no"
-    print_text_block(f"sync after refresh: {sync_after_refresh}")
 
 
 @obsidian_app.command("sync")
@@ -106,6 +96,4 @@ def obsidian_status(
     print_text_block("obsidian: configured")
     print_text_block(f"vault: {settings.obsidian.vault_path}")
     print_text_block(f"folder: {settings.obsidian.folder}")
-    sync_after_refresh = "yes" if settings.obsidian.sync_after_update else "no"
-    print_text_block(f"sync after refresh: {sync_after_refresh}")
     print_text_block(f"last sync: {settings.obsidian.last_sync_at or 'never'}")

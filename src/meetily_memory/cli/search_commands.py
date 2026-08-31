@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated
 
 import typer
 
@@ -15,7 +15,7 @@ from meetily_memory.cli.common import (
     print_text_block,
     read_repository_from_context,
 )
-from meetily_memory.domain import AmbiguousMeetingError, MeetingRef, MeetingSearchFilters
+from meetily_memory.domain import MeetingRef, MeetingSearchFilters, MeetingSearchResult, SearchHit
 from meetily_memory.open_commands import stable_meeting_open_command
 from meetily_memory.serializers import meeting_search_result_payload
 
@@ -95,54 +95,42 @@ def search(
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     search_results = core_from_context(ctx).search(query, limit, context, filters=filters)
-    results = [meeting_search_result_payload(result) for result in search_results.results]
     if json_output:
-        print_json(results)
+        print_json([meeting_search_result_payload(result) for result in search_results.results])
         return
-    print_search_results(results)
+    print_search_results(search_results.results)
 
 
-def print_search_results(results: list[dict[str, object]]) -> None:
+def print_search_results(results: tuple[MeetingSearchResult, ...]) -> None:
     for index, result in enumerate(results):
         if index:
             console.print()
         print_search_meeting_header(result)
-        matched_tags = cast("list[str]", result["matched_tags"])
-        if matched_tags:
-            console.print(f"matched tag: {', '.join(matched_tags)}")
-        for evidence in cast("list[dict[str, object]]", result["evidence"]):
+        if result.matched_tags:
+            console.print(f"matched tag: {', '.join(result.matched_tags)}")
+        for evidence in result.evidence:
             print_search_excerpt(evidence)
 
 
-def print_search_meeting_header(result: dict[str, object]) -> None:
-    meeting_id = result["meeting_local_id"]
-    meeting = cast("dict[str, object]", result["meeting"])
-    date = compact_date(meeting.get("updated_at") or meeting.get("created_at"))
+def print_search_meeting_header(result: MeetingSearchResult) -> None:
+    meeting = result.meeting
+    date = compact_date(meeting.updated_at or meeting.created_at)
     suffix = f" ({date})" if date else ""
-    console.print(f"#{meeting_id} {meeting['title']}{suffix}")
-    meeting_ref = cast("dict[str, object]", meeting["ref"])
-    print_text_block(
-        "open: "
-        + stable_meeting_open_command(
-            meeting_ref["source_uuid"],
-            meeting_ref["external_id"],
-        )
-    )
+    console.print(f"#{result.meeting_id} {meeting.title}{suffix}")
+    print_text_block("open: " + stable_meeting_open_command(meeting.ref))
 
 
-def print_search_excerpt(result: dict[str, object]) -> None:
-    excerpt = cast("dict[str, object]", result["excerpt"])
-    source_parts = [
-        f"chunk #{excerpt.get('chunk_external_id') or excerpt['ordinal']}",
-    ]
-    if excerpt.get("timestamp_label"):
-        source_parts.insert(0, str(excerpt["timestamp_label"]))
-    if result.get("is_context"):
+def print_search_excerpt(result: SearchHit) -> None:
+    excerpt = result.excerpt
+    source_parts = [f"chunk #{excerpt.chunk_external_id or excerpt.ordinal}"]
+    if excerpt.timestamp_label:
+        source_parts.insert(0, excerpt.timestamp_label)
+    if result.is_context:
         source_parts.append("context")
     console.print(" | ".join(source_parts))
-    text = str(excerpt["text"])
-    if excerpt.get("speaker"):
-        text = f"{excerpt['speaker']}: {text}"
+    text = excerpt.text
+    if excerpt.speaker:
+        text = f"{excerpt.speaker}: {text}"
     console.print(text)
     console.print()
 
@@ -150,46 +138,23 @@ def print_search_excerpt(result: dict[str, object]) -> None:
 @app.command("open")
 def open_command(
     ctx: typer.Context,
-    source: Annotated[bool, typer.Option("--source", help="Open the indexed source path.")] = False,
-    print_path: Annotated[
-        bool,
-        typer.Option("--print-path", help="Print the selected path without opening it."),
-    ] = False,
-    source_uuid: Annotated[
-        str | None,
-        typer.Option("--source-uuid", help="Stable source UUID for --external-id."),
-    ] = None,
-    external_id: Annotated[
-        str | None,
-        typer.Option("--external-id", help="Stable or unique bare external meeting ID."),
-    ] = None,
+    meeting_ref: Annotated[
+        str,
+        typer.Argument(help="Canonical meeting reference: SOURCE_UUID/EXTERNAL_ID."),
+    ],
 ) -> None:
     """Open the original meeting folder."""
-    repo = read_repository_from_context(ctx)
-    if source_uuid is not None and external_id is None:
-        message = "--source-uuid requires --external-id."
+    try:
+        ref = MeetingRef.parse(meeting_ref)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    meeting = read_repository_from_context(ctx).get_meeting_by_ref(ref)
+    if meeting is None:
+        message = f"Meeting not found: {ref}"
         raise typer.BadParameter(message)
-    if external_id is not None and source_uuid is not None:
-        meeting = repo.get_meeting_by_ref(MeetingRef(source_uuid, external_id))
-        display_id = f"{source_uuid}/{external_id}"
-    elif external_id is not None:
-        try:
-            meeting = repo.get_meeting(external_id)
-        except AmbiguousMeetingError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        display_id = external_id
-    else:
-        message = "Provide --external-id and optionally --source-uuid."
+    folder_path = meeting.get("folder_path")
+    if not folder_path:
+        message = f"Meeting has no source-native folder: {ref}"
         raise typer.BadParameter(message)
-    if not meeting:
-        message = f"Meeting not found: {display_id}"
-        raise typer.BadParameter(message)
-    path = meeting.get("source_path") if source else meeting.get("folder_path")
-    path = path or meeting.get("folder_path") or meeting.get("source_path")
-    if not path:
-        message = f"Meeting has no path: {display_id}"
-        raise typer.BadParameter(message)
-    if print_path:
-        print_text_block(str(path))
-        return
-    open_path(Path(path))
+    open_path(Path(str(folder_path)))

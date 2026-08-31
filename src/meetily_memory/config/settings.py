@@ -1,38 +1,25 @@
+from __future__ import annotations
+
 import fcntl
-import os
-import tempfile
-from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 from meetily_memory.config.paths import app_config_path
-from meetily_memory.durable_files import fsync_directory
-from meetily_memory.json_codec import dumps_json, loads_json
+from meetily_memory.db.row_decode import decode_nullable_text, decode_required_text
+from meetily_memory.db.state_schema import StateSchemaError
+from meetily_memory.user_state import UserStateRepository
 
-
-class _SyncableTextFile(Protocol):
-    def write(self, value: str, /) -> int: ...
-
-    def flush(self) -> None: ...
-
-    def fileno(self) -> int: ...
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 
 @dataclass(frozen=True)
 class ObsidianSettings:
     vault_path: str | None = None
     folder: str = "Meetily Memory"
-    sync_after_update: bool = False
     last_sync_at: str | None = None
-
-
-@dataclass(frozen=True)
-class SemanticSettings:
-    provider: str | None = None
-    model: str | None = None
-    ollama_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,23 +29,16 @@ class AppSettings:
     ui_language: str | None = None
     last_update_at: str | None = None
     obsidian: ObsidianSettings = ObsidianSettings()
-    semantic: SemanticSettings = SemanticSettings()
 
     def as_payload(self) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "source_uuid": self.source_uuid,
             "ui_language": self.ui_language,
             "last_update_at": self.last_update_at,
             "obsidian": {
                 "vault_path": self.obsidian.vault_path,
                 "folder": self.obsidian.folder,
-                "sync_after_update": self.obsidian.sync_after_update,
                 "last_sync_at": self.obsidian.last_sync_at,
-            },
-            "semantic": {
-                "provider": self.semantic.provider,
-                "model": self.semantic.model,
-                "ollama_url": self.semantic.ollama_url,
             },
         }
         if self.source_path is not None:
@@ -67,15 +47,17 @@ class AppSettings:
 
 
 def load_app_settings(path: Path | None = None) -> AppSettings:
-    settings_path = path or app_config_path()
-    return _app_settings_from_payload(_load_settings_payload(settings_path))
+    state_path = _state_path(path)
+    if not state_path.is_file():
+        return AppSettings()
+    row = UserStateRepository.open_existing(state_path).read_app_settings()
+    return _app_settings_from_state_row(row)
 
 
 def save_app_settings(settings: AppSettings, path: Path | None = None) -> Path:
     settings_path = path or app_config_path()
     with _settings_lock(settings_path):
-        current_payload = _load_settings_payload(settings_path)
-        _save_app_settings_unlocked(settings, settings_path, current_payload)
+        _write_settings(settings_path, settings)
     return settings_path
 
 
@@ -88,31 +70,42 @@ def update_app_settings(
 ) -> AppSettings:
     path = settings_path or app_config_path()
     with _settings_lock(path):
-        current_payload = _load_settings_payload(path)
-        settings = _app_settings_from_payload(current_payload)
+        settings = load_app_settings(path)
         updated = AppSettings(
-            source_path=string_change(changes, "source_path", settings.source_path),
-            source_uuid=string_change(changes, "source_uuid", settings.source_uuid),
+            source_path=normalize_setting_text_change(changes, "source_path", settings.source_path),
+            source_uuid=normalize_setting_text_change(changes, "source_uuid", settings.source_uuid),
             ui_language=normalize_ui_language(
-                string_change(changes, "ui_language", settings.ui_language)
+                normalize_setting_text_change(changes, "ui_language", settings.ui_language)
             ),
-            last_update_at=string_change(changes, "last_update_at", settings.last_update_at),
+            last_update_at=normalize_setting_text_change(
+                changes, "last_update_at", settings.last_update_at
+            ),
             obsidian=obsidian_change(
                 changes.get("obsidian"),
                 settings.obsidian,
                 expected_for_sync=expected_obsidian,
                 last_sync_at=obsidian_last_sync_at,
             ),
-            semantic=semantic_change(changes.get("semantic"), settings.semantic),
         )
-        _save_app_settings_unlocked(updated, path, current_payload)
+        _write_settings(path, updated)
     return updated
+
+
+def _write_settings(settings_path: Path, settings: AppSettings) -> None:
+    repository = UserStateRepository(_state_path(settings_path))
+    repository.replace_app_settings(_state_values(settings))
+
+
+def _state_path(settings_path: Path | None) -> Path:
+    logical_path = settings_path or app_config_path()
+    return Path(logical_path).with_name("state.sqlite")
 
 
 @contextmanager
 def _settings_lock(path: Path) -> Generator[None, None, None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_name(f"{path.name}.lock")
+    state_path = _state_path(path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name(f"{state_path.name}.lock")
     with lock_path.open("a+b") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
@@ -121,106 +114,46 @@ def _settings_lock(path: Path) -> Generator[None, None, None]:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def _load_settings_payload(path: Path) -> dict[str, Any]:
-    try:
-        raw_payload = path.read_bytes()
-    except FileNotFoundError:
-        return {}
-    try:
-        payload = loads_json(raw_payload)
-    except ValueError as exc:
-        message = f"Invalid settings file {path}: malformed JSON."
-        raise ValueError(message) from exc
-    if not isinstance(payload, dict):
-        message = f"Invalid settings file {path}: expected a JSON object."
-        raise ValueError(message)  # noqa: TRY004
-    return payload
+def _state_values(settings: AppSettings) -> dict[str, object]:
+    return {
+        "source_uuid": settings.source_uuid,
+        "source_path": settings.source_path,
+        "ui_language": settings.ui_language,
+        "last_update_at": settings.last_update_at,
+        "obsidian_vault_path": settings.obsidian.vault_path,
+        "obsidian_folder": settings.obsidian.folder,
+        "obsidian_last_sync_at": settings.obsidian.last_sync_at,
+    }
 
 
-def _app_settings_from_payload(payload: dict[str, Any]) -> AppSettings:
-    obsidian_payload = payload.get("obsidian")
-    semantic_payload = payload.get("semantic")
-    obsidian = obsidian_from_payload(obsidian_payload if isinstance(obsidian_payload, dict) else {})
-    semantic = semantic_from_payload(semantic_payload if isinstance(semantic_payload, dict) else {})
+def _app_settings_from_state_row(row: dict[str, object]) -> AppSettings:
+    context = "state app settings"
+
+    def nullable_text(column: str) -> str | None:
+        return decode_nullable_text(
+            row[column],
+            table="app_settings",
+            column=column,
+            context=context,
+            error_type=StateSchemaError,
+        )
+
     return AppSettings(
-        source_path=optional_str(payload.get("source_path")),
-        source_uuid=optional_str(payload.get("source_uuid")),
-        ui_language=normalize_ui_language(optional_str(payload.get("ui_language"))),
-        last_update_at=optional_str(payload.get("last_update_at")),
-        obsidian=obsidian,
-        semantic=semantic,
-    )
-
-
-def _save_app_settings_unlocked(
-    settings: AppSettings,
-    path: Path,
-    current_payload: dict[str, Any],
-) -> None:
-    payload = _merge_settings_payload(current_payload, settings.as_payload())
-    _atomic_write_settings(path, payload)
-
-
-def _merge_settings_payload(
-    current_payload: dict[str, Any],
-    settings_payload: dict[str, Any],
-) -> dict[str, Any]:
-    merged_payload = dict(current_payload)
-    for key, value in settings_payload.items():
-        if key in ("obsidian", "semantic") and isinstance(value, dict):
-            current_section = current_payload.get(key)
-            merged_section = dict(current_section) if isinstance(current_section, dict) else {}
-            merged_section.update(value)
-            merged_payload[key] = merged_section
-        else:
-            merged_payload[key] = value
-    if "source_path" not in settings_payload:
-        merged_payload.pop("source_path", None)
-    merged_payload.pop("autosync_enabled", None)
-    return merged_payload
-
-
-def _atomic_write_settings(path: Path, payload: dict[str, Any]) -> None:
-    contents = dumps_json(payload) + "\n"
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-            temp_path = Path(temp_file.name)
-            _write_and_sync(temp_file, contents)
-        os.replace(temp_path, path)  # noqa: PTH105
-        fsync_directory(path.parent)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-
-
-def _write_and_sync(file: _SyncableTextFile, contents: str) -> None:
-    file.write(contents)
-    file.flush()
-    os.fsync(file.fileno())
-
-
-def obsidian_from_payload(payload: dict[str, Any]) -> ObsidianSettings:
-    return ObsidianSettings(
-        vault_path=optional_str(payload.get("vault_path")),
-        folder=optional_str(payload.get("folder")) or "Meetily Memory",
-        sync_after_update=bool(payload.get("sync_after_update", False)),
-        last_sync_at=optional_str(payload.get("last_sync_at")),
-    )
-
-
-def semantic_from_payload(payload: dict[str, Any]) -> SemanticSettings:
-    return SemanticSettings(
-        provider=optional_str(payload.get("provider")),
-        model=optional_str(payload.get("model")),
-        ollama_url=optional_str(payload.get("ollama_url")),
+        source_path=nullable_text("source_path"),
+        source_uuid=nullable_text("source_uuid"),
+        ui_language=nullable_text("ui_language"),
+        last_update_at=nullable_text("last_update_at"),
+        obsidian=ObsidianSettings(
+            vault_path=nullable_text("obsidian_vault_path"),
+            folder=decode_required_text(
+                row["obsidian_folder"],
+                table="app_settings",
+                column="obsidian_folder",
+                context=context,
+                error_type=StateSchemaError,
+            ),
+            last_sync_at=nullable_text("obsidian_last_sync_at"),
+        ),
     )
 
 
@@ -245,7 +178,6 @@ def obsidian_change(
         return ObsidianSettings(
             vault_path=current.vault_path,
             folder=current.folder,
-            sync_after_update=current.sync_after_update,
             last_sync_at=last_sync_at,
         )
     if isinstance(value, ObsidianSettings):
@@ -253,21 +185,21 @@ def obsidian_change(
     return current
 
 
-def semantic_change(value: object, current: SemanticSettings) -> SemanticSettings:
-    if isinstance(value, SemanticSettings):
-        return value
-    return current
-
-
-def string_change(changes: dict[str, object], key: str, current: str | None) -> str | None:
+def normalize_setting_text_change(
+    changes: dict[str, object],
+    key: str,
+    current: str | None,
+) -> str | None:
+    """Normalize setting input; an explicit empty string clears the setting."""
     value = changes.get(key, current)
+    if value is None:
+        return None
     if isinstance(value, Path):
         return str(value)
-    return optional_str(value)
-
-
-def optional_str(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
+    if type(value) is str:
+        return value or None
+    message = f"Setting {key} must be a string, path, or None; got {type(value).__name__}."
+    raise TypeError(message)
 
 
 def normalize_ui_language(value: str | None) -> str | None:

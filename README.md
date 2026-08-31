@@ -1,11 +1,8 @@
 # Meetily Memory
 
-Find past Meetily discussions, verify them against source excerpts, and open
-the original meeting.
-
-Meetily Memory reads the local Meetily database, builds a private local index,
-and never modifies the source database or sends meeting data to a cloud
-service.
+Search past Meetily meetings locally, verify the relevant transcript excerpt, and open the original.
+Meetily Memory is for Meetily users who need to recover what was actually discussed without sending
+meeting data to another service.
 
 ## Install
 
@@ -20,95 +17,71 @@ The CLI is available as `mm` and `meetily-memory`.
 
 ## Quick Start
 
-Initialize the local index:
-
 ```bash
 mm init
-```
-
-Search meeting history:
-
-```bash
 mm s "migration risk"
+mm open SOURCE_UUID/EXTERNAL_ID
 ```
 
-Each result includes the meeting, a matching source excerpt, and a stable command for opening the
-original. Use the generated `MeetingRef` command rather than an index-local numeric identifier:
+Search results include transcript excerpts and a complete `mm open ...` command. Copy that command
+from the result to open the original meeting; do not substitute the displayed result number.
 
-```bash
-mm open --source-uuid 8fd43c7b-4e82-4e91-aab1-6bd92131bc20 --external-id EXTERNAL_ID
-```
+## Refresh
 
-If Meetily cannot be discovered automatically:
-
-```bash
-mm doctor
-```
-
-## Search
-
-`mm s` is the main product interface:
-
-```bash
-mm s "owner_worker_id"
-mm s "what did we decide about migration?"
-mm s "product integration" --since 7d
-mm s "product integration" --from 2026-08-17 --to 2026-08-23
-```
-
-`--since Nd` searches from the current moment minus N days through now. Calendar filters use
-local dates: `--from` includes the start date and `--to` includes the entire final day.
-`--since` and `--from` are mutually exclusive.
-
-Use `--context N` when a matching excerpt needs adjacent transcript chunks:
-
-```bash
-mm s "migration risk" --context 2
-```
-
-## Keep the Index Fresh
-
-Refresh the local index after new meetings:
+After Meetily has new meetings, refresh the local index manually:
 
 ```bash
 mm refresh
 ```
 
+## Lexical Search
 
-Update the installed CLI:
+Search is lexical: it works best with words, names, identifiers, and phrases that appear in the
+transcript. It may miss paraphrases or questions phrased differently from the discussion.
 
-```bash
-mm update
-```
-
-## Optional: Organize With Tags
-
-Search works without manual organization. Add a tag only when several meetings
-belong to a project or topic that is not named consistently in their
-transcripts:
+Use neighboring transcript chunks or date filters when needed:
 
 ```bash
-mm tag add migration \
-  --source-uuid 8fd43c7b-4e82-4e91-aab1-6bd92131bc20 \
-  --external-id EXTERNAL_ID
-mm s "migration"
+mm s "migration risk" --context 2
+mm s "product integration" --since 7d
+mm s "product integration" --from 2026-08-17 --to 2026-08-23
 ```
 
-See the [command reference](docs/commands.md) for listing, suggesting, and
-removing tags.
+Run `mm s --help` for the current search options.
 
 ## Privacy
 
-- Meetily remains the read-only source of truth.
-- `index.sqlite` contains derived data and can be rebuilt.
-- Explicit user state is kept separately from the disposable index.
-- Search and indexing run locally.
+Meetily Memory reads the Meetily source database without modifying it. Indexing and search run
+locally, and meeting data is not sent to a cloud service.
 
-## Advanced Commands
+## Optional Organization
 
-Obsidian, database diagnostics, and source-rebinding commands remain available as hidden advanced
-commands outside the main workflow. Semantic retrieval is isolated to offline evaluation tooling.
-See [docs/commands.md](docs/commands.md) and [docs/integrations.md](docs/integrations.md).
+Search works without manual organization. To add or remove meeting tags, start with:
+
+```bash
+mm tag --help
+```
+
+Obsidian sync is optional and manual. It writes managed notes only under `Meetings/` and `Tags/`:
+
+```bash
+mm obsidian init --vault /path/to/vault
+mm obsidian sync
+mm obsidian status
+```
+
+Run `mm obsidian
+--help` for the current commands.
+
+## Troubleshooting and Help
+
+If Meetily cannot be discovered or the local setup is unhealthy:
+
+```bash
+mm doctor
+```
+
+Use `mm --help` or `mm COMMAND --help` as the command reference.
 
 ## Development
 

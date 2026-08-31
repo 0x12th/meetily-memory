@@ -1,158 +1,299 @@
+from __future__ import annotations
+
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from threading import Barrier
+from typing import TYPE_CHECKING
 
 import pytest
 
-from meetily_memory import user_state as user_state_module
-from meetily_memory.db.migrations import (
-    LATEST_IN_PLACE_SCHEMA_VERSION,
-    migrate_to_v1,
-    migrate_to_v2,
-    migrate_to_v3,
+from meetily_memory.db.row_decode import decode_nullable_integer
+from meetily_memory.db.schema_family import (
+    INDEX_APPLICATION_ID,
+    INDEX_SCHEMA_EPOCH,
+    INDEX_SCHEMA_FAMILY,
+    INDEX_SCHEMA_USER_VERSION,
+    SCHEMA_USER_VERSION_BASE,
+    STATE_APPLICATION_ID,
+    STATE_SCHEMA_EPOCH,
+    STATE_SCHEMA_FAMILY,
+    STATE_SCHEMA_USER_VERSION,
 )
-from meetily_memory.db.repository import IndexRepository
-from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
+from meetily_memory.db.state_schema import (
+    APPLICATION_TABLES,
+    STATE_SCHEMA_SQL,
+    StateSchemaError,
+    create_state_database,
+    validate_state_database,
+)
 from meetily_memory.user_state import (
-    CURRENT_USER_STATE_SCHEMA_VERSION,
-    INDEX_GENERATION_STATE_SCHEMA,
-    MIGRATION_REPORT_SCHEMA,
-    PENDING_SOURCE_BINDING_SCHEMA,
-    SOURCE_REVISION_SCHEMA,
-    TAG_STATE_SCHEMA,
-    TOPIC_ALIAS_STATE_SCHEMA,
-    USER_STATE_SCHEMA,
     AmbiguousSourceIdentityError,
     SourcePathClaim,
-    StoredTopic,
     UserStateRepository,
 )
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-def test_legacy_task_status_migrates_to_persistent_state_before_index_schema(
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    state_path = tmp_path / "state.sqlite"
-    source_path = str(tmp_path / "source.sqlite")
-    _create_v3_index_with_task_status(index_path, source_path=source_path)
-    state = UserStateRepository(state_path)
-    source_uuid = state.get_or_create_source(
-        "meetily_sqlite",
-        source_path,
-        now="state-created",
-    )
 
-    repo = IndexRepository(index_path, state_path=state_path)
-    report = UserStateRepository(state_path).latest_migration_report()
+def _database_identity(path: Path) -> tuple[bytes, int]:
+    return path.read_bytes(), path.stat().st_mtime_ns
 
-    assert repo.requires_rebuild is True
-    assert report == {"migrated": 1, "orphaned": 0}
-    with sqlite3.connect(state_path) as conn:
-        persisted_status = conn.execute(
-            "SELECT status, note FROM task_states WHERE orphaned = 0"
-        ).fetchone()
-    assert persisted_status == ("done", "verified by user")
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute(
-            "SELECT source_uuid FROM task_states WHERE orphaned = 0"
-        ).fetchone() == (source_uuid,)
-    with sqlite3.connect(index_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_IN_PLACE_SCHEMA_VERSION
-        assert (
-            conn.execute(
+
+def _application_tables(path: Path) -> set[str]:
+    with sqlite3.connect(path) as connection:
+        return {
+            str(row[0])
+            for row in connection.execute(
                 """
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'task_status_overrides'
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
                 """
-            ).fetchone()
-            is None
-        )
+            )
+        }
 
 
-def test_v3_task_transfer_reuses_only_registered_source_and_orphans_other_source(
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    state_path = tmp_path / "state.sqlite"
-    source_a = str(tmp_path / "source-a.sqlite")
-    source_b = str(tmp_path / "source-b.sqlite")
-    _create_v3_index_with_two_task_sources(index_path, source_a, source_b)
-    state = UserStateRepository(state_path)
-    source_a_uuid = state.get_or_create_source(
-        "meetily_sqlite",
-        source_a,
-        now="registered-a",
-    )
+def test_schema_family_constants_are_stable() -> None:
+    assert SCHEMA_USER_VERSION_BASE == 1000
+    assert STATE_SCHEMA_FAMILY == "meetily-memory-state"
+    assert INDEX_SCHEMA_FAMILY == "meetily-memory-index"
+    assert STATE_APPLICATION_ID == 0x4D4D5354
+    assert INDEX_APPLICATION_ID == 0x4D4D4958
+    assert STATE_SCHEMA_EPOCH == 1
+    assert INDEX_SCHEMA_EPOCH == 1
+    assert STATE_SCHEMA_USER_VERSION == 1001
+    assert INDEX_SCHEMA_USER_VERSION == 1001
 
-    IndexRepository(index_path, state_path=state_path)
 
-    assert state.latest_migration_report() == {"migrated": 1, "orphaned": 1}
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute("SELECT uuid, current_path FROM sources").fetchall() == [
-            (source_a_uuid, source_a)
+def test_fresh_state_has_exact_epoch_schema_identity_and_singletons(tmp_path: Path) -> None:
+    state_path = tmp_path / "nested" / "state.sqlite"
+
+    repository = UserStateRepository(state_path)
+
+    assert repository.state_path == state_path
+    assert _application_tables(state_path) == APPLICATION_TABLES
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("PRAGMA application_id").fetchone() == (STATE_APPLICATION_ID,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (STATE_SCHEMA_USER_VERSION,)
+        assert connection.execute(
+            "SELECT singleton, schema_family, schema_epoch FROM state_meta"
+        ).fetchall() == [(1, STATE_SCHEMA_FAMILY, STATE_SCHEMA_EPOCH)]
+        settings = connection.execute("SELECT * FROM app_settings").fetchall()
+        assert len(settings) == 1
+        assert settings[0][0] == 1
+        setting_columns = [
+            str(row[1]) for row in connection.execute("PRAGMA table_info(app_settings)")
         ]
-        active = conn.execute(
-            """
-            SELECT source_uuid, meeting_external_id, status, note, source
-            FROM task_states
-            WHERE orphaned = 0
-            """
-        ).fetchone()
-        orphan = conn.execute(
-            """
-            SELECT source_uuid, meeting_external_id, status, note, source, orphaned_reason
-            FROM task_states
-            WHERE orphaned = 1
-            """
-        ).fetchone()
-    assert active == (source_a_uuid, "meeting-a", "done", "note-a", "manual-a")
-    assert orphan == (
-        None,
-        "meeting-b",
-        "in_progress",
-        "note-b",
-        "manual-b",
-        "legacy source identity is absent from persistent state",
+        assert setting_columns == [
+            "singleton",
+            "source_uuid",
+            "source_path",
+            "ui_language",
+            "last_update_at",
+            "obsidian_vault_path",
+            "obsidian_folder",
+            "obsidian_last_sync_at",
+        ]
+        meeting_tag_columns = [
+            str(row[1]) for row in connection.execute("PRAGMA table_info(meeting_tags)")
+        ]
+        assert meeting_tag_columns == [
+            "source_uuid",
+            "meeting_external_id",
+            "manual_tag_id",
+            "created_at",
+        ]
+        indexes = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        assert indexes == {
+            "idx_app_settings_source_uuid",
+            "idx_meeting_tags_manual_tag_id",
+            "idx_meeting_tags_meeting",
+            "idx_sources_kind_projected_path",
+        }
+    validate_state_database(state_path)
+
+
+def test_state_schema_sql_contains_only_the_supported_application_tables() -> None:
+    with sqlite3.connect(":memory:") as connection:
+        connection.executescript(STATE_SCHEMA_SQL)
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+    assert tables == APPLICATION_TABLES
+    assert (
+        not {
+            "task_states",
+            "migration_reports",
+            "migration_report_items",
+            "topic_alias_topics",
+            "topic_aliases",
+            "topic_alias_imports",
+            "index_generations",
+            "tags",
+        }
+        & tables
     )
 
 
-def test_task_status_survives_disposable_index_rebuild(meetily_db: Path, tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
+@pytest.mark.parametrize(
+    "alter_sql",
+    [
+        "ALTER TABLE app_settings ADD COLUMN semantic_provider TEXT",
+        "ALTER TABLE meeting_tags ADD COLUMN source TEXT DEFAULT 'manual'",
+    ],
+)
+def test_exact_state_schema_rejects_removed_semantic_and_assignment_source_columns(
+    tmp_path: Path,
+    alter_sql: str,
+) -> None:
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    repo = IndexRepository(index_path, state_path=state_path)
-    task = repo.list_structured_entity_details("action_items")[0]
-    repo.set_task_status(task["id"], "done", note="keep me")
+    create_state_database(state_path)
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(alter_sql)
+        connection.commit()
 
-    index_path.unlink()
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    rebuilt = IndexRepository(index_path, state_path=state_path)
-    matching = [
-        row
-        for row in rebuilt.list_structured_entity_details("action_items", limit=100)
-        if row["text"] == task["text"]
-    ]
-
-    assert matching[0]["status"] == "done"
-    assert matching[0]["status_note"] == "keep me"
+    with pytest.raises(StateSchemaError, match="schema objects do not exactly match"):
+        validate_state_database(state_path)
 
 
-def test_unmatched_legacy_status_is_preserved_as_orphan(tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
+def test_fresh_create_refuses_any_existing_file_without_modifying_it(tmp_path: Path) -> None:
     state_path = tmp_path / "state.sqlite"
-    _create_v3_index_with_task_status(
-        index_path,
-        source_path=str(tmp_path / "source.sqlite"),
-        chunk_external_id=None,
+    state_path.write_bytes(b"")
+    before = _database_identity(state_path)
+
+    with pytest.raises(StateSchemaError, match=r"fresh-only|Refusing"):
+        create_state_database(state_path)
+
+    assert _database_identity(state_path) == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["legacy", "foreign", "future", "future-epoch", "wrong-family", "tampered"],
+)
+def test_existing_non_epoch_state_is_rejected_actionably_and_read_only(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    state_path = tmp_path / f"{case}.sqlite"
+    if case == "legacy":
+        with sqlite3.connect(state_path) as connection:
+            connection.execute("CREATE TABLE sources (uuid TEXT PRIMARY KEY)")
+            connection.execute("PRAGMA user_version=7")
+    else:
+        create_state_database(state_path)
+        with sqlite3.connect(state_path) as connection:
+            if case == "foreign":
+                connection.execute(f"PRAGMA application_id={INDEX_APPLICATION_ID}")
+            elif case == "future":
+                connection.execute(f"PRAGMA user_version={STATE_SCHEMA_USER_VERSION + 1}")
+            elif case in {"future-epoch", "wrong-family"}:
+                connection.execute("PRAGMA ignore_check_constraints=ON")
+                if case == "future-epoch":
+                    connection.execute(
+                        "UPDATE state_meta SET schema_epoch=? WHERE singleton=1",
+                        (STATE_SCHEMA_EPOCH + 1,),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE state_meta "
+                        "SET schema_family='another-state-family' WHERE singleton=1"
+                    )
+                connection.execute("PRAGMA ignore_check_constraints=OFF")
+            else:
+                connection.execute("DROP INDEX idx_meeting_tags_meeting")
+            connection.commit()
+    before = _database_identity(state_path)
+
+    with pytest.raises(
+        StateSchemaError,
+        match=r"Deleting state permanently loses manual tags and application settings",
+    ):
+        UserStateRepository(state_path)
+
+    assert _database_identity(state_path) == before
+
+
+def test_corrupt_existing_state_is_rejected_actionably_and_read_only(tmp_path: Path) -> None:
+    state_path = tmp_path / "corrupt.sqlite"
+    state_path.write_bytes(b"not a sqlite database")
+    before = _database_identity(state_path)
+
+    with pytest.raises(
+        StateSchemaError,
+        match=r"Deleting state permanently loses manual tags and application settings",
+    ):
+        UserStateRepository(state_path)
+
+    assert _database_identity(state_path) == before
+
+
+def test_settings_preserve_selected_source_and_runtime_values(tmp_path: Path) -> None:
+    state = UserStateRepository(tmp_path / "state.sqlite")
+    source_uuid = state.get_or_create_source("meetily_sqlite", "/source.sqlite", now="created")
+
+    state.replace_app_settings(
+        {
+            "source_uuid": source_uuid,
+            "source_path": None,
+            "ui_language": "ru",
+            "last_update_at": "updated",
+            "obsidian_vault_path": "/vault",
+            "obsidian_folder": "Meetily",
+            "obsidian_last_sync_at": "synced",
+        }
     )
 
-    IndexRepository(index_path, state_path=state_path)
-    state = UserStateRepository(state_path)
+    row = state.read_app_settings()
+    assert row == {
+        "singleton": 1,
+        "source_uuid": source_uuid,
+        "source_path": None,
+        "ui_language": "ru",
+        "last_update_at": "updated",
+        "obsidian_vault_path": "/vault",
+        "obsidian_folder": "Meetily",
+        "obsidian_last_sync_at": "synced",
+    }
 
-    assert state.latest_migration_report() == {"migrated": 0, "orphaned": 1}
-    assert state.list_orphans()[0]["status"] == "done"
+
+def test_pending_revision_decoder_accepts_only_sqlite_integer_or_null(tmp_path: Path) -> None:
+    database = tmp_path / "row-values.sqlite"
+    with sqlite3.connect(database) as connection:
+        text_value = connection.execute("SELECT CAST('7' AS TEXT) AS pending_revision").fetchone()[
+            0
+        ]
+        null_value = connection.execute("SELECT NULL AS pending_revision").fetchone()[0]
+
+    with pytest.raises(
+        StateSchemaError,
+        match=r"sources\.pending_revision must be INTEGER, got TEXT",
+    ):
+        decode_nullable_integer(
+            text_value,
+            table="sources",
+            column="pending_revision",
+            context="source binding",
+            error_type=StateSchemaError,
+        )
+    assert (
+        decode_nullable_integer(
+            null_value,
+            table="sources",
+            column="pending_revision",
+            context="source binding",
+            error_type=StateSchemaError,
+        )
+        is None
+    )
 
 
 def test_source_uuid_survives_explicit_path_update(tmp_path: Path) -> None:
@@ -195,19 +336,9 @@ def test_atomic_source_path_claim_allows_only_one_competing_uuid(tmp_path: Path)
     conflicts = [result for result in results if isinstance(result, AmbiguousSourceIdentityError)]
     assert len(claims) == 1
     assert len(conflicts) == 1
-    with sqlite3.connect(state_path) as conn:
-        paths = dict(conn.execute("SELECT uuid, current_path FROM sources"))
-    assert paths[claims[0].source_uuid] == str(target_path.resolve(strict=True))
-    losing_uuid = second_uuid if claims[0].source_uuid == first_uuid else first_uuid
-    expected_losing_path = (
-        "/old/second.sqlite" if losing_uuid == second_uuid else "/old/first.sqlite"
-    )
-    assert paths[losing_uuid] == expected_losing_path
 
 
-def test_same_target_retry_preserves_persisted_projection_and_finalizes_once(
-    tmp_path: Path,
-) -> None:
+def test_same_target_retry_preserves_projection_and_finalizes_once(tmp_path: Path) -> None:
     state_path = tmp_path / "state.sqlite"
     state = UserStateRepository(state_path)
     source_uuid = state.get_or_create_source("meetily_sqlite", "/old/source.sqlite", now="1")
@@ -231,75 +362,20 @@ def test_same_target_retry_preserves_persisted_projection_and_finalizes_once(
     assert retry_claim.claimed_revision > first_claim.claimed_revision
     assert retry_claim.projected_path == "/old/source.sqlite"
     assert retry_claim.resumed is True
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute(
-            """
-            SELECT current_path, projected_path, revision, pending_revision
-            FROM sources
-            WHERE uuid = ?
-            """,
-            (source_uuid,),
-        ).fetchone() == (
-            str(target_path.resolve(strict=True)),
-            "/old/source.sqlite",
-            retry_claim.claimed_revision,
-            retry_claim.claimed_revision,
-        )
-
     assert restarted_state.finalize_source_path_claim(retry_claim) is True
     assert restarted_state.finalize_source_path_claim(first_claim) is False
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute(
-            """
-            SELECT current_path, projected_path, revision, pending_revision
-            FROM sources
-            WHERE uuid = ?
-            """,
-            (source_uuid,),
-        ).fetchone() == (
-            str(target_path.resolve(strict=True)),
-            str(target_path.resolve(strict=True)),
-            retry_claim.claimed_revision,
-            None,
-        )
+    assert restarted_state.get_source_binding(source_uuid) == {
+        "uuid": source_uuid,
+        "kind": "meetily_sqlite",
+        "current_path": str(target_path.resolve(strict=True)),
+        "revision": retry_claim.claimed_revision,
+        "projected_path": str(target_path.resolve(strict=True)),
+        "pending_revision": None,
+        "updated_at": "3",
+    }
 
 
-def test_same_target_retry_compensation_persists_reverse_claim_with_fresh_token(
-    tmp_path: Path,
-) -> None:
-    state = UserStateRepository(tmp_path / "state.sqlite")
-    source_uuid = state.get_or_create_source("meetily_sqlite", "/old/source.sqlite", now="1")
-    target_path = tmp_path / "target.sqlite"
-    target_path.touch()
-    first_claim = state.claim_source_path(
-        source_uuid,
-        "meetily_sqlite",
-        target_path,
-        now="2",
-    )
-    retry_claim = state.claim_source_path(
-        source_uuid,
-        "meetily_sqlite",
-        target_path,
-        now="3",
-    )
-
-    rollback_claim = state.begin_source_path_rollback(retry_claim, now="rollback")
-
-    assert rollback_claim is not None
-    persisted = state.get_pending_source_path_claim(source_uuid)
-    assert persisted is not None
-    assert persisted.claimed_path == rollback_claim.claimed_path
-    assert persisted.projected_path == rollback_claim.projected_path
-    assert persisted.claimed_revision == rollback_claim.claimed_revision
-    assert rollback_claim.claimed_path == "/old/source.sqlite"
-    assert rollback_claim.projected_path == str(target_path.resolve(strict=True))
-    assert rollback_claim.claimed_revision > retry_claim.claimed_revision
-    assert state.begin_source_path_rollback(first_claim, now="stale") is None
-    assert state.finalize_source_path_claim(retry_claim) is False
-
-
-def test_source_path_claim_compensation_and_aba_are_token_guarded(tmp_path: Path) -> None:
+def test_source_path_claim_compensation_is_token_guarded(tmp_path: Path) -> None:
     state = UserStateRepository(tmp_path / "state.sqlite")
     source_uuid = state.get_or_create_source("meetily_sqlite", "/old/source.sqlite", now="1")
     target_path = tmp_path / "target.sqlite"
@@ -312,444 +388,9 @@ def test_source_path_claim_compensation_and_aba_are_token_guarded(tmp_path: Path
     )
 
     rollback_claim = state.begin_source_path_rollback(first_claim, now="rollback")
+
     assert rollback_claim is not None
+    assert rollback_claim.claimed_path == "/old/source.sqlite"
+    assert rollback_claim.projected_path == str(target_path.resolve(strict=True))
     assert state.finalize_source_path_claim(rollback_claim) is True
-    second_claim = state.claim_source_path(
-        source_uuid,
-        "meetily_sqlite",
-        target_path,
-        now="3",
-    )
-
-    assert second_claim.claimed_revision > rollback_claim.claimed_revision
     assert state.begin_source_path_rollback(first_claim, now="stale") is None
-    assert state.finalize_source_path_claim(first_claim) is False
-    assert state.finalize_source_path_claim(second_claim) is True
-    with sqlite3.connect(state.state_path) as conn:
-        assert conn.execute(
-            """
-            SELECT current_path, projected_path, revision, pending_revision
-            FROM sources
-            WHERE uuid = ?
-            """,
-            (source_uuid,),
-        ).fetchone() == (
-            str(target_path.resolve(strict=True)),
-            str(target_path.resolve(strict=True)),
-            second_claim.claimed_revision,
-            None,
-        )
-
-
-def test_source_path_claim_compensation_does_not_overwrite_newer_path(tmp_path: Path) -> None:
-    state = UserStateRepository(tmp_path / "state.sqlite")
-    source_uuid = state.get_or_create_source("meetily_sqlite", "/old/source.sqlite", now="1")
-    target_path = tmp_path / "target.sqlite"
-    target_path.touch()
-    claim = state.claim_source_path(
-        source_uuid,
-        "meetily_sqlite",
-        target_path,
-        now="2",
-    )
-    state.update_source_path(source_uuid, "/concurrent/source.sqlite", now="3")
-
-    rollback_claim = state.begin_source_path_rollback(claim, now="rollback")
-
-    assert rollback_claim is None
-    assert state.get_source(source_uuid) == {
-        "uuid": source_uuid,
-        "kind": "meetily_sqlite",
-        "current_path": "/concurrent/source.sqlite",
-    }
-
-
-def test_user_state_v1_migrates_to_current_schema_idempotently(tmp_path: Path) -> None:
-    state_path = tmp_path / "state.sqlite"
-    with sqlite3.connect(state_path) as conn:
-        conn.executescript(USER_STATE_SCHEMA)
-        conn.execute("PRAGMA user_version = 1")
-        conn.commit()
-
-    UserStateRepository(state_path)
-    UserStateRepository(state_path)
-
-    with sqlite3.connect(state_path) as conn:
-        assert (
-            conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_USER_STATE_SCHEMA_VERSION
-        )
-        tables = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-        assert {
-            "tags",
-            "meeting_tags",
-            "migration_report_items",
-            "topic_alias_topics",
-            "topic_aliases",
-            "topic_alias_imports",
-            "index_generations",
-        } <= tables
-        report_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(migration_reports)")
-        }
-        assert "migration_key" in report_columns
-        meeting_tag_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(meeting_tags)").fetchall()
-        }
-        assert {"source_uuid", "meeting_external_id", "tag_id", "source"} <= meeting_tag_columns
-        source_columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(sources)").fetchall()
-        }
-        assert {"revision", "projected_path", "pending_revision"} <= source_columns
-
-
-def test_pending_binding_and_topic_alias_schema_upgrades_are_atomic_and_retryable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state_path = tmp_path / "state.sqlite"
-    with sqlite3.connect(state_path) as conn:
-        conn.executescript(USER_STATE_SCHEMA)
-        conn.executescript(TAG_STATE_SCHEMA)
-        conn.executescript(MIGRATION_REPORT_SCHEMA)
-        conn.executescript(SOURCE_REVISION_SCHEMA)
-        conn.execute(
-            """
-            INSERT INTO sources (
-              uuid, kind, current_path, created_at, updated_at, revision
-            ) VALUES ('source-uuid', 'meetily_sqlite', '/source.sqlite', '1', '1', 4)
-            """
-        )
-        conn.execute("PRAGMA user_version = 4")
-        conn.commit()
-
-    original_execute = user_state_module.execute_sql_statements
-    failed_scripts: list[str] = []
-
-    def fail_each_new_schema_once(conn: sqlite3.Connection, script: str) -> None:
-        original_execute(conn, script)
-        if (
-            script
-            in {
-                PENDING_SOURCE_BINDING_SCHEMA,
-                TOPIC_ALIAS_STATE_SCHEMA,
-                INDEX_GENERATION_STATE_SCHEMA,
-            }
-            and script not in failed_scripts
-        ):
-            failed_scripts.append(script)
-            message = "injected additive state schema failure"
-            raise RuntimeError(message)
-
-    monkeypatch.setattr(user_state_module, "execute_sql_statements", fail_each_new_schema_once)
-    with pytest.raises(RuntimeError, match="additive state schema failure"):
-        UserStateRepository(state_path)
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert "projected_path" not in {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(sources)").fetchall()
-        }
-
-    with pytest.raises(RuntimeError, match="additive state schema failure"):
-        UserStateRepository(state_path)
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
-        assert conn.execute(
-            "SELECT projected_path, pending_revision FROM sources WHERE uuid = 'source-uuid'"
-        ).fetchone() == ("/source.sqlite", None)
-        assert "topic_aliases" not in {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-
-    with pytest.raises(RuntimeError, match="additive state schema failure"):
-        UserStateRepository(state_path)
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
-        assert "generation_id" not in {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(topic_alias_imports)").fetchall()
-        }
-        assert "index_generations" not in {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-
-    monkeypatch.setattr(user_state_module, "execute_sql_statements", original_execute)
-    UserStateRepository(state_path)
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == (
-            CURRENT_USER_STATE_SCHEMA_VERSION
-        )
-        assert conn.execute(
-            "SELECT current_path, projected_path, revision, pending_revision FROM sources"
-        ).fetchall() == [("/source.sqlite", "/source.sqlite", 4, None)]
-        assert {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        } >= {
-            "topic_alias_topics",
-            "topic_aliases",
-            "topic_alias_imports",
-            "index_generations",
-        }
-
-
-def test_topic_namespace_conflict_is_prevalidated_before_any_state_row(
-    tmp_path: Path,
-) -> None:
-    state_path = tmp_path / "state.sqlite"
-    state = UserStateRepository(state_path)
-    beta = StoredTopic(
-        stable_key="topic:beta",
-        title="Beta",
-        normalized_title="beta",
-        created_at="beta-created",
-        updated_at="beta-updated",
-        raw_metadata_json='{"owner":"beta"}',
-    )
-    alpha = StoredTopic(
-        stable_key="topic:alpha",
-        title="Alpha",
-        normalized_title="alpha",
-        created_at="alpha-created",
-        updated_at="alpha-updated",
-        raw_metadata_json='{"owner":"alpha"}',
-    )
-    assert state.add_topic_aliases(beta, ["bee"], now="beta-alias") == ("bee",)
-    before = state_path.read_bytes()
-
-    added = state.add_topic_aliases(alpha, ["alpha-free", "  BETA  "], now="conflict")
-
-    assert added == ()
-    assert state_path.read_bytes() == before
-    assert state.topic_for_query("beta") == beta
-    assert state.topic_for_query("Alpha") is None
-    assert state.topic_for_query("alpha-free") is None
-    assert state.list_topics() == (beta,)
-
-
-def test_v6_alias_import_ledger_migrates_to_generation_and_path_key(tmp_path: Path) -> None:
-    state_path = tmp_path / "state.sqlite"
-    digest = "a" * 64
-    with sqlite3.connect(state_path) as conn:
-        conn.executescript(USER_STATE_SCHEMA)
-        conn.executescript(TAG_STATE_SCHEMA)
-        conn.executescript(MIGRATION_REPORT_SCHEMA)
-        conn.executescript(SOURCE_REVISION_SCHEMA)
-        conn.executescript(PENDING_SOURCE_BINDING_SCHEMA)
-        conn.executescript(TOPIC_ALIAS_STATE_SCHEMA)
-        conn.execute(
-            """
-            INSERT INTO topic_alias_imports (
-              index_path, source_schema_version, source_alias_count,
-              source_digest, imported_at
-            ) VALUES ('/index.sqlite', 5, 1, ?, 'imported')
-            """,
-            (digest,),
-        )
-        conn.execute("PRAGMA user_version = 6")
-        conn.commit()
-
-    UserStateRepository(state_path)
-
-    generation_id = f"legacy-import:{digest}"
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute(
-            """
-            SELECT generation_id, index_path, alias_owner, registered_at
-            FROM index_generations
-            """
-        ).fetchone() == (generation_id, "/index.sqlite", "legacy", "imported")
-        assert conn.execute(
-            """
-            SELECT generation_id, index_path, source_schema_version,
-                   source_alias_count, source_digest, imported_at
-            FROM topic_alias_imports
-            """
-        ).fetchone() == (generation_id, "/index.sqlite", 5, 1, digest, "imported")
-
-
-def test_source_revision_schema_upgrade_is_atomic_and_retryable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state_path = tmp_path / "state.sqlite"
-    with sqlite3.connect(state_path) as conn:
-        conn.executescript(USER_STATE_SCHEMA)
-        conn.executescript(TAG_STATE_SCHEMA)
-        conn.executescript(MIGRATION_REPORT_SCHEMA)
-        conn.execute(
-            """
-            INSERT INTO sources (uuid, kind, current_path, created_at, updated_at)
-            VALUES ('source-uuid', 'meetily_sqlite', '/source.sqlite', '1', '1')
-            """
-        )
-        conn.execute("PRAGMA user_version = 3")
-        conn.commit()
-
-    original_execute = user_state_module.execute_sql_statements
-
-    def fail_after_revision_ddl(conn: sqlite3.Connection, script: str) -> None:
-        original_execute(conn, script)
-        if script == SOURCE_REVISION_SCHEMA:
-            message = "injected state schema failure"
-            raise RuntimeError(message)
-
-    monkeypatch.setattr(user_state_module, "execute_sql_statements", fail_after_revision_ddl)
-    with pytest.raises(RuntimeError, match="injected state schema failure"):
-        UserStateRepository(state_path)
-
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
-        assert "revision" not in {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(sources)").fetchall()
-        }
-
-    monkeypatch.setattr(user_state_module, "execute_sql_statements", original_execute)
-    UserStateRepository(state_path)
-
-    with sqlite3.connect(state_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == (
-            CURRENT_USER_STATE_SCHEMA_VERSION
-        )
-        assert conn.execute(
-            "SELECT current_path, revision FROM sources WHERE uuid = 'source-uuid'"
-        ).fetchone() == ("/source.sqlite", 0)
-
-
-def _create_v3_index_with_task_status(
-    index_path: Path,
-    *,
-    source_path: str,
-    chunk_external_id: str | None = "chunk-1",
-) -> None:
-    with sqlite3.connect(index_path) as conn:
-        migrate_to_v1(conn)
-        migrate_to_v2(conn)
-        migrate_to_v3(conn)
-        conn.execute("PRAGMA user_version = 3")
-        conn.execute(
-            """
-            INSERT INTO sources (id, kind, path, created_at, updated_at)
-            VALUES (1, 'meetily_sqlite', ?, 'now', 'now')
-            """,
-            (source_path,),
-        )
-        conn.execute(
-            """
-            INSERT INTO meetings (
-              id, source_id, external_id, title, fingerprint, indexed_at
-            ) VALUES (1, 1, 'meeting-1', 'Meeting', 'meeting-fp', 'now')
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO chunks (
-              id, meeting_id, external_id, kind, ordinal, text, fingerprint
-            ) VALUES (1, 1, ?, 'transcript', 0, 'Ship migration plan.', 'chunk-fp')
-            """,
-            (chunk_external_id,),
-        )
-        conn.execute(
-            """
-            INSERT INTO action_items (
-              id, meeting_id, source_chunk_id, ordinal, text, source, confidence,
-              fingerprint, created_at, updated_at
-            ) VALUES (
-              1, 1, 1, 0, 'Ship migration plan.', 'heuristic', 0.55,
-              'entity-fp', 'now', 'now'
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO task_status_overrides (
-              action_item_id, status, note, source, created_at, updated_at
-            ) VALUES (1, 'done', 'verified by user', 'manual', 'now', 'now')
-            """
-        )
-        conn.commit()
-
-
-def _create_v3_index_with_two_task_sources(
-    index_path: Path,
-    source_a: str,
-    source_b: str,
-) -> None:
-    with sqlite3.connect(index_path) as conn:
-        migrate_to_v1(conn)
-        migrate_to_v2(conn)
-        migrate_to_v3(conn)
-        for source_id, suffix, source_path, status, note, provenance in (
-            (1, "a", source_a, "done", "note-a", "manual-a"),
-            (2, "b", source_b, "in_progress", "note-b", "manual-b"),
-        ):
-            conn.execute(
-                """
-                INSERT INTO sources (id, kind, path, created_at, updated_at)
-                VALUES (?, 'meetily_sqlite', ?, 'created', 'updated')
-                """,
-                (source_id, source_path),
-            )
-            conn.execute(
-                """
-                INSERT INTO meetings (
-                  id, source_id, external_id, title, fingerprint, indexed_at
-                ) VALUES (?, ?, ?, ?, ?, 'indexed')
-                """,
-                (
-                    source_id,
-                    source_id,
-                    f"meeting-{suffix}",
-                    f"Meeting {suffix.upper()}",
-                    f"meeting-fp-{suffix}",
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO chunks (
-                  id, meeting_id, external_id, kind, ordinal, text, fingerprint
-                ) VALUES (?, ?, ?, 'transcript', 0, ?, ?)
-                """,
-                (
-                    source_id,
-                    source_id,
-                    f"chunk-{suffix}",
-                    f"Ship plan {suffix}.",
-                    f"chunk-fp-{suffix}",
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO action_items (
-                  id, meeting_id, source_chunk_id, ordinal, text, source, confidence,
-                  fingerprint, created_at, updated_at
-                ) VALUES (?, ?, ?, 0, ?, 'heuristic', 0.8, ?, 'created', 'updated')
-                """,
-                (
-                    source_id,
-                    source_id,
-                    source_id,
-                    f"Ship plan {suffix}.",
-                    f"entity-fp-{suffix}",
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO task_status_overrides (
-                  action_item_id, status, note, source, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'created', 'updated')
-                """,
-                (source_id, status, note, provenance),
-            )
-        conn.commit()

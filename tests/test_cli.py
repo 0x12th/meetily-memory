@@ -10,7 +10,6 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from meetily_memory.cli import obsidian_commands
 from meetily_memory.cli.app import app
 from meetily_memory.cli.common import open_path
 from meetily_memory.cli.search_commands import parse_search_filters
@@ -18,12 +17,11 @@ from meetily_memory.config.settings import (
     ObsidianSettings,
     load_app_settings,
 )
-from meetily_memory.db.migrations import CURRENT_SCHEMA_VERSION
-from meetily_memory.db.repository import IndexRepository
-from meetily_memory.integrations import ObsidianSyncResult
+from meetily_memory.db.schema_family import INDEX_SCHEMA_USER_VERSION
 from meetily_memory.json_codec import loads_json
-from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
+from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.tagging import TagRepository
+from tests.index_helpers import publish_fresh_index
 
 
 def test_parse_search_filters_builds_since_window_from_injected_clock() -> None:
@@ -83,7 +81,7 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert "Local search over Meetily meeting history." in help_result.stdout
     assert "Main workflow:" in help_result.stdout
     assert "mm s QUERY" in help_result.stdout
-    assert "mm open --source-uuid UUID --external-id ID" in help_result.stdout
+    assert "mm open SOURCE_UUID/EXTERNAL_ID" in help_result.stdout
     assert "\n  ask" not in help_result.stdout
     assert "ask answers" not in help_result.stdout
     assert "--install-completion" not in help_result.stdout
@@ -99,6 +97,7 @@ def test_cli_help_uses_plain_click_format() -> None:
         "s",
         "open",
         "tag",
+        "obsidian",
     ):
         assert re.search(rf"\n  {re.escape(command)}(?:\s{{2,}}|\n)", help_result.stdout)
     for command in (
@@ -106,7 +105,6 @@ def test_cli_help_uses_plain_click_format() -> None:
         "c",
         "t",
         "topic",
-        "obsidian",
         "config",
         "db",
         "mcp",
@@ -115,8 +113,9 @@ def test_cli_help_uses_plain_click_format() -> None:
 
     open_help = runner.invoke(app, ["open", "--help"])
     assert open_help.exit_code == 0
-    assert "--source" in open_help.stdout
-    assert "--folder" not in open_help.stdout
+    assert "MEETING_REF" in open_help.stdout
+    for obsolete_option in ("--source-uuid", "--external-id", "--source", "--print-path"):
+        assert obsolete_option not in open_help.stdout
 
     search_help = runner.invoke(app, ["s", "--help"])
     assert search_help.exit_code == 0
@@ -129,7 +128,8 @@ def test_cli_help_uses_plain_click_format() -> None:
 
     obsidian_init_help = runner.invoke(app, ["obsidian", "init", "--help"])
     assert obsidian_init_help.exit_code == 0
-    assert "--sync-after-refresh" in obsidian_init_help.stdout
+    assert "--sync-after-refresh" not in obsidian_init_help.stdout
+    assert "--no-sync-after-refresh" not in obsidian_init_help.stdout
     assert "--sync-after-update" not in obsidian_init_help.stdout
 
 
@@ -137,7 +137,6 @@ def test_cli_help_uses_plain_click_format() -> None:
     ("command", "expected"),
     [
         (("scan",), "--source"),
-        (("obsidian",), "sync"),
         (("config",), "source"),
         (("db",), "status"),
     ],
@@ -175,8 +174,14 @@ def test_cli_config_language_persists_ui_language(tmp_path: Path) -> None:
 
     assert language.exit_code == 0
     assert "ui language: ru" in language.stdout
-    config = loads_json((data_dir / "settings.json").read_text())
-    assert config["ui_language"] == "ru"
+    settings_path = index_path.with_name("settings.json")
+    state_path = index_path.with_name("state.sqlite")
+    assert load_app_settings(settings_path).ui_language == "ru"
+    assert not settings_path.exists()
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT ui_language FROM app_settings").fetchone() == ("ru",)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
     status = runner.invoke(app, ["--index", str(index_path), "status"], env=env)
     assert status.exit_code == 0
@@ -189,8 +194,11 @@ def test_cli_config_language_persists_ui_language(tmp_path: Path) -> None:
     )
     assert auto.exit_code == 0
     assert "ui language: auto" in auto.stdout
-    config = loads_json((data_dir / "settings.json").read_text())
-    assert config["ui_language"] is None
+    assert load_app_settings(settings_path).ui_language is None
+    assert not settings_path.exists()
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute("SELECT ui_language FROM app_settings").fetchone() == (None,)
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
 def scan_twice(runner: CliRunner, index_path: Path, meetily_db: Path) -> None:
@@ -199,17 +207,21 @@ def scan_twice(runner: CliRunner, index_path: Path, meetily_db: Path) -> None:
         ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
     assert scan.exit_code == 0
-    assert "meetings seen: 2" in scan.stdout
+    assert "meetings: 2" in scan.stdout
 
-    force_scan = runner.invoke(
+    second_scan = runner.invoke(
         app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db), "--force"],
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
-    assert force_scan.exit_code == 0
-    assert "meetings updated: 2" in force_scan.stdout
+    assert second_scan.exit_code == 0
+    assert "meetings: 2" in second_scan.stdout
 
 
-def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_path: Path) -> None:
+def test_cli_v1_scan_search_list_last_person_and_doctor(
+    meetily_db: Path,
+    tmp_path: Path,
+    platform_opener: tuple[dict[str, str], Path],
+) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
 
@@ -221,8 +233,8 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert "pricing decision" in search.stdout
     assert "chunk #" in search.stdout
     with sqlite3.connect(index_path) as conn:
-        source_uuid = str(conn.execute("SELECT source_uuid FROM sources").fetchone()[0])
-    assert f"open: mm open --source-uuid {source_uuid} --external-id meeting-1" in search.stdout
+        source_uuid = str(conn.execute("SELECT source_uuid FROM index_meta").fetchone()[0])
+    assert f"open: mm open {source_uuid}/meeting-1" in search.stdout
 
     doctor = runner.invoke(
         app,
@@ -231,24 +243,19 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
     assert doctor.exit_code == 0
     assert "source readable: yes" in doctor.stdout
     assert "fts5: yes" in doctor.stdout
-    assert "decisions:" in doctor.stdout
-    assert "action items:" in doctor.stdout
+    assert "meetings: 2" in doctor.stdout
+    assert "chunks: 6" in doctor.stdout
 
+    target = tmp_path / "Dobrynya Follow-up"
+    target.mkdir()
+    opener_env, opener_calls = platform_opener
     opened = runner.invoke(
         app,
-        [
-            "--index",
-            str(index_path),
-            "open",
-            "--source-uuid",
-            source_uuid,
-            "--external-id",
-            "meeting-2",
-            "--print-path",
-        ],
+        ["--index", str(index_path), "open", f"{source_uuid}/meeting-2"],
+        env=opener_env,
     )
     assert opened.exit_code == 0
-    assert opened.stdout.strip() == str(tmp_path / "Dobrynya Follow-up")
+    assert opener_calls.read_text(encoding="utf-8").strip() == str(target)
 
 
 def test_cli_search_can_include_neighboring_context(meetily_db: Path, tmp_path: Path) -> None:
@@ -272,8 +279,8 @@ def test_cli_search_can_include_neighboring_context(meetily_db: Path, tmp_path: 
     assert "Open question: who owns partner review?" in search.stdout
     assert "context" in search.stdout
     with sqlite3.connect(index_path) as conn:
-        source_uuid = str(conn.execute("SELECT source_uuid FROM sources").fetchone()[0])
-    assert f"open: mm open --source-uuid {source_uuid} --external-id meeting-1" in search.stdout
+        source_uuid = str(conn.execute("SELECT source_uuid FROM index_meta").fetchone()[0])
+    assert f"open: mm open {source_uuid}/meeting-1" in search.stdout
 
 
 def test_cli_search_filters_text_and_json_results_by_inclusive_dates(
@@ -346,9 +353,15 @@ def test_cli_search_rejects_invalid_filters_before_opening_database(tmp_path: Pa
     assert not missing_index.exists()
 
 
-def test_cli_open_selects_meeting_folder_by_default(meetily_db: Path, tmp_path: Path) -> None:
+def test_cli_open_resolves_one_canonical_ref_to_the_source_native_folder(
+    meetily_db: Path,
+    tmp_path: Path,
+    platform_opener: tuple[dict[str, str], Path],
+) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
+    target = tmp_path / "Launch Planning"
+    target.mkdir()
 
     scan = runner.invoke(
         app,
@@ -358,25 +371,42 @@ def test_cli_open_selects_meeting_folder_by_default(meetily_db: Path, tmp_path: 
 
     meeting = IndexRepository.open_existing(index_path).get_meeting_by_local_id(1)
     assert meeting is not None
-    open_args = [
-        "--source-uuid",
-        str(meeting["source_uuid"]),
-        "--external-id",
-        str(meeting["external_id"]),
-    ]
-    default_path = runner.invoke(
+    meeting_ref = f"{meeting['source_uuid']}/{meeting['external_id']}"
+    opener_env, opener_calls = platform_opener
+    opened = runner.invoke(
         app,
-        ["--index", str(index_path), "open", *open_args, "--print-path"],
+        ["--index", str(index_path), "open", meeting_ref],
+        env=opener_env,
     )
-    assert default_path.exit_code == 0
-    assert default_path.stdout.strip() == str(tmp_path / "Launch Planning")
 
-    source_path = runner.invoke(
+    assert opened.exit_code == 0, opened.output
+    assert opener_calls.read_text(encoding="utf-8").strip() == str(target)
+
+
+def test_cli_open_reports_invalid_and_missing_canonical_refs(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    runner = CliRunner()
+
+    invalid = runner.invoke(app, ["--index", str(index_path), "open", "meeting-1"])
+    assert invalid.exit_code == 2
+    assert "Expected SOURCE_UUID/EXTERNAL_ID" in invalid.output
+    assert not index_path.exists()
+
+    scan = runner.invoke(
         app,
-        ["--index", str(index_path), "open", *open_args, "--source", "--print-path"],
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
-    assert source_path.exit_code == 0
-    assert source_path.stdout.strip() == str(meetily_db)
+    assert scan.exit_code == 0
+    meeting = IndexRepository.open_existing(index_path).get_meeting_by_local_id(1)
+    assert meeting is not None
+    missing_ref = f"{meeting['source_uuid']}/missing"
+
+    missing = runner.invoke(app, ["--index", str(index_path), "open", missing_ref])
+    assert missing.exit_code == 2
+    assert f"Meeting not found: {missing_ref}" in missing.output
 
 
 def test_cli_refresh_skips_unproven_structured_analysis(meetily_db: Path, tmp_path: Path) -> None:
@@ -385,7 +415,7 @@ def test_cli_refresh_skips_unproven_structured_analysis(meetily_db: Path, tmp_pa
 
     scan = runner.invoke(
         app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db), "--no-analyze"],
+        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
     assert scan.exit_code == 0
 
@@ -394,7 +424,9 @@ def test_cli_refresh_skips_unproven_structured_analysis(meetily_db: Path, tmp_pa
         ["--index", str(index_path), "refresh", "--source", str(meetily_db), "--json"],
     )
     assert refresh.exit_code == 0
-    assert loads_json(refresh.stdout)["meetings_analyzed"] == 0
+    payload = loads_json(refresh.stdout)
+    assert payload["meetings_seen"] == 2
+    assert "meetings_analyzed" not in payload
 
 
 def test_cli_doctor_reports_meetily_schema_status(tmp_path: Path) -> None:
@@ -459,23 +491,22 @@ def test_cli_db_status_reports_missing_schema_without_creating_databases(
     assert status.exit_code == 0
     assert f"index path: {index_path}" in status.stdout
     assert "schema version: missing" in status.stdout
-    assert f"current schema version: {CURRENT_SCHEMA_VERSION}" in status.stdout
+    assert f"current schema version: {INDEX_SCHEMA_USER_VERSION}" in status.stdout
     assert "schema status: missing" in status.stdout
     assert "orphaned tag assignments: unavailable" in status.stdout
-    assert "user-state database status is missing" in status.stdout
+    assert "state database status is missing" in status.stdout
     assert not index_path.exists()
     assert not index_path.with_name("state.sqlite").exists()
 
 
-def test_cli_db_status_reports_orphaned_tag_assignments(tmp_path: Path) -> None:
+def test_cli_db_status_reports_orphaned_tag_assignments(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
     index_path = tmp_path / "index.sqlite"
-    repo = IndexRepository(index_path)
-    source_uuid = repo.user_state.get_or_create_source(
-        "meetily_sqlite",
-        "/missing.sqlite",
-        now="1",
-    )
-    TagRepository(repo.state_path).assign(
+    published = publish_fresh_index(index_path, meetily_db)
+    source_uuid = published.source.source_uuid
+    TagRepository(index_path.with_name("state.sqlite")).assign(
         source_uuid,
         ("missing-meeting",),
         ("Сбер", "Собес"),
@@ -532,10 +563,9 @@ def test_cli_removed_public_commands_are_not_available() -> None:
 def test_cli_init_status_and_obsidian_sync(
     meetily_db: Path,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    index_path = tmp_path / "index.sqlite"
     data_dir = tmp_path / "data"
+    index_path = data_dir / "index.sqlite"
     vault_dir = tmp_path / "vault"
     env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
     runner = CliRunner()
@@ -547,7 +577,7 @@ def test_cli_init_status_and_obsidian_sync(
     )
     assert init.exit_code == 0
     assert "initialized: yes" in init.stdout
-    assert "meetings seen: 2" in init.stdout
+    assert "meetings: 2" in init.stdout
 
     status = runner.invoke(app, ["--index", str(index_path), "status"], env=env)
     assert status.exit_code == 0
@@ -564,28 +594,23 @@ def test_cli_init_status_and_obsidian_sync(
             str(vault_dir),
             "--folder",
             "Meetily Memory",
-            "--sync-after-refresh",
         ],
         env=env,
     )
     assert obsidian_init.exit_code == 0
     assert "obsidian vault:" in obsidian_init.stdout
+    obsidian_status = runner.invoke(
+        app,
+        ["obsidian", "status", "--json"],
+        env=env,
+    )
+    assert obsidian_status.exit_code == 0
+    assert loads_json(obsidian_status.stdout) == {
+        "vault_path": str(vault_dir),
+        "folder": "Meetily Memory",
+        "last_sync_at": None,
+    }
 
-    original_sync = obsidian_commands.sync_obsidian_vault
-    lock_checked = False
-
-    def sync_while_lock_is_held(
-        index: Path,
-        vault: Path,
-        folder: str,
-    ) -> ObsidianSyncResult:
-        nonlocal lock_checked
-        with pytest.raises(RefreshLockBusyError), RefreshLock(index_path):
-            pass
-        lock_checked = True
-        return original_sync(index, vault, folder)
-
-    monkeypatch.setattr(obsidian_commands, "sync_obsidian_vault", sync_while_lock_is_held)
     obsidian_sync = runner.invoke(
         app,
         [
@@ -597,15 +622,17 @@ def test_cli_init_status_and_obsidian_sync(
         env=env,
     )
     assert obsidian_sync.exit_code == 0
-    assert lock_checked
     assert "obsidian files synced:" in obsidian_sync.stdout
     meeting_note = next(
         (vault_dir / "Meetily Memory" / "Meetings").glob("Dobrynya Follow-up--m-*.md")
     )
-    assert "<!-- meetily-memory:managed:v1:" in meeting_note.read_text(encoding="utf-8")
+    assert "<!-- meetily-memory:managed:v2:" in meeting_note.read_text(encoding="utf-8")
 
 
-def test_cli_obsidian_uses_workspace_settings_scope(meetily_db: Path, tmp_path: Path) -> None:
+def test_cli_obsidian_uses_workspace_settings_scope_and_manual_sync(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     index_path = workspace / "index.sqlite"
     workspace_settings = workspace / "settings.json"
@@ -642,7 +669,6 @@ def test_cli_obsidian_uses_workspace_settings_scope(meetily_db: Path, tmp_path: 
             "init",
             "--vault",
             str(workspace_vault),
-            "--sync-after-refresh",
         ],
     )
     assert configured.exit_code == 0
@@ -666,15 +692,22 @@ def test_cli_obsidian_uses_workspace_settings_scope(meetily_db: Path, tmp_path: 
     meeting_note.unlink()
     refresh = runner.invoke(
         app,
-        ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
+        ["--index", str(index_path), "refresh", "--source", str(meetily_db), "--json"],
     )
     assert refresh.exit_code == 0
-    assert "obsidian sync: yes" in refresh.stdout
+    assert "obsidian_synced" not in loads_json(refresh.stdout)
+    assert not meeting_note.exists()
 
     workspace_config = load_app_settings(workspace_settings)
     global_config = load_app_settings(global_settings)
     assert workspace_config.obsidian.vault_path == str(workspace_vault)
     assert workspace_config.obsidian.last_sync_at is not None
     assert global_config.obsidian == ObsidianSettings(vault_path=str(global_vault))
-    assert meeting_note.exists()
     assert not global_vault.exists()
+
+    manual_resync = runner.invoke(
+        app,
+        ["--index", str(index_path), "obsidian", "sync"],
+    )
+    assert manual_resync.exit_code == 0
+    assert meeting_note.exists()

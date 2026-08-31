@@ -1,6 +1,3 @@
-import sqlite3
-import subprocess
-import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -20,17 +17,14 @@ from meetily_memory.evaluation import (
     evaluate_retrieval,
     load_dataset,
 )
-from meetily_memory.json_codec import loads_json
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.retrieval import (
     LexicalRetrievalStrategy,
     LexicalTagMeetingRetrievalStrategy,
     TagRetrievalStrategy,
 )
-from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
-from meetily_memory.semantic_search import LocalHashEmbeddingProvider, index_semantic_embeddings
 from meetily_memory.tagging import TagRepository, TagService
-from tests.semantic_helpers import requires_sqlite_vec
+from tests.index_helpers import publish_fresh_index
 
 
 @dataclass(frozen=True)
@@ -127,7 +121,7 @@ def test_v2_dataset_accepts_tag_only_and_semantic_classes(tmp_path: Path) -> Non
 
 def test_evaluation_calculates_ranked_and_product_metrics(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db)
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
     dataset = replace(
         dataset,
@@ -156,7 +150,7 @@ def test_evaluation_supports_tag_only_meeting_results_and_fingerprints_tag_state
     tmp_path: Path,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db)
     repository = IndexRepository(index_path)
     dataset = EvaluationDataset(
         schema_version="meetily-memory.eval.v2",
@@ -204,7 +198,7 @@ def test_evaluation_records_explicit_neighbor_context_parameter(
     meetily_db: Path, tmp_path: Path
 ) -> None:
     index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db)
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
 
     report = evaluate_retrieval(dataset, index_path, limit=5, context=1)
@@ -212,9 +206,9 @@ def test_evaluation_records_explicit_neighbor_context_parameter(
     assert report.manifest.retrieval_parameters == {"limit": 5, "context": 1}
 
 
-def test_evaluation_records_explicit_hybrid_strategy(meetily_db: Path, tmp_path: Path) -> None:
+def test_evaluation_records_explicit_custom_strategy(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db)
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
     hit = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
 
@@ -224,33 +218,13 @@ def test_evaluation_records_explicit_hybrid_strategy(meetily_db: Path, tmp_path:
         limit=5,
         config=EvaluationRetrievalConfig(
             strategy=FixedEvaluationStrategy((hit,)),
-            mode="hybrid_rrf",
+            mode="custom_rrf",
             parameters={"rrf_k": 60},
-            semantic_provider="ollama",
-            semantic_model="nomic-embed-text",
-            semantic_dimension=768,
-            semantic_model_digest="sha256:model",
-            semantic_query_instruction="search_query: {text}",
-            semantic_document_instruction="search_document: {text}",
-            semantic_index_fingerprint="sha256:index",
-            chunk_fingerprint="sha256:chunks",
-            semantic_refresh_ms=1234.5,
-            semantic_index_size_bytes=4096,
         ),
     )
 
-    assert report.manifest.retrieval_mode == "hybrid_rrf"
+    assert report.manifest.retrieval_mode == "custom_rrf"
     assert report.manifest.retrieval_parameters == {"limit": 5, "context": 0, "rrf_k": 60}
-    assert report.manifest.semantic_provider == "ollama"
-    assert report.manifest.semantic_model == "nomic-embed-text"
-    assert report.manifest.semantic_dimension == 768
-    assert report.manifest.semantic_model_digest == "sha256:model"
-    assert report.manifest.semantic_query_instruction == "search_query: {text}"
-    assert report.manifest.semantic_document_instruction == "search_document: {text}"
-    assert report.manifest.semantic_index_fingerprint == "sha256:index"
-    assert report.manifest.chunk_fingerprint == "sha256:chunks"
-    assert report.manifest.semantic_refresh_ms == 1234.5
-    assert report.manifest.semantic_index_size_bytes == 4096
 
 
 def test_evaluation_records_cold_start_before_warm_latency_measurements(
@@ -258,7 +232,7 @@ def test_evaluation_records_cold_start_before_warm_latency_measurements(
     tmp_path: Path,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db)
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
     hit = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
 
@@ -275,193 +249,6 @@ def test_evaluation_records_cold_start_before_warm_latency_measurements(
     assert report.cold_start_latency_ms is not None
     assert report.cold_start_latency_ms >= 0
     assert report.manifest.retrieval_parameters["warmed_up"] is True
-
-
-def test_hybrid_evaluation_scripts_do_not_create_missing_index_or_state(tmp_path: Path) -> None:
-    dataset = "tests/fixtures/evaluation/synthetic_dataset.json"
-    retrieval_index = tmp_path / "missing-retrieval" / "index.sqlite"
-    retrieval_output = tmp_path / "retrieval.json"
-    retrieval = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "scripts/evaluate-retrieval.py",
-            dataset,
-            "--index",
-            str(retrieval_index),
-            "--output",
-            str(retrieval_output),
-            "--retrieval",
-            "hybrid",
-            "--embedding-provider",
-            "hash",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    semantic_index = tmp_path / "missing-semantic" / "index.sqlite"
-    semantic_output = tmp_path / "semantic-output"
-    semantic = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "scripts/evaluate-semantic-search.py",
-            dataset,
-            "--index",
-            str(semantic_index),
-            "--output-dir",
-            str(semantic_output),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert retrieval.returncode != 0
-    assert "index not found" in retrieval.stderr
-    assert semantic.returncode != 0
-    assert "index not found" in semantic.stderr
-    assert not retrieval_index.parent.exists()
-    assert not semantic_index.parent.exists()
-    assert not retrieval_output.exists()
-    assert not semantic_output.exists()
-
-
-def test_hybrid_evaluation_scripts_report_authoritative_state_recovery(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    dataset = "tests/fixtures/evaluation/synthetic_dataset.json"
-    index_path = tmp_path / "current" / "index.sqlite"
-    state_path = index_path.with_name("state.sqlite")
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    state_path.unlink()
-    before = (index_path.read_bytes(), index_path.stat().st_mtime_ns)
-    retrieval_output = tmp_path / "retrieval.json"
-    semantic_output = tmp_path / "semantic-output"
-    commands = (
-        [
-            sys.executable,
-            "scripts/evaluate-retrieval.py",
-            dataset,
-            "--index",
-            str(index_path),
-            "--output",
-            str(retrieval_output),
-            "--retrieval",
-            "hybrid",
-            "--embedding-provider",
-            "hash",
-        ],
-        [
-            sys.executable,
-            "scripts/evaluate-semantic-search.py",
-            dataset,
-            "--index",
-            str(index_path),
-            "--output-dir",
-            str(semantic_output),
-        ],
-    )
-
-    for command in commands:
-        result = subprocess.run(  # noqa: S603
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode != 0
-        assert "Restore the authoritative `state.sqlite`" in result.stderr
-        assert "`mm refresh` alone cannot recover" in result.stderr
-        assert "Manual tags, task statuses, and task notes cannot be recovered" in result.stderr
-
-    assert not state_path.exists()
-    assert (index_path.read_bytes(), index_path.stat().st_mtime_ns) == before
-    assert not retrieval_output.exists()
-    assert not semantic_output.exists()
-
-
-@requires_sqlite_vec
-def test_evaluation_script_runs_explicit_hybrid_mode(meetily_db: Path, tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    output_path = tmp_path / "hybrid.json"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
-    index_semantic_embeddings(
-        index_path,
-        embedding_provider=LocalHashEmbeddingProvider(),
-    )
-
-    result = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "scripts/evaluate-retrieval.py",
-            "tests/fixtures/evaluation/synthetic_dataset.json",
-            "--index",
-            str(index_path),
-            "--output",
-            str(output_path),
-            "--retrieval",
-            "hybrid",
-            "--embedding-provider",
-            "hash",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    report = loads_json(output_path.read_text())
-    assert report["manifest"]["retrieval_mode"] == "hybrid_rrf"
-    assert report["manifest"]["semantic_provider"] == "hash"
-    assert report["manifest"]["semantic_model"] == "local-hash-v1"
-    assert report["manifest"]["retrieval_parameters"]["warmed_up"] is True
-    assert report["cold_start_latency_ms"] >= 0
-
-
-@requires_sqlite_vec
-def test_evaluation_script_rejects_incomplete_hybrid_index(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    output_path = tmp_path / "hybrid.json"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
-    index_semantic_embeddings(
-        index_path,
-        embedding_provider=LocalHashEmbeddingProvider(),
-    )
-    with sqlite3.connect(index_path) as conn:
-        conn.execute(
-            """
-            DELETE FROM chunk_embeddings
-            WHERE chunk_id = (SELECT MIN(chunk_id) FROM chunk_embeddings)
-            """
-        )
-        conn.commit()
-
-    result = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "scripts/evaluate-retrieval.py",
-            "tests/fixtures/evaluation/synthetic_dataset.json",
-            "--index",
-            str(index_path),
-            "--output",
-            str(output_path),
-            "--retrieval",
-            "hybrid",
-            "--embedding-provider",
-            "hash",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 2
-    assert "semantic index is incomplete" in result.stderr
-    assert not output_path.exists()
 
 
 def test_report_comparison_is_paired_by_task_and_class() -> None:
@@ -611,14 +398,12 @@ def test_evaluation_uses_external_evidence_identity_after_index_rebuild(
     meetily_db: Path, tmp_path: Path
 ) -> None:
     index_path = tmp_path / "index.sqlite"
-    scanner = MeetilySQLiteScanner(index_path)
-    scanner.scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db)
     dataset = load_dataset(Path("tests/fixtures/evaluation/synthetic_dataset.json"))
     first = evaluate_retrieval(dataset, index_path, limit=5)
 
     index_path.unlink()
-    scanner = MeetilySQLiteScanner(index_path)
-    scanner.scan(meetily_db)
+    publish_fresh_index(index_path, meetily_db)
     second = evaluate_retrieval(dataset, index_path, limit=5)
 
     assert first.tasks[0].retrieved[0].evidence_ids[0] == "meeting-1/transcript-1"

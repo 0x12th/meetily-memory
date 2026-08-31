@@ -7,8 +7,8 @@ from meetily_memory.cli.common import (
     print_text_block,
     read_repository_from_context,
 )
-from meetily_memory.db.repository import IndexRepository
 from meetily_memory.domain import MeetingRef
+from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.tagging import TagMutationResult, TagService
 
 tag_app = make_typer("Manage meeting tags.")
