@@ -32,21 +32,11 @@ Search meeting history:
 mm s "migration risk"
 ```
 
-Each result includes the meeting, matching source excerpt, and command for
-opening the original:
-
-```text
-#10 Meeting 2026-07-06
-open: mm open --source-uuid 8fd43c7b-4e82-4e91-aab1-6bd92131bc20 --external-id meeting-10
-
-12:56:36 | chunk #3863
-If I write to the database, I must also publish to Kafka...
-```
-
-Open the meeting:
+Each result includes the meeting, a matching source excerpt, and a stable command for opening the
+original. Use the generated `MeetingRef` command rather than an index-local numeric identifier:
 
 ```bash
-mm open --source-uuid 8fd43c7b-4e82-4e91-aab1-6bd92131bc20 --external-id meeting-10
+mm open --source-uuid 8fd43c7b-4e82-4e91-aab1-6bd92131bc20 --external-id EXTERNAL_ID
 ```
 
 If Meetily cannot be discovered automatically:
@@ -84,12 +74,6 @@ Refresh the local index after new meetings:
 mm refresh
 ```
 
-Automatic refresh is optional:
-
-```bash
-mm autosync start
-mm autosync status
-```
 
 Update the installed CLI:
 
@@ -104,7 +88,9 @@ belong to a project or topic that is not named consistently in their
 transcripts:
 
 ```bash
-mm tag add 10 11 migration
+mm tag add migration \
+  --source-uuid 8fd43c7b-4e82-4e91-aab1-6bd92131bc20 \
+  --external-id EXTERNAL_ID
 mm s "migration"
 ```
 
@@ -120,11 +106,9 @@ removing tags.
 
 ## Advanced Commands
 
-Context, topics, Obsidian, MCP, database diagnostics, and source-rebinding
-commands remain available but are not part of the main workflow. Semantic
-retrieval is isolated to offline evaluation tooling, and the duplicate local
-LLM answer path has been removed. See [docs/commands.md](docs/commands.md) and
-[docs/integrations.md](docs/integrations.md).
+Obsidian, database diagnostics, and source-rebinding commands remain available as hidden advanced
+commands outside the main workflow. Semantic retrieval is isolated to offline evaluation tooling.
+See [docs/commands.md](docs/commands.md) and [docs/integrations.md](docs/integrations.md).
 
 ## Development
 

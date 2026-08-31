@@ -49,10 +49,10 @@ def update_setting_in_process(
                 settings_path=settings_path,
                 ui_language=str(value),
             )
-        elif key == "autosync_enabled":
+        elif key == "source_uuid":
             settings_module.update_app_settings(
                 settings_path=settings_path,
-                autosync_enabled=bool(value),
+                source_uuid=str(value),
             )
         else:
             message = f"Unsupported concurrent settings key: {key}"
@@ -122,7 +122,7 @@ def test_save_and_update_preserve_unknown_keys(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    update_app_settings(settings_path=settings_path, autosync_enabled=True)
+    update_app_settings(settings_path=settings_path, ui_language="en")
     updated_payload = loads_json(settings_path.read_bytes())
 
     assert updated_payload["future_top_level"] == {"enabled": True}
@@ -169,7 +169,7 @@ def test_concurrent_updates_merge_under_one_interprocess_lock(tmp_path: Path) ->
         ),
         context.Process(
             target=update_setting_in_process,
-            args=(settings_path, "autosync_enabled", True, start, stale_reads),
+            args=(settings_path, "source_uuid", "source-uuid", start, stale_reads),
         ),
     ]
 
@@ -186,7 +186,7 @@ def test_concurrent_updates_merge_under_one_interprocess_lock(tmp_path: Path) ->
     assert [process.exitcode for process in processes] == [0, 0]
     settings = load_app_settings(settings_path)
     assert settings.ui_language == "ru"
-    assert settings.autosync_enabled is True
+    assert settings.source_uuid == "source-uuid"
 
 
 def test_stale_obsidian_sync_does_not_mark_reconfigured_vault_as_synced(tmp_path: Path) -> None:
@@ -330,14 +330,14 @@ def test_default_and_workspace_settings_remain_isolated(
     monkeypatch.setenv("MEETILY_MEMORY_DATA_DIR", str(global_dir))
 
     update_app_settings(ui_language="ru")
-    update_app_settings(settings_path=workspace_settings_path, autosync_enabled=True)
+    update_app_settings(settings_path=workspace_settings_path, source_uuid="source-uuid")
 
     global_settings = load_app_settings(global_settings_path)
     workspace_settings = load_app_settings(workspace_settings_path)
     assert global_settings.ui_language == "ru"
-    assert global_settings.autosync_enabled is False
+    assert global_settings.source_uuid is None
     assert workspace_settings.ui_language is None
-    assert workspace_settings.autosync_enabled is True
+    assert workspace_settings.source_uuid == "source-uuid"
 
 
 def test_save_fsyncs_file_and_parent_directory(

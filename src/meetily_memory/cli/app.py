@@ -4,10 +4,9 @@ from typing import Annotated
 
 import typer
 
-from meetily_memory.cli.autosync_commands import autosync_app
 from meetily_memory.cli.common import index_option, make_typer, version_callback
 from meetily_memory.cli.lifecycle_commands import app as lifecycle_app
-from meetily_memory.cli.lifecycle_commands import config_app, db_app, mcp_app
+from meetily_memory.cli.lifecycle_commands import config_app, db_app
 from meetily_memory.cli.obsidian_commands import obsidian_app
 from meetily_memory.cli.search_commands import app as search_app
 from meetily_memory.cli.tag_commands import tag_app
@@ -18,17 +17,16 @@ app = make_typer(
     "\b\n"
     "Main workflow:\n"
     "  mm s QUERY       Find meetings and source excerpts.\n"
-    "  mm open ID       Open the original meeting.\n"
+    "  mm open --source-uuid UUID --external-id ID\n"
+    "                     Open the original meeting.\n"
     "  mm tag ...       Mark related meetings."
 )
 app.add_typer(lifecycle_app)
 app.add_typer(search_app)
 app.add_typer(tag_app, name="tag")
 app.add_typer(obsidian_app, name="obsidian", hidden=True)
-app.add_typer(autosync_app, name="autosync")
 app.add_typer(config_app, name="config", hidden=True)
 app.add_typer(db_app, name="db", hidden=True)
-app.add_typer(mcp_app, name="mcp", hidden=True)
 
 
 @app.callback()

@@ -176,7 +176,6 @@ def fake_binary_source(version: str, mode: str) -> str:
             "initialized": True,
             "index_path": str(index_path),
             "source_path": source_path,
-            "autosync_enabled": False,
             "source_uuid": "synthetic-source-uuid",
             "meetings_seen": 1,
             "meetings_inserted": 1,

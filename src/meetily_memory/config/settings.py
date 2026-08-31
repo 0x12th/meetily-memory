@@ -40,7 +40,6 @@ class AppSettings:
     source_path: str | None = None
     source_uuid: str | None = None
     ui_language: str | None = None
-    autosync_enabled: bool = False
     last_update_at: str | None = None
     obsidian: ObsidianSettings = ObsidianSettings()
     semantic: SemanticSettings = SemanticSettings()
@@ -49,7 +48,6 @@ class AppSettings:
         payload = {
             "source_uuid": self.source_uuid,
             "ui_language": self.ui_language,
-            "autosync_enabled": self.autosync_enabled,
             "last_update_at": self.last_update_at,
             "obsidian": {
                 "vault_path": self.obsidian.vault_path,
@@ -97,11 +95,6 @@ def update_app_settings(
             source_uuid=string_change(changes, "source_uuid", settings.source_uuid),
             ui_language=normalize_ui_language(
                 string_change(changes, "ui_language", settings.ui_language)
-            ),
-            autosync_enabled=bool_change(
-                changes,
-                "autosync_enabled",
-                current=settings.autosync_enabled,
             ),
             last_update_at=string_change(changes, "last_update_at", settings.last_update_at),
             obsidian=obsidian_change(
@@ -153,7 +146,6 @@ def _app_settings_from_payload(payload: dict[str, Any]) -> AppSettings:
         source_path=optional_str(payload.get("source_path")),
         source_uuid=optional_str(payload.get("source_uuid")),
         ui_language=normalize_ui_language(optional_str(payload.get("ui_language"))),
-        autosync_enabled=bool(payload.get("autosync_enabled", False)),
         last_update_at=optional_str(payload.get("last_update_at")),
         obsidian=obsidian,
         semantic=semantic,
@@ -184,6 +176,7 @@ def _merge_settings_payload(
             merged_payload[key] = value
     if "source_path" not in settings_payload:
         merged_payload.pop("source_path", None)
+    merged_payload.pop("autosync_enabled", None)
     return merged_payload
 
 
@@ -271,11 +264,6 @@ def string_change(changes: dict[str, object], key: str, current: str | None) -> 
     if isinstance(value, Path):
         return str(value)
     return optional_str(value)
-
-
-def bool_change(changes: dict[str, object], key: str, *, current: bool) -> bool:
-    value = changes.get(key, current)
-    return bool(value)
 
 
 def optional_str(value: object) -> str | None:

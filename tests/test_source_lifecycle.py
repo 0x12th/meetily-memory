@@ -108,7 +108,7 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
 
     init = runner.invoke(
         app,
-        ["--index", str(index_path), "init", "--source", str(meetily_db), "--no-autosync"],
+        ["--index", str(index_path), "init", "--source", str(meetily_db)],
         env=env,
     )
     assert init.exit_code == 0
@@ -119,7 +119,7 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     evidence_id = before_result.evidence[0].id
     task = before.structured_entities("action_items").entities[0]
     before.set_task_status(task.id, "done", note="survives move")
-    TagService(IndexRepository(index_path)).assign(("1",), ("Сбер",))
+    TagService(IndexRepository(index_path)).assign((meeting_ref,), ("Сбер",))
     original_uuid = loads_json((data_dir / "settings.json").read_text())["source_uuid"]
 
     rebind = runner.invoke(
@@ -149,7 +149,8 @@ def test_explicit_rebind_preserves_identity_evidence_and_task_state(
     assert matching_tasks[0].status == "done"
     assert matching_tasks[0].status_note == "survives move"
     assert [
-        tag.display_name for tag in TagService(IndexRepository(index_path)).list_for_meeting("1")
+        tag.display_name
+        for tag in TagService(IndexRepository(index_path)).list_for_meeting(meeting_ref)
     ] == ["Сбер"]
     with sqlite3.connect(index_path) as conn:
         sources = conn.execute("SELECT path FROM sources").fetchall()
@@ -167,7 +168,7 @@ def test_source_selection_without_rebind_uses_a_distinct_uuid(
     env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
     runner.invoke(
         app,
-        ["--index", str(index_path), "init", "--source", str(meetily_db), "--no-autosync"],
+        ["--index", str(index_path), "init", "--source", str(meetily_db)],
         env=env,
     )
     old_uuid = loads_json((data_dir / "settings.json").read_text())["source_uuid"]
@@ -201,7 +202,7 @@ def test_explicit_rebind_allows_zero_overlap_without_creating_a_new_source(
     env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
     runner.invoke(
         app,
-        ["--index", str(index_path), "init", "--source", str(meetily_db), "--no-autosync"],
+        ["--index", str(index_path), "init", "--source", str(meetily_db)],
         env=env,
     )
     original_uuid = loads_json((data_dir / "settings.json").read_text())["source_uuid"]
@@ -243,7 +244,7 @@ def test_rebind_accepts_a_partial_copy_with_one_matching_meeting(
     env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
     runner.invoke(
         app,
-        ["--index", str(index_path), "init", "--source", str(meetily_db), "--no-autosync"],
+        ["--index", str(index_path), "init", "--source", str(meetily_db)],
         env=env,
     )
 
@@ -270,18 +271,7 @@ def test_refresh_lock_blocks_a_second_writer_and_is_released_on_process_exit(
     assert ready.wait(timeout=10)
 
     runner = CliRunner()
-    autosync = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "refresh",
-            "--source",
-            str(meetily_db),
-            "--autosync-run",
-        ],
-        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
-    )
+
     blocked = runner.invoke(
         app,
         ["--index", str(index_path), "refresh", "--source", str(meetily_db)],
@@ -307,9 +297,6 @@ def test_refresh_lock_blocks_a_second_writer_and_is_released_on_process_exit(
         env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
     )
 
-    assert autosync.exit_code == 0
-    assert "autosync skipped" in autosync.output.lower()
-    assert f"pid {process.pid}" in autosync.output.lower()
     assert blocked.exit_code != 0
     assert "refresh is already running" in blocked.output.lower()
     assert f"pid {process.pid}" in blocked.output.lower()
@@ -473,8 +460,10 @@ def test_successful_scan_reconciles_deleted_meeting_and_restores_its_tag(
     deleted_meeting = repo.get_meeting("meeting-2")
     assert deleted_meeting is not None
     deleted_meeting_id = int(deleted_meeting["id"])
+    deleted_meeting_ref = repo.meeting_ref_for_external_id("meeting-2")
+    assert deleted_meeting_ref is not None
     tag_service = TagService(repo)
-    tag_service.assign((str(deleted_meeting_id),), ("Сбер",))
+    tag_service.assign((deleted_meeting_ref,), ("Сбер",))
     with sqlite3.connect(index_path) as conn:
         deleted_chunk_ids = {
             int(row[0])
@@ -534,7 +523,7 @@ def test_successful_scan_reconciles_deleted_meeting_and_restores_its_tag(
 
     restored = repo.get_meeting("meeting-2")
     assert restored is not None
-    assert [tag.display_name for tag in tag_service.list_for_meeting(str(restored["id"]))] == [
+    assert [tag.display_name for tag in tag_service.list_for_meeting(deleted_meeting_ref)] == [
         "Сбер"
     ]
     assert tag_service.orphaned_assignment_count() == 0

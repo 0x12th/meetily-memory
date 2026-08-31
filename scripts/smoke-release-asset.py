@@ -264,7 +264,6 @@ def validate_init(payload: object, fixture: Path) -> str:
     payload = json_object(payload, "mm init JSON must be an object.")
     require(payload.get("initialized") is True, "mm init did not report initialized=true.")
     require(payload.get("source_path") == str(fixture), "mm init reported the wrong source path.")
-    require(payload.get("autosync_enabled") is False, "mm init unexpectedly enabled autosync.")
     require(payload.get("meetings_seen") == 1, "mm init did not scan exactly one meeting.")
     require(payload.get("meetings_inserted") == 1, "mm init did not insert exactly one meeting.")
     require(payload.get("chunks_seen") == 1, "mm init did not scan exactly one source chunk.")
@@ -438,7 +437,7 @@ def run_smoke(archive: Path, expected_tag: str, result: dict[str, Any]) -> None:
 
         init_result = run_command(
             binary,
-            ["init", "--source", str(fixture), "--no-autosync", "--json"],
+            ["init", "--source", str(fixture), "--json"],
             cwd=work_dir,
             environment=environment,
         )

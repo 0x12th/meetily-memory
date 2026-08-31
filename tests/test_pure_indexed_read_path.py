@@ -28,7 +28,6 @@ from meetily_memory.evaluation import (
     corpus_fingerprint,
     load_dataset,
 )
-from meetily_memory.mcp_server import create_mcp_server
 from meetily_memory.meeting_structure import ENTITY_KINDS
 from meetily_memory.repositories.index import (
     EvidenceResolutionError,
@@ -108,8 +107,7 @@ def database_snapshot(
     )
 
 
-@pytest.mark.anyio
-async def test_core_cli_and_mcp_reads_leave_index_state_and_source_unchanged(
+def test_core_and_cli_reads_leave_index_state_and_source_unchanged(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
@@ -124,29 +122,28 @@ async def test_core_cli_and_mcp_reads_leave_index_state_and_source_unchanged(
 
     core = MeetilyMemoryCore(index_path, state_path=state_path)
     search = core.search("migration risks", limit=5, context=1)
-    evidence_id = search.results[0].evidence[0].id
-    assert core.resolve_search_hit(evidence_id).id == evidence_id
-    assert core.build_context("migration risks", limit=5, context=1).evidence
+    assert search.results[0].evidence
     assert core.meetings()
     assert core.structured_entities("action_items", limit=100).entities
+    meeting_ref = search.results[0].meeting.ref
 
     runner = CliRunner()
     commands = (
         ("s", "migration risks", "--json"),
-        ("c", "migration risks", "--context", "1"),
         ("tag", "list"),
-        ("open", "1", "--source", "--print-path"),
+        (
+            "open",
+            "--source-uuid",
+            meeting_ref.source_uuid,
+            "--external-id",
+            meeting_ref.external_id,
+            "--source",
+            "--print-path",
+        ),
     )
     for command in commands:
         result = runner.invoke(app, ["--index", str(index_path), *command])
         assert result.exit_code == 0, result.output
-
-    server = create_mcp_server(index_path)
-    _, payload = await server.call_tool(
-        "search_meetings",
-        {"query": "migration risks", "limit": 5},
-    )
-    assert payload is not None
 
     after = (
         database_snapshot(index_path, INDEX_ROW_QUERIES),
@@ -330,7 +327,7 @@ def test_operation_snapshot_validates_pinned_state_and_pins_both_schemas_first(
         pass
 
 
-def test_shared_core_cli_mcp_retrieval_counts_stay_bounded_from_limit_one_to_eight(
+def test_core_retrieval_counts_stay_bounded_from_limit_one_to_eight(
     meetily_db: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -378,7 +375,9 @@ def test_shared_core_cli_mcp_retrieval_counts_stay_bounded_from_limit_one_to_eig
                 "SELECT id FROM meetings WHERE external_id LIKE 'bounded-meeting-%' ORDER BY id"
             )
         )
-    TagService(writer).assign(local_ids, ("boundedretrieval",))
+    refs = tuple(writer.meeting_ref_for_local_id(int(local_id)) for local_id in local_ids)
+    assert all(ref is not None for ref in refs)
+    TagService(writer).assign(tuple(ref for ref in refs if ref is not None), ("boundedretrieval",))
     core = MeetilyMemoryCore(index_path)
     repository = core._repository  # noqa: SLF001
     strategy = core._meeting_retrieval  # noqa: SLF001

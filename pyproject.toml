@@ -17,9 +17,7 @@ dependencies = [
 semantic = [
   "sqlite-vec>=0.1.9,<0.2.0",
 ]
-mcp = [
-  "mcp>=1.27,<2",
-]
+
 
 [project.scripts]
 meetily-memory = "meetily_memory.cli.app:main"
@@ -27,7 +25,6 @@ mm = "meetily_memory.cli.app:main"
 
 [dependency-groups]
 dev = [
-  "mcp>=1.27,<2",
   "pre-commit>=4.0.0",
   "pyinstaller>=6.11.0",
   "pytest>=8.3.0",

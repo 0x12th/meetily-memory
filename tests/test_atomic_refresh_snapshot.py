@@ -32,7 +32,7 @@ from meetily_memory.config.settings import (
 )
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
-from meetily_memory.domain import RetrievalSource
+from meetily_memory.domain import MeetingRef, RetrievalSource
 from meetily_memory.integrations import ObsidianSyncResult
 from meetily_memory.json_codec import loads_json
 from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
@@ -576,13 +576,9 @@ def test_core_search_stays_on_one_snapshot_across_projection_replacement(  # noq
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
-    MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    with _readonly_connection(index_path) as conn:
-        old_local_id = str(
-            conn.execute("SELECT id FROM meetings WHERE external_id = 'meeting-1'").fetchone()[0]
-        )
+    scan = MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     TagService(IndexRepository(index_path, state_path=state_path)).assign(
-        (old_local_id,),
+        (MeetingRef(scan.source_uuid, "meeting-1"),),
         ("pricing decision",),
     )
     old_core = MeetilyMemoryCore(index_path, state_path=state_path)
@@ -1005,7 +1001,6 @@ def test_init_settings_failure_is_sanitized_and_has_exact_retry(
             "init",
             "--source",
             str(meetily_db),
-            "--no-autosync",
         ],
         env=env,
     )
@@ -1028,7 +1023,6 @@ def test_init_settings_failure_is_sanitized_and_has_exact_retry(
         "init",
         "--source",
         str(meetily_db.resolve(strict=True)),
-        "--no-autosync",
     ]
 
     monkeypatch.setattr(lifecycle_module, "update_app_settings", original_update)

@@ -12,6 +12,7 @@ from meetily_memory.cli.common import console, print_meeting_table
 from meetily_memory.diagnostics import SourceDatabaseDiagnostic
 from meetily_memory.json_codec import loads_json
 from meetily_memory.open_commands import stable_meeting_open_command
+from meetily_memory.repositories.index import IndexRepository
 
 TITLE = "[red]literal[/red]"
 TAG = "closing [/oops]"
@@ -47,7 +48,22 @@ def test_search_prints_source_values_literally_and_keeps_json_unchanged(
     )
     assert scan.exit_code == 0, scan.output
 
-    tag = runner.invoke(app, ["--index", str(index_path), "tag", "add", "1", TAG])
+    meeting = IndexRepository.open_existing(index_path).get_meeting_by_local_id(1)
+    assert meeting is not None
+    tag = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "add",
+            TAG,
+            "--source-uuid",
+            str(meeting["source_uuid"]),
+            "--external-id",
+            str(meeting["external_id"]),
+        ],
+    )
     assert tag.exit_code == 0, tag.output
 
     text_result = runner.invoke(app, ["--index", str(index_path), "s", "closing"])

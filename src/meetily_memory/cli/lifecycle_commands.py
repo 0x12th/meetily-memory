@@ -12,7 +12,6 @@ from typing import Annotated
 
 import typer
 
-from meetily_memory.cli.autosync_commands import autosync_runtime_status, enable_autosync
 from meetily_memory.cli.common import (
     console,
     make_typer,
@@ -56,7 +55,6 @@ from meetily_memory.user_state import (
 app = make_typer("Local Meetily history lifecycle commands.")
 config_app = make_typer("Manage CLI settings.")
 db_app = make_typer("Inspect the local index database.")
-mcp_app = make_typer("Run the MCP server.")
 
 
 def utc_now_iso() -> str:
@@ -357,15 +355,8 @@ def init(
         Path | None,
         typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
     ] = None,
-    autosync: Annotated[
-        bool | None,
-        typer.Option("--autosync/--no-autosync", help="Enable automatic index refreshes."),
-    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    should_enable_autosync = autosync
-    if should_enable_autosync is None:
-        should_enable_autosync = typer.confirm("Enable automatic index refreshes?", default=False)
     try:
         with RefreshLock(ctx.obj["index_path"]):
             source_path = configured_source_path(
@@ -382,7 +373,6 @@ def init(
                     settings_path=ctx.obj["settings_path"],
                     source_uuid=source_uuid,
                     source_path=None,
-                    autosync_enabled=False,
                     last_update_at=utc_now_iso(),
                 )
             except Exception:  # noqa: BLE001
@@ -398,7 +388,6 @@ def init(
                         "init",
                         "--source",
                         str(source_path),
-                        "--no-autosync",
                     ),
                 )
                 repo.record_post_publish_failure(result.run_id, (issue,))
@@ -406,21 +395,11 @@ def init(
             repo.resolve_post_publish_failures(source_uuid, ("settings_update",))
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if should_enable_autosync:
-        try:
-            enable_autosync(
-                ctx.obj["index_path"],
-                ctx.obj["settings_path"],
-                interval_minutes=30,
-            )
-        except RuntimeError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        settings = load_app_settings(ctx.obj["settings_path"])
+
     response = {
         "initialized": True,
         "index_path": str(ctx.obj["index_path"]),
         "source_path": str(source_path),
-        "autosync_enabled": settings.autosync_enabled,
         **payload,
     }
     if json_output:
@@ -429,7 +408,6 @@ def init(
     print_text_block("initialized: yes")
     print_text_block(f"index path: {ctx.obj['index_path']}")
     print_text_block(f"source path: {source_path}")
-    print_text_block(f"autosync: {'enabled' if settings.autosync_enabled else 'disabled'}")
     print_update_payload(payload)
 
 
@@ -441,7 +419,7 @@ def status(
     index_path = ctx.obj["index_path"]
     settings = load_app_settings(ctx.obj["settings_path"])
     diagnostics = inspect_local_databases(index_path, settings.source_uuid)
-    autosync_status = autosync_runtime_status(ctx.obj["settings_path"], index_path)
+
     configured_source = diagnostic_source_path(settings, diagnostics.configured_source_path)
     source_path = str(configured_source) if configured_source else None
     stats = diagnostics.stats
@@ -458,10 +436,6 @@ def status(
         "ui_language": settings.ui_language,
         "resolved_ui_language": resolved_ui_language,
         "last_update_at": settings.last_update_at,
-        "autosync_enabled": autosync_status.enabled,
-        "autosync_configured": autosync_status.configured,
-        "autosync_installed": autosync_status.installed,
-        "autosync_active": autosync_status.active,
         "obsidian_configured": obsidian_configured,
         **scan_diagnostics,
         **stats,
@@ -476,7 +450,6 @@ def status(
     configured_label = "configured" if settings.ui_language else "auto"
     print_text_block(f"language: {resolved_ui_language} ({configured_label})")
     print_text_block(f"last refresh: {settings.last_update_at or 'never'}")
-    print_text_block(f"autosync: {autosync_status.label}")
     print_text_block(f"obsidian: {'configured' if obsidian_configured else 'not configured'}")
     print_text_block(f"meetings: {stats['meetings']}")
     print_text_block(f"chunks: {stats['chunks']}")
@@ -801,7 +774,6 @@ def refresh(
         typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
     ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
-    autosync_run: Annotated[bool, typer.Option("--autosync-run", hidden=True)] = False,
 ) -> None:
     try:
         with RefreshLock(ctx.obj["index_path"]):
@@ -817,9 +789,6 @@ def refresh(
                 source_path,
             )
     except RefreshLockBusyError as exc:
-        if autosync_run:
-            typer.echo(f"Autosync skipped: {exc}", err=True)
-            return
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
         payload["obsidian_synced"] = obsidian_synced
@@ -909,16 +878,6 @@ def db_status(
             f"{migration_report['migrated']} migrated, "
             f"{migration_report['orphaned']} orphaned"
         )
-
-
-@mcp_app.command("serve")
-def mcp_serve(ctx: typer.Context) -> None:
-    try:
-        from meetily_memory.mcp_server import run_mcp_server  # noqa: PLC0415
-    except ImportError as exc:
-        message = "MCP support is optional. Install with `meetily-memory[mcp]`."
-        raise typer.BadParameter(message) from exc
-    run_mcp_server(ctx.obj["index_path"])
 
 
 @app.command()

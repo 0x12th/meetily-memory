@@ -83,7 +83,7 @@ def test_cli_help_uses_plain_click_format() -> None:
     assert "Local search over Meetily meeting history." in help_result.stdout
     assert "Main workflow:" in help_result.stdout
     assert "mm s QUERY" in help_result.stdout
-    assert "mm open ID" in help_result.stdout
+    assert "mm open --source-uuid UUID --external-id ID" in help_result.stdout
     assert "\n  ask" not in help_result.stdout
     assert "ask answers" not in help_result.stdout
     assert "--install-completion" not in help_result.stdout
@@ -99,7 +99,6 @@ def test_cli_help_uses_plain_click_format() -> None:
         "s",
         "open",
         "tag",
-        "autosync",
     ):
         assert re.search(rf"\n  {re.escape(command)}(?:\s{{2,}}|\n)", help_result.stdout)
     for command in (
@@ -138,12 +137,9 @@ def test_cli_help_uses_plain_click_format() -> None:
     ("command", "expected"),
     [
         (("scan",), "--source"),
-        (("c",), "QUESTION"),
-        (("t",), "QUERY"),
         (("obsidian",), "sync"),
         (("config",), "source"),
         (("db",), "status"),
-        (("mcp",), "serve"),
     ],
 )
 def test_hidden_commands_remain_directly_accessible(
@@ -197,37 +193,6 @@ def test_cli_config_language_persists_ui_language(tmp_path: Path) -> None:
     assert config["ui_language"] is None
 
 
-def test_cli_autosync_status_reports_missing_scheduler(tmp_path: Path) -> None:
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    (data_dir / "settings.json").write_text(
-        json.dumps({"autosync_enabled": True}) + "\n",
-        encoding="utf-8",
-    )
-    runner = CliRunner()
-
-    status = runner.invoke(
-        app,
-        ["autosync", "status", "--json"],
-        env={"HOME": str(tmp_path / "home"), "MEETILY_MEMORY_DATA_DIR": str(data_dir)},
-    )
-
-    assert status.exit_code == 0
-    payload = loads_json(status.stdout)
-    assert payload["configured"] is True
-    assert payload["installed"] is False
-    assert payload["active"] is False
-    assert payload["enabled"] is False
-
-    main_status = runner.invoke(
-        app,
-        ["--index", str(tmp_path / "index.sqlite"), "status"],
-        env={"HOME": str(tmp_path / "home"), "MEETILY_MEMORY_DATA_DIR": str(data_dir)},
-    )
-    assert main_status.exit_code == 0
-    assert "autosync: misconfigured" in main_status.stdout
-
-
 def scan_twice(runner: CliRunner, index_path: Path, meetily_db: Path) -> None:
     scan = runner.invoke(
         app,
@@ -259,33 +224,6 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
         source_uuid = str(conn.execute("SELECT source_uuid FROM sources").fetchone()[0])
     assert f"open: mm open --source-uuid {source_uuid} --external-id meeting-1" in search.stdout
 
-    context = runner.invoke(app, ["--index", str(index_path), "c", "Who owns migration risks?"])
-    assert context.exit_code == 0
-    assert "# Question" in context.stdout
-    assert "Evidence role: neighboring context" not in context.stdout
-
-    expanded_context = runner.invoke(
-        app,
-        ["--index", str(index_path), "c", "Who owns migration risks?", "--context", "2"],
-    )
-    assert expanded_context.exit_code == 0
-    assert "Evidence role: neighboring context" in expanded_context.stdout
-    assert "# Relevant meetings" in context.stdout
-    assert "## Meeting: Dobrynya Follow-up" in context.stdout
-    assert "Date: 2026-07-02T09:30:00Z" in context.stdout
-    assert "/meeting-2 / transcript-2" in context.stdout
-    assert "### Relevant excerpt" in context.stdout
-    assert "Dobrynya agreed to send migration risks by Friday." in context.stdout
-    assert "Evidence role: neighboring context" in expanded_context.stdout
-    assert context.stdout.count("Who owns migration risks?") == 2
-
-    exact_context = runner.invoke(
-        app,
-        ["--index", str(index_path), "c", "Who owns migration risks?", "--context", "0"],
-    )
-    assert exact_context.exit_code == 0
-    assert "Evidence role: neighboring context" not in exact_context.stdout
-
     doctor = runner.invoke(
         app,
         ["--index", str(index_path), "doctor", "--source", str(meetily_db)],
@@ -302,6 +240,8 @@ def test_cli_v1_scan_search_list_last_person_and_doctor(meetily_db: Path, tmp_pa
             "--index",
             str(index_path),
             "open",
+            "--source-uuid",
+            source_uuid,
             "--external-id",
             "meeting-2",
             "--print-path",
@@ -406,232 +346,6 @@ def test_cli_search_rejects_invalid_filters_before_opening_database(tmp_path: Pa
     assert not missing_index.exists()
 
 
-def test_cli_topic_shows_structured_memory_with_source_evidence(
-    meetily_db: Path, tmp_path: Path
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    runner = CliRunner()
-
-    scan = runner.invoke(
-        app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
-    )
-    assert scan.exit_code == 0
-
-    topic = runner.invoke(app, ["--index", str(index_path), "t", "migration"])
-    assert topic.exit_code == 0
-    assert "What we know: migration" in topic.stdout
-    assert "Dobrynya Follow-up" in topic.stdout
-    assert "/meeting-2 / transcript-2" in topic.stdout
-    assert "Dobrynya agreed to send migration risks by Friday." in topic.stdout
-
-
-def test_cli_topic_uses_configured_ui_language(meetily_db: Path, tmp_path: Path) -> None:
-    with sqlite3.connect(meetily_db) as conn:
-        conn.execute(
-            """
-            INSERT INTO summary_processes (
-                meeting_id, status, created_at, updated_at, result, metadata
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "meeting-2",
-                "completed",
-                "2026-07-02T09:33:00Z",
-                "2026-07-02T09:34:00Z",
-                '{"markdown":"Добрыня подтвердил план миграции."}',
-                '{"language":"ru"}',
-            ),
-        )
-        conn.commit()
-    index_path = tmp_path / "index.sqlite"
-    data_dir = tmp_path / "data"
-    config_path = data_dir / "settings.json"
-    data_dir.mkdir()
-    config_path.write_text('{"ui_language":"ru"}\n', encoding="utf-8")
-    env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
-    runner = CliRunner()
-
-    scan = runner.invoke(
-        app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
-    )
-    assert scan.exit_code == 0
-
-    topic = runner.invoke(app, ["--index", str(index_path), "t", "миграция"], env=env)
-
-    assert topic.exit_code == 0
-    assert "Что известно: миграция" in topic.stdout
-    assert "Связанные встречи" in topic.stdout
-    assert "Dobrynya Follow-up" in topic.stdout
-    assert "Добрыня подтвердил план миграции." in topic.stdout
-
-
-def test_cli_topic_uses_russian_output_and_cautious_sections(
-    meetily_db: Path, tmp_path: Path
-) -> None:
-    with sqlite3.connect(meetily_db) as conn:
-        insert_kafka_meeting(conn, tmp_path)
-        conn.commit()
-    index_path = tmp_path / "index.sqlite"
-    data_dir = tmp_path / "data"
-    config_path = data_dir / "settings.json"
-    data_dir.mkdir()
-    config_path.write_text('{"ui_language":"ru"}\n', encoding="utf-8")
-    env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
-    runner = CliRunner()
-
-    scan = runner.invoke(
-        app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db), "--no-analyze"],
-    )
-    assert scan.exit_code == 0
-
-    topic = runner.invoke(app, ["--index", str(index_path), "t", "Kafka"], env=env)
-
-    assert topic.exit_code == 0
-    assert "Что известно: Kafka" in topic.stdout
-    assert "Связанные встречи" in topic.stdout
-    assert "Возможные решения" in topic.stdout
-    assert "Подтвержденные решения не найдены." in topic.stdout
-    assert "Возможные риски" in topic.stdout
-    assert "Проблема: нельзя гарантировать запись в БД" in topic.stdout
-    assert "Подтверждающие фрагменты" in topic.stdout
-    assert "What we know" not in topic.stdout
-    assert "(heuristic)" not in topic.stdout
-
-
-def test_cli_topic_uses_indexed_alias_terms(meetily_db: Path, tmp_path: Path) -> None:
-    with sqlite3.connect(meetily_db) as conn:
-        insert_kafka_meeting(conn, tmp_path)
-        conn.commit()
-    index_path = tmp_path / "index.sqlite"
-    runner = CliRunner()
-
-    scan = runner.invoke(
-        app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db), "--no-analyze"],
-    )
-    assert scan.exit_code == 0
-
-    without_alias = runner.invoke(app, ["--index", str(index_path), "t", "кафка"])
-    assert without_alias.exit_code == 0
-    assert "Kafka Architecture" not in without_alias.stdout
-
-    alias = runner.invoke(
-        app,
-        [
-            "--index",
-            str(index_path),
-            "t",
-            "kafka",
-            "--alias",
-            "кафка",
-            "--alias",
-            "broker",
-            "--alias",
-            "брокер",
-            "--alias",
-            "outbox",
-        ],
-    )
-    assert alias.exit_code == 0
-
-    for query in ("kafka", "кафка", "broker", "брокер", "outbox"):
-        topic = runner.invoke(app, ["--index", str(index_path), "t", query])
-        assert topic.exit_code == 0
-        assert "Kafka Architecture" in topic.stdout
-        assert "Kafka как брокер событий" in topic.stdout
-        assert "Pattern outbox." in topic.stdout
-
-
-def test_cli_topic_keeps_configured_english_for_russian_content(
-    meetily_db: Path, tmp_path: Path
-) -> None:
-    with sqlite3.connect(meetily_db) as conn:
-        insert_kafka_meeting(conn, tmp_path)
-        conn.commit()
-    index_path = tmp_path / "index.sqlite"
-    data_dir = tmp_path / "data"
-    config_path = data_dir / "settings.json"
-    data_dir.mkdir()
-    config_path.write_text('{"ui_language":"en"}\n', encoding="utf-8")
-    env = {"MEETILY_MEMORY_DATA_DIR": str(data_dir)}
-    runner = CliRunner()
-
-    scan = runner.invoke(
-        app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db), "--no-analyze"],
-    )
-    assert scan.exit_code == 0
-
-    topic = runner.invoke(app, ["--index", str(index_path), "t", "брокер"], env=env)
-
-    assert topic.exit_code == 0
-    assert "What we know: брокер" in topic.stdout
-    assert "Related meetings" in topic.stdout
-    assert "Что известно" not in topic.stdout
-
-
-def insert_kafka_meeting(conn: sqlite3.Connection, tmp_path: Path) -> None:
-    conn.execute(
-        """
-        INSERT INTO meetings (id, title, created_at, updated_at, folder_path)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            "meeting-3",
-            "Kafka Architecture",
-            "2026-07-06T12:50:00Z",
-            "2026-07-06T13:00:00Z",
-            str(tmp_path / "Kafka Architecture"),
-        ),
-    )
-    conn.executemany(
-        """
-        INSERT INTO transcripts (
-            id, meeting_id, transcript, timestamp, audio_start_time,
-            audio_end_time, duration, speaker
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                "transcript-5",
-                "meeting-3",
-                "Обсуждали Kafka как брокер событий.",
-                "12:56:20",
-                3380.0,
-                3390.0,
-                10.0,
-                "Alice",
-            ),
-            (
-                "transcript-6",
-                "meeting-3",
-                "Проблема: нельзя гарантировать запись в БД "
-                "и отправку в Kafka без рассинхронизации.",
-                "12:56:36",
-                3396.0,
-                3402.0,
-                6.0,
-                "Alice",
-            ),
-            (
-                "transcript-7",
-                "meeting-3",
-                "Pattern outbox.",
-                "12:56:42",
-                3402.0,
-                3405.0,
-                3.0,
-                "Bob",
-            ),
-        ],
-    )
-
-
 def test_cli_open_selects_meeting_folder_by_default(meetily_db: Path, tmp_path: Path) -> None:
     index_path = tmp_path / "index.sqlite"
     runner = CliRunner()
@@ -642,16 +356,24 @@ def test_cli_open_selects_meeting_folder_by_default(meetily_db: Path, tmp_path: 
     )
     assert scan.exit_code == 0
 
+    meeting = IndexRepository.open_existing(index_path).get_meeting_by_local_id(1)
+    assert meeting is not None
+    open_args = [
+        "--source-uuid",
+        str(meeting["source_uuid"]),
+        "--external-id",
+        str(meeting["external_id"]),
+    ]
     default_path = runner.invoke(
         app,
-        ["--index", str(index_path), "open", "1", "--print-path"],
+        ["--index", str(index_path), "open", *open_args, "--print-path"],
     )
     assert default_path.exit_code == 0
     assert default_path.stdout.strip() == str(tmp_path / "Launch Planning")
 
     source_path = runner.invoke(
         app,
-        ["--index", str(index_path), "open", "1", "--source", "--print-path"],
+        ["--index", str(index_path), "open", *open_args, "--source", "--print-path"],
     )
     assert source_path.exit_code == 0
     assert source_path.stdout.strip() == str(meetily_db)
@@ -666,12 +388,6 @@ def test_cli_refresh_skips_unproven_structured_analysis(meetily_db: Path, tmp_pa
         ["--index", str(index_path), "scan", "--source", str(meetily_db), "--no-analyze"],
     )
     assert scan.exit_code == 0
-
-    topic = runner.invoke(app, ["--index", str(index_path), "t", "migration"])
-    assert topic.exit_code == 0
-    assert "Supporting excerpts" in topic.stdout
-    assert "Dobrynya agreed to send migration risks by Friday." in topic.stdout
-    assert "/meeting-2 / transcript-2" in topic.stdout
 
     refresh = runner.invoke(
         app,
@@ -778,22 +494,6 @@ def test_cli_db_status_reports_orphaned_tag_assignments(tmp_path: Path) -> None:
     assert json.loads(json_status.stdout)["orphaned_tag_assignments"] == 2
 
 
-def test_cli_mcp_serve_is_real_subcommand() -> None:
-    runner = CliRunner()
-
-    mcp_help = runner.invoke(app, ["mcp", "--help"])
-    assert mcp_help.exit_code == 0
-    assert "Commands:" in mcp_help.stdout
-    assert "serve" in mcp_help.stdout
-
-    serve_help = runner.invoke(app, ["mcp", "serve", "--help"])
-    assert serve_help.exit_code == 0
-    assert "Usage: root mcp serve" in serve_help.stdout
-    assert "--transport" not in serve_help.stdout
-    assert "streamable-http" not in serve_help.stdout
-    assert "sse" not in serve_help.stdout.casefold()
-
-
 def test_cli_removed_public_commands_are_not_available() -> None:
     runner = CliRunner()
 
@@ -818,6 +518,11 @@ def test_cli_removed_public_commands_are_not_available() -> None:
         "semantic",
         "ask",
         "llm",
+        "autosync",
+        "c",
+        "t",
+        "topic",
+        "mcp",
     )
     for command in removed_commands:
         result = runner.invoke(app, [command, "--help"])
@@ -837,7 +542,7 @@ def test_cli_init_status_and_obsidian_sync(
 
     init = runner.invoke(
         app,
-        ["--index", str(index_path), "init", "--source", str(meetily_db), "--no-autosync"],
+        ["--index", str(index_path), "init", "--source", str(meetily_db)],
         env=env,
     )
     assert init.exit_code == 0
@@ -848,7 +553,6 @@ def test_cli_init_status_and_obsidian_sync(
     assert status.exit_code == 0
     assert f"index path: {index_path}" in status.stdout
     assert f"source path: {meetily_db}" in status.stdout
-    assert "autosync: disabled" in status.stdout
     assert "obsidian: not configured" in status.stdout
 
     obsidian_init = runner.invoke(
@@ -926,7 +630,6 @@ def test_cli_obsidian_uses_workspace_settings_scope(meetily_db: Path, tmp_path: 
             "init",
             "--source",
             str(meetily_db),
-            "--no-autosync",
         ],
     )
     assert init.exit_code == 0
@@ -975,33 +678,3 @@ def test_cli_obsidian_uses_workspace_settings_scope(meetily_db: Path, tmp_path: 
     assert global_config.obsidian == ObsidianSettings(vault_path=str(global_vault))
     assert meeting_note.exists()
     assert not global_vault.exists()
-
-
-def test_cli_v5_topic_graph_alias_and_task_status_memory(meetily_db: Path, tmp_path: Path) -> None:
-    index_path = tmp_path / "index.sqlite"
-    runner = CliRunner()
-
-    scan = runner.invoke(
-        app,
-        ["--index", str(index_path), "scan", "--source", str(meetily_db)],
-    )
-    assert scan.exit_code == 0
-
-    topic = runner.invoke(app, ["--index", str(index_path), "t", "migration"])
-    assert topic.exit_code == 0
-    assert "What we know: migration" in topic.stdout
-    assert "Possible tasks" in topic.stdout
-    assert "Dobrynya agreed to send migration risks by Friday." in topic.stdout
-    assert "/meeting-2 / transcript-2" in topic.stdout
-
-    alias = runner.invoke(
-        app,
-        ["--index", str(index_path), "t", "migration", "--alias", "миграция"],
-    )
-    assert alias.exit_code == 0
-    assert "alias added: миграция -> migration" in alias.stdout
-
-    alias_lookup = runner.invoke(app, ["--index", str(index_path), "t", "миграция"])
-    assert alias_lookup.exit_code == 0
-    assert "What we know: migration" in alias_lookup.stdout
-    assert "alias: миграция" in alias_lookup.stdout

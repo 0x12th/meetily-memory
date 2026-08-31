@@ -1,11 +1,10 @@
 import sqlite3
 from pathlib import Path
 
-from meetily_memory.core import ContextRetrievalOptions, MeetilyMemoryCore
-from meetily_memory.domain import MemoryEntity, SearchHit, SearchResults
+from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.domain import SearchHit, SearchResults
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
-from meetily_memory.serializers import context_bundle_payload, memory_entity_payload
 
 
 def test_search_has_one_meeting_level_contract(meetily_db: Path, tmp_path: Path) -> None:
@@ -33,63 +32,15 @@ def test_search_hit_identity_and_source_survive_index_rebuild(
 
     index_path.unlink()
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
-    core = MeetilyMemoryCore(index_path, state_path=state_path)
-    second = IndexRepository(index_path, state_path=state_path).search_hits("pricing decision")[0]
-    resolved = core.resolve_search_hit(first.id)
+    repository = IndexRepository(index_path, state_path=state_path)
+    second = repository.search_hits("pricing decision")[0]
+    resolved = repository.get_search_hit(first.id)
 
     assert isinstance(first, SearchHit)
     assert first.id == second.id
     assert first.meeting.external_id == second.meeting.external_id
     assert first.excerpt.text == "Alice confirmed the launch checklist and pricing decision."
     assert resolved == second
-
-
-def test_context_is_data_only_and_uses_canonical_memory_entities(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
-    core = MeetilyMemoryCore(index_path)
-
-    bundle = core.build_context("migration risks", limit=5)
-    bounded = core._build_context_bundle(  # noqa: SLF001
-        "migration risks",
-        3,
-        ContextRetrievalOptions(neighbor_count=1, max_evidence=5),
-    )
-    payload = context_bundle_payload(bundle)
-
-    assert "markdown" not in payload
-    assert bundle.evidence
-    assert all(isinstance(hit, SearchHit) for hit in bundle.evidence)
-    assert all(isinstance(entity, MemoryEntity) for entity in bundle.entities)
-    assert {entity.kind for entity in bundle.entities} <= {"decision", "task", "risk", "question"}
-    assert all(entity.authoritative is False for entity in bundle.entities)
-    assert all(entity.evidence_id for entity in bundle.entities)
-    assert all("confidence" not in memory_entity_payload(entity) for entity in bundle.entities)
-    assert bounded.evidence
-    assert len(bounded.evidence) <= 5
-    assert next(iter(bounded.evidence)).is_context is False
-    assert any(hit.is_context for hit in bounded.evidence)
-
-
-def test_context_neighbors_are_explicit_without_changing_search_default(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
-    core = MeetilyMemoryCore(index_path)
-
-    search = core.search("migration risks", limit=3)
-    context = core.build_context("migration risks", limit=3)
-    expanded = core.build_context("migration risks", limit=3, context=2)
-
-    assert all(not evidence.is_context for result in search.results for evidence in result.evidence)
-    assert all(not result.is_context for result in context.evidence)
-    assert any(result.is_context for result in expanded.evidence)
-    assert len(expanded.evidence) <= 20
 
 
 def test_memory_entities_require_chunks_and_cascade_on_chunk_delete(

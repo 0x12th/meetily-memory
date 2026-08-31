@@ -14,7 +14,6 @@ from typer.testing import CliRunner
 from meetily_memory import user_state
 from meetily_memory.cli import lifecycle_commands as lifecycle_module
 from meetily_memory.cli.app import app
-from meetily_memory.context_builder import group_hits_by_meeting
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.migrations import (
     CURRENT_SCHEMA_VERSION,
@@ -378,12 +377,6 @@ def test_duplicate_external_ids_keep_distinct_refs_evidence_context_and_json(
     )
     refs = {result.meeting.ref for result in matching}
     evidence_ids = {hit.id for result in matching for hit in result.evidence}
-    context = core.build_context("pricing decision", limit=10)
-    groups = [
-        group
-        for group in group_hits_by_meeting(context.evidence)
-        if group.ref.external_id == "meeting-1"
-    ]
 
     assert len(matching) == 2
     assert {ref.source_uuid for ref in refs} == {
@@ -391,7 +384,6 @@ def test_duplicate_external_ids_keep_distinct_refs_evidence_context_and_json(
         second_scan.source_uuid,
     }
     assert len(evidence_ids) == 2
-    assert {group.ref for group in groups} == refs
     for ref in refs:
         meeting = core.get_meeting_by_ref(ref)
         assert meeting is not None
@@ -457,13 +449,10 @@ def test_digit_only_external_id_is_not_confused_with_local_cli_id(
 
     by_ref = core.get_meeting_by_ref(digit_ref)
     by_bare_external_id = core.get_meeting("2")
-    by_local_id = core.get_meeting_by_local_id(2)
 
     assert by_ref is not None
     assert by_ref.title == "Launch Planning"
     assert by_bare_external_id == by_ref
-    assert by_local_id is not None
-    assert by_local_id.title == "Dobrynya Follow-up"
 
     runner = CliRunner()
     local_open = runner.invoke(
@@ -484,8 +473,8 @@ def test_digit_only_external_id_is_not_confused_with_local_cli_id(
         ],
     )
 
-    assert local_open.exit_code == 0
-    assert local_open.stdout.strip() == str(tmp_path / "Dobrynya Follow-up")
+    assert local_open.exit_code != 0
+    assert "No such option" in local_open.output or "unexpected extra argument" in local_open.output
     assert stable_open.exit_code == 0
     assert stable_open.stdout.strip() == str(tmp_path / "Launch Planning")
 
@@ -781,7 +770,7 @@ def test_legacy_path_collision_requires_explicit_rebind_before_rebuild(  # noqa:
         if entity.meeting_ref == meeting.ref
     )
     bootstrap_core.set_task_status(task.id, "done", note="survives explicit rebind")
-    TagService(bootstrap_repo).assign((str(meeting.id),), ("explicit-rebind-tag",))
+    TagService(bootstrap_repo).assign((meeting.ref,), ("explicit-rebind-tag",))
 
     legacy_link = tmp_path / "legacy-source.sqlite"
     if collision_kind == "cross-cwd-relative":
@@ -861,7 +850,7 @@ def test_legacy_path_collision_requires_explicit_rebind_before_rebuild(  # noqa:
     assert [
         tag.display_name
         for tag in TagService(IndexRepository(index_path, state_path=state_path)).list_for_meeting(
-            str(rebuilt_meeting.id)
+            rebuilt_meeting.ref
         )
     ] == ["explicit-rebind-tag"]
 
@@ -1764,7 +1753,17 @@ def test_run_refresh_heals_v6_projection_after_state_claim_crash(
         assert set(conn.execute("SELECT source_path FROM meetings")) == {(moved_path,)}
     opened = CliRunner().invoke(
         app,
-        ["--index", str(index_path), "open", "1", "--source", "--print-path"],
+        [
+            "--index",
+            str(index_path),
+            "open",
+            "--source-uuid",
+            scan.source_uuid,
+            "--external-id",
+            "meeting-1",
+            "--source",
+            "--print-path",
+        ],
         env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
     )
     assert opened.exit_code == 0
@@ -2671,7 +2670,7 @@ def test_secondary_v5_source_rebind_by_uuid_enables_full_rebuild(
         "done",
         note="secondary survives explicit repair",
     )
-    TagService(bootstrap_repo).assign((str(secondary_meeting.id),), ("secondary-repair",))
+    TagService(bootstrap_repo).assign((secondary_meeting.ref,), ("secondary-repair",))
 
     legacy_link = tmp_path / "secondary-legacy-link.sqlite"
     if secondary_path_kind == "relative":
@@ -2736,7 +2735,7 @@ def test_secondary_v5_source_rebind_by_uuid_enables_full_rebuild(
     assert [
         tag.display_name
         for tag in TagService(IndexRepository(index_path, state_path=state_path)).list_for_meeting(
-            str(rebuilt_secondary.id)
+            rebuilt_secondary.ref
         )
     ] == ["secondary-repair"]
     with sqlite3.connect(index_path) as conn:
@@ -2946,7 +2945,7 @@ def test_failed_then_successful_rebuild_preserves_refs_and_source_backed_state( 
         if entity.meeting_ref == original_ref
     )
     core.set_task_status(task.id, "done", note="survives incompatible rebuild")
-    TagService(repo).assign((str(meeting.id),), ("persistent-tag",))
+    TagService(repo).assign((meeting.ref,), ("persistent-tag",))
 
     canonical_source = str(meetily_db.resolve(strict=True))
     with sqlite3.connect(index_path) as conn:
@@ -2994,7 +2993,7 @@ def test_failed_then_successful_rebuild_preserves_refs_and_source_backed_state( 
     assert [
         tag.display_name
         for tag in TagService(IndexRepository(index_path, state_path=state_path)).list_for_meeting(
-            str(rebuilt_meeting.id)
+            rebuilt_meeting.ref
         )
     ] == ["persistent-tag"]
 

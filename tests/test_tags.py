@@ -14,7 +14,7 @@ from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.db.repository import IndexRepository
 from meetily_memory.db.schema import existing_index_connection
-from meetily_memory.domain import MeetingSearchFilters, RetrievalSource
+from meetily_memory.domain import MeetingRef, MeetingSearchFilters, RetrievalSource
 from meetily_memory.scanner.meetily_sqlite import MeetilySQLiteScanner
 from meetily_memory.semantic_search import (
     LocalHashEmbeddingProvider,
@@ -23,6 +23,16 @@ from meetily_memory.semantic_search import (
 from meetily_memory.tagging import TagService
 from meetily_memory.user_state import UserStateRepository
 from tests.semantic_helpers import requires_sqlite_vec
+
+
+def indexed_ref(repository: IndexRepository, local_id: int) -> MeetingRef:
+    meeting_ref = repository.meeting_ref_for_local_id(local_id)
+    assert meeting_ref is not None
+    return meeting_ref
+
+
+def indexed_refs(repository: IndexRepository, *local_ids: int) -> tuple[MeetingRef, ...]:
+    return tuple(indexed_ref(repository, local_id) for local_id in local_ids)
 
 
 class TargetBiasedEmbeddingProvider:
@@ -137,19 +147,21 @@ def test_tag_service_validates_batch_and_persists_assignments(
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     service = service_class(IndexRepository(index_path, state_path=state_path))
 
-    assigned = service.assign(("1", "2"), ("Сбер", "собес"))
-    repeated = service.assign(("1", "2"), ("сбер", "СОБЕС"))
+    refs = indexed_refs(service.index_repository, 1, 2)
+    assigned = service.assign(refs, ("Сбер", "собес"))
+    repeated = service.assign(refs, ("сбер", "СОБЕС"))
 
     assert assigned.added_links == 4
     assert repeated.existing_links == 4
-    assert [tag.display_name for tag in service.list_for_meeting("1")] == ["Сбер", "собес"]
+    assert [tag.display_name for tag in service.list_for_meeting(refs[0])] == ["Сбер", "собес"]
     assert [(item.display_name, item.active_meetings) for item in service.list_all()] == [
         ("Сбер", 2),
         ("собес", 2),
     ]
 
-    with pytest.raises(ValueError, match="Meetings not found: 999"):
-        service.assign(("1", "999"), ("не записывать",))
+    missing_ref = MeetingRef(refs[0].source_uuid, "missing")
+    with pytest.raises(ValueError, match=f"Meetings not found: {missing_ref.source_uuid}/missing"):
+        service.assign((refs[0], missing_ref), ("не записывать",))
     assert service.repository.search("не записывать") == ()
 
 
@@ -162,7 +174,10 @@ def test_tag_list_and_suggest_hydrate_assignments_with_bounded_queries(
     state_path = tmp_path / "state.sqlite"
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     writer = TagService(IndexRepository(index_path, state_path=state_path))
-    writer.assign(("2",), tuple(f"batch-only-tag-{index}" for index in range(16)))
+    writer.assign(
+        (indexed_ref(writer.index_repository, 2),),
+        tuple(f"batch-only-tag-{index}" for index in range(16)),
+    )
     service = TagService(IndexRepository.open_existing(index_path, state_path=state_path))
     counts = {
         "index_connections": 0,
@@ -216,16 +231,17 @@ def test_tag_list_and_suggest_hydrate_assignments_with_bounded_queries(
         "state_queries": 1,
     }
 
+    meeting_ref = indexed_ref(service.index_repository, 1)
     counts.update(
         index_connections=0,
         index_queries=0,
         state_connections=0,
         state_queries=0,
     )
-    assert service.suggest("1") == ()
+    assert service.suggest(meeting_ref) == ()
     assert counts == {
-        "index_connections": 5,
-        "index_queries": 5,
+        "index_connections": 4,
+        "index_queries": 4,
         "state_connections": 2,
         "state_queries": 2,
     }
@@ -243,13 +259,14 @@ def test_manual_tags_survive_disposable_index_rebuild(
     state_path = tmp_path / "state.sqlite"
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     service = service_class(IndexRepository(index_path, state_path=state_path))
-    service.assign(("1",), ("Сбер",))
+    meeting_ref = indexed_ref(service.index_repository, 1)
+    service.assign((meeting_ref,), ("Сбер",))
 
     index_path.unlink()
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     rebuilt = service_class(IndexRepository(index_path, state_path=state_path))
 
-    assert [tag.display_name for tag in rebuilt.list_for_meeting("1")] == ["Сбер"]
+    assert [tag.display_name for tag in rebuilt.list_for_meeting(meeting_ref)] == ["Сбер"]
 
 
 def test_orphaned_tag_assignments_are_preserved_but_excluded_from_active_tags(
@@ -285,18 +302,53 @@ def test_cli_assigns_lists_and_removes_tags(meetily_db: Path, tmp_path: Path) ->
         ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
     assert scan.exit_code == 0
+    repository = IndexRepository.open_existing(index_path)
+    first_ref, second_ref = indexed_refs(repository, 1, 2)
 
     added = runner.invoke(
         app,
-        ["--index", str(index_path), "tag", "add", "1", "2", "сбер,собес"],
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "add",
+            "сбер,собес",
+            "--source-uuid",
+            first_ref.source_uuid,
+            "--external-id",
+            first_ref.external_id,
+            "--external-id",
+            second_ref.external_id,
+        ],
     )
     repeated = runner.invoke(
         app,
-        ["--index", str(index_path), "tag", "add", "1", "2", "СБЕР,собес"],
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "add",
+            "СБЕР,собес",
+            "--source-uuid",
+            first_ref.source_uuid,
+            "--external-id",
+            first_ref.external_id,
+            "--external-id",
+            second_ref.external_id,
+        ],
     )
     meeting_tags = runner.invoke(
         app,
-        ["--index", str(index_path), "tag", "list", "1"],
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "list",
+            "--source-uuid",
+            first_ref.source_uuid,
+            "--external-id",
+            first_ref.external_id,
+        ],
     )
     all_tags = runner.invoke(
         app,
@@ -304,7 +356,17 @@ def test_cli_assigns_lists_and_removes_tags(meetily_db: Path, tmp_path: Path) ->
     )
     removed = runner.invoke(
         app,
-        ["--index", str(index_path), "tag", "remove", "1", "сбер"],
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "remove",
+            "сбер",
+            "--source-uuid",
+            first_ref.source_uuid,
+            "--external-id",
+            first_ref.external_id,
+        ],
     )
 
     assert added.exit_code == 0
@@ -312,7 +374,7 @@ def test_cli_assigns_lists_and_removes_tags(meetily_db: Path, tmp_path: Path) ->
     assert repeated.exit_code == 0
     assert "Already assigned: сбер, собес" in repeated.stdout
     assert meeting_tags.exit_code == 0
-    assert "Meeting #1" in meeting_tags.stdout
+    assert f"Meeting {first_ref.source_uuid}/{first_ref.external_id}" in meeting_tags.stdout
     assert "- сбер" in meeting_tags.stdout
     assert "- собес" in meeting_tags.stdout
     assert all_tags.exit_code == 0
@@ -333,18 +395,48 @@ def test_cli_tag_batch_errors_do_not_write_partial_state(
         ["--index", str(index_path), "scan", "--source", str(meetily_db)],
     )
     assert scan.exit_code == 0
+    meeting_ref = indexed_ref(IndexRepository.open_existing(index_path), 1)
 
     missing_meeting = runner.invoke(
         app,
-        ["--index", str(index_path), "tag", "add", "1", "999", "сбер"],
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "add",
+            "сбер",
+            "--source-uuid",
+            meeting_ref.source_uuid,
+            "--external-id",
+            meeting_ref.external_id,
+            "--external-id",
+            "missing",
+        ],
     )
     no_ids = runner.invoke(
         app,
-        ["--index", str(index_path), "tag", "add", "сбер"],
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "add",
+            "сбер",
+            "--source-uuid",
+            meeting_ref.source_uuid,
+        ],
     )
     no_tags = runner.invoke(
         app,
-        ["--index", str(index_path), "tag", "add", "1", "2"],
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "add",
+            "--source-uuid",
+            meeting_ref.source_uuid,
+            "--external-id",
+            meeting_ref.external_id,
+        ],
     )
     all_tags = runner.invoke(
         app,
@@ -352,12 +444,12 @@ def test_cli_tag_batch_errors_do_not_write_partial_state(
     )
 
     assert missing_meeting.exit_code == 2
-    assert "Meetings not found: 999" in missing_meeting.output
+    assert f"Meetings not found: {meeting_ref.source_uuid}/missing" in missing_meeting.output
     assert "No tags were changed." in missing_meeting.output
     assert no_ids.exit_code == 2
-    assert "No meeting IDs provided." in no_ids.output
+    assert "Provide at least one --external-id." in no_ids.output
     assert no_tags.exit_code == 2
-    assert "No tags provided." in no_tags.output
+    assert "Missing argument 'TAGS'" in no_tags.output
     assert "сбер" not in all_tags.stdout
 
 
@@ -374,7 +466,7 @@ def test_search_returns_meetings_with_real_or_empty_evidence(
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     core = MeetilyMemoryCore(index_path, state_path=state_path)
     service = service_class(IndexRepository(index_path, state_path=state_path))
-    service.assign(("2",), ("Сбер",))
+    service.assign((indexed_ref(service.index_repository, 2),), ("Сбер",))
 
     tag_only = core.search("сбер").results
     lexical = core.search("migration risks").results
@@ -398,7 +490,7 @@ def test_tag_only_search_uses_the_same_date_filter(
     state_path = tmp_path / "state.sqlite"
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     repository = IndexRepository(index_path, state_path=state_path)
-    TagService(repository).assign(("1", "2"), ("product integration",))
+    TagService(repository).assign(indexed_refs(repository, 1, 2), ("product integration",))
     filters = MeetingSearchFilters(
         from_utc=datetime(2026, 7, 2, tzinfo=UTC),
         to_utc=datetime(2026, 7, 3, tzinfo=UTC),
@@ -426,7 +518,7 @@ def test_search_orders_exact_tag_before_lexical_before_token_tag(
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     core = MeetilyMemoryCore(index_path, state_path=state_path)
     service = service_class(IndexRepository(index_path, state_path=state_path))
-    service.assign(("2",), ("pricing decision",))
+    service.assign((indexed_ref(service.index_repository, 2),), ("pricing decision",))
 
     exact_then_lexical = core.search("pricing decision").results
     lexical_then_token = core.search("pricing").results
@@ -448,10 +540,21 @@ def test_cli_search_explains_tag_only_match(meetily_db: Path, tmp_path: Path) ->
         ).exit_code
         == 0
     )
+    meeting_ref = indexed_ref(IndexRepository.open_existing(index_path), 2)
     assert (
         runner.invoke(
             app,
-            ["--index", str(index_path), "tag", "add", "2", "сбер"],
+            [
+                "--index",
+                str(index_path),
+                "tag",
+                "add",
+                "сбер",
+                "--source-uuid",
+                meeting_ref.source_uuid,
+                "--external-id",
+                meeting_ref.external_id,
+            ],
         ).exit_code
         == 0
     )
@@ -482,11 +585,14 @@ def test_tag_suggestions_prioritize_title_text_then_similar_meeting(
     index_semantic_embeddings(index_path, embedding_provider=provider)
     service = TagService(IndexRepository(index_path, state_path=state_path))
     service.assign(
-        ("2",),
+        (indexed_ref(service.index_repository, 2),),
         ("Launch Planning", "pricing decision", "migration-team"),
     )
 
-    suggestions = service.suggest("1", embedding_provider=provider)
+    suggestions = service.suggest(
+        indexed_ref(service.index_repository, 1),
+        embedding_provider=provider,
+    )
 
     assert [
         (item.tag.display_name, item.reason, item.similar_meeting_id) for item in suggestions
@@ -547,9 +653,12 @@ def test_tag_suggestions_skip_all_target_chunks_to_find_another_meeting(
     provider = TargetBiasedEmbeddingProvider()
     index_semantic_embeddings(index_path, embedding_provider=provider)
     service = TagService(IndexRepository(index_path, state_path=state_path))
-    service.assign(("2",), ("private-label",))
+    service.assign((indexed_ref(service.index_repository, 2),), ("private-label",))
 
-    suggestions = service.suggest("1", embedding_provider=provider)
+    suggestions = service.suggest(
+        indexed_ref(service.index_repository, 1),
+        embedding_provider=provider,
+    )
 
     assert [(item.tag.display_name, item.similar_meeting_id) for item in suggestions] == [
         ("private-label", 2)
@@ -586,11 +695,14 @@ def test_tag_suggestions_fall_back_without_complete_semantic_index(
     state_path = tmp_path / "state.sqlite"
     MeetilySQLiteScanner(index_path, state_path=state_path).scan(meetily_db)
     service = TagService(IndexRepository(index_path, state_path=state_path))
-    service.assign(("2",), ("Launch Planning", "pricing decision", "migration-team"))
-    service.assign(("1",), ("pricing decision",))
+    service.assign(
+        (indexed_ref(service.index_repository, 2),),
+        ("Launch Planning", "pricing decision", "migration-team"),
+    )
+    service.assign((indexed_ref(service.index_repository, 1),), ("pricing decision",))
 
     suggestions = service.suggest(
-        "1",
+        indexed_ref(service.index_repository, 1),
         embedding_provider=ExplodingEmbeddingProvider(),
     )
 
@@ -612,10 +724,13 @@ def test_tag_suggestions_fall_back_when_ready_semantic_provider_fails(
         embedding_provider=LocalHashEmbeddingProvider(),
     )
     service = TagService(IndexRepository(index_path, state_path=state_path))
-    service.assign(("2",), ("Launch Planning", "migration-team"))
+    service.assign(
+        (indexed_ref(service.index_repository, 2),),
+        ("Launch Planning", "migration-team"),
+    )
 
     suggestions = service.suggest(
-        "1",
+        indexed_ref(service.index_repository, 1),
         embedding_provider=UnavailableHashProvider(),
     )
 
@@ -640,6 +755,8 @@ def test_cli_suggests_existing_tags_without_persisting_suggestions(
         ).exit_code
         == 0
     )
+    repository = IndexRepository.open_existing(index_path)
+    first_ref, second_ref = indexed_refs(repository, 1, 2)
     assert (
         runner.invoke(
             app,
@@ -648,8 +765,11 @@ def test_cli_suggests_existing_tags_without_persisting_suggestions(
                 str(index_path),
                 "tag",
                 "add",
-                "2",
                 "Launch Planning,pricing decision",
+                "--source-uuid",
+                second_ref.source_uuid,
+                "--external-id",
+                second_ref.external_id,
             ],
             env=env,
         ).exit_code
@@ -658,12 +778,22 @@ def test_cli_suggests_existing_tags_without_persisting_suggestions(
 
     suggested = runner.invoke(
         app,
-        ["--index", str(index_path), "tag", "suggest", "1"],
+        [
+            "--index",
+            str(index_path),
+            "tag",
+            "suggest",
+            "--source-uuid",
+            first_ref.source_uuid,
+            "--external-id",
+            first_ref.external_id,
+        ],
         env=env,
     )
 
     assert suggested.exit_code == 0
-    assert "Suggested tags for meeting #1:" in suggested.stdout
+    expected_header = f"Suggested tags for meeting {first_ref.source_uuid}/{first_ref.external_id}:"
+    assert expected_header in suggested.stdout
     assert "1. Launch Planning — title match" in suggested.stdout
     assert "2. pricing decision — text match" in suggested.stdout
     with sqlite3.connect(index_path.with_name("state.sqlite")) as conn:

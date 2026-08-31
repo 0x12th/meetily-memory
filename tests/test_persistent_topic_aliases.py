@@ -83,7 +83,7 @@ def index_topic_alias_rows(index_path: Path) -> list[tuple[object, ...]]:
         ).fetchall()
 
 
-def test_known_and_unknown_topic_and_graph_reads_leave_both_databases_unchanged(
+def test_known_and_unknown_topic_reads_leave_both_databases_unchanged(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
@@ -101,8 +101,6 @@ def test_known_and_unknown_topic_and_graph_reads_leave_both_databases_unchanged(
 
     known = core.topic("MOVE")
     unknown = core.topic("never-recorded-topic")
-    known_graph = core.graph("move")
-    unknown_graph = core.graph("never-recorded-topic")
 
     assert known.topic.title == "migration"
     assert known.topic.aliases == ("move",)
@@ -111,9 +109,6 @@ def test_known_and_unknown_topic_and_graph_reads_leave_both_databases_unchanged(
     assert unknown.topic.title == "never-recorded-topic"
     assert unknown.topic.aliases == ()
     assert unknown.structured_signals == ()
-    assert {node.type for node in known_graph.nodes} >= {"Topic", "Task"}
-    assert unknown_graph.topic.title == "never-recorded-topic"
-    assert {node.type for node in unknown_graph.nodes} == {"Topic"}
 
     after = (
         database_snapshot(index_path, INDEX_ROW_QUERIES),
@@ -132,13 +127,12 @@ def test_alias_add_command_and_explicit_delete_only_mutate_state(
     index_before_add = database_snapshot(index_path, INDEX_ROW_QUERIES)
     state_before_add = database_snapshot(state_path, STATE_ROW_QUERIES)
 
-    result = CliRunner().invoke(
-        app,
-        ["--index", str(index_path), "t", "migration", "--alias", "Move"],
+    result = MeetilyMemoryCore(index_path, state_path=state_path).add_topic_alias(
+        "migration",
+        ["Move"],
     )
 
-    assert result.exit_code == 0, result.output
-    assert "alias added: Move -> migration" in result.stdout
+    assert result.added_aliases == ("Move",)
     assert database_snapshot(index_path, INDEX_ROW_QUERIES) == index_before_add
     assert database_snapshot(state_path, STATE_ROW_QUERIES) != state_before_add
     assert [row[6:8] for row in state_topic_alias_rows(state_path)] == [("Move", "move")]
@@ -214,20 +208,10 @@ def test_default_and_workspace_topic_alias_state_remain_isolated(
     assert global_scan.exit_code == 0, global_scan.output
     assert workspace_scan.exit_code == 0, workspace_scan.output
 
-    global_add = runner.invoke(
-        app,
-        ["t", "migration", "--alias", "global-only", "--json"],
-        env={"MEETILY_MEMORY_DATA_DIR": str(global_dir)},
-    )
-    workspace_add = runner.invoke(
-        app,
-        ["--index", str(workspace_index), "t", "migration", "--alias", "workspace-only", "--json"],
-    )
-    assert global_add.exit_code == 0, global_add.output
-    assert workspace_add.exit_code == 0, workspace_add.output
-
     global_core = MeetilyMemoryCore(global_index, state_path=global_state)
     workspace_core = MeetilyMemoryCore(workspace_index, state_path=workspace_state)
+    global_core.add_topic_alias("migration", ["global-only"])
+    workspace_core.add_topic_alias("migration", ["workspace-only"])
     assert global_core.topic("global-only").topic.title == "migration"
     assert workspace_core.topic("workspace-only").topic.title == "migration"
     assert global_core.topic("workspace-only").topic.title == "workspace-only"
@@ -371,7 +355,7 @@ def test_topics_keeps_index_topic_backed_by_current_knowledge_relationship(
     assert [(topic.title, topic.aliases) for topic in topics] == [("Derived", ())]
 
 
-def test_state_only_topic_ids_are_deterministic_unique_and_graph_safe(
+def test_state_only_topic_ids_are_deterministic_and_unique(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
@@ -391,23 +375,11 @@ def test_state_only_topic_ids_are_deterministic_unique_and_graph_safe(
         topic.title: topic.id
         for topic in MeetilyMemoryCore(index_path, state_path=state_path).topics()
     }
-    graph = core.graph("MOVE")
 
     assert first == second
     assert set(first) == {"migration", "Architecture"}
     assert len(set(first.values())) == len(first)
     assert all(topic_id <= -(1 << 62) for topic_id in first.values())
-    assert graph.topic.id == first["migration"]
-    node_ids = [node.id for node in graph.nodes]
-    edge_ids = [edge.id for edge in graph.edges]
-    assert len(node_ids) == len(set(node_ids))
-    assert len(edge_ids) == len(set(edge_ids))
-    assert {
-        endpoint for edge in graph.edges for endpoint in (edge.from_node_id, edge.to_node_id)
-    }.issubset(node_ids)
-    assert all(
-        edge.to_node_id == graph.topic.id for edge in graph.edges if edge.relation == "belongs_to"
-    )
     assert (
         database_snapshot(index_path, INDEX_ROW_QUERIES),
         database_snapshot(state_path, STATE_ROW_QUERIES),

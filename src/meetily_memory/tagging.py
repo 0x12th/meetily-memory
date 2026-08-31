@@ -443,28 +443,28 @@ class TagService:
 
     def assign(
         self,
-        meeting_ids: tuple[str, ...],
+        meeting_refs: tuple[MeetingRef, ...],
         tag_names: tuple[str, ...],
     ) -> TagMutationResult:
-        identities = self._resolve_meetings(meeting_ids)
+        self._require_meetings(meeting_refs)
         self._require_tags(tag_names)
         return self.repository.assign_many(
-            identities,
+            meeting_refs,
             tag_names,
             now=self.index_repository.utc_now(),
         )
 
     def remove(
         self,
-        meeting_ids: tuple[str, ...],
+        meeting_refs: tuple[MeetingRef, ...],
         tag_names: tuple[str, ...],
     ) -> TagMutationResult:
-        identities = self._resolve_meetings(meeting_ids)
+        self._require_meetings(meeting_refs)
         self._require_tags(tag_names)
-        return self.repository.remove_many(identities, tag_names)
+        return self.repository.remove_many(meeting_refs, tag_names)
 
-    def list_for_meeting(self, meeting_id: str) -> tuple[Tag, ...]:
-        identity = self._resolve_meetings((meeting_id,))[0]
+    def list_for_meeting(self, identity: MeetingRef) -> tuple[Tag, ...]:
+        self._require_meetings((identity,))
         return self.repository.list_for_meeting(
             identity.source_uuid,
             identity.meeting_external_id,
@@ -489,14 +489,13 @@ class TagService:
 
     def suggest(
         self,
-        meeting_id: str,
+        identity: MeetingRef,
         *,
         embedding_provider: EmbeddingProvider | None = None,
     ) -> tuple[TagSuggestion, ...]:
-        identity = self._resolve_meetings((meeting_id,))[0]
         meeting = self.index_repository.get_meeting_by_ref(identity)
         if meeting is None:
-            message = f"Meeting not found: {meeting_id}"
+            message = f"Meeting not found: {identity.source_uuid}/{identity.external_id}"
             raise ValueError(message)
         assigned = {
             tag.normalized_name
@@ -651,39 +650,16 @@ class TagService:
         refs = tuple(dict.fromkeys(assignment.identity for assignment in assignments))
         return frozenset(self.index_repository.get_meetings_by_refs(refs))
 
-    def _resolve_meetings(
-        self,
-        meeting_ids: tuple[str, ...],
-    ) -> tuple[MeetingRef, ...]:
-        if not meeting_ids:
-            message = "No meeting IDs provided."
+    def _require_meetings(self, meeting_refs: tuple[MeetingRef, ...]) -> None:
+        if not meeting_refs:
+            message = "No meeting references provided."
             raise ValueError(message)
-        parsed: list[tuple[str, int]] = []
-        missing: list[str] = []
-        for meeting_id in meeting_ids:
-            try:
-                parsed.append((meeting_id, int(meeting_id)))
-            except ValueError:
-                missing.append(meeting_id)
-        meetings = self.index_repository.get_meetings_by_local_ids(
-            tuple(local_id for _, local_id in parsed)
-        )
-        resolved: list[MeetingRef] = []
-        for meeting_id, local_id in parsed:
-            meeting = meetings.get(local_id)
-            if meeting is None:
-                missing.append(meeting_id)
-                continue
-            resolved.append(
-                MeetingRef(
-                    source_uuid=str(meeting["source_uuid"]),
-                    external_id=str(meeting["external_id"]),
-                )
-            )
+        meetings = self.index_repository.get_meetings_by_refs(meeting_refs)
+        missing = tuple(ref for ref in meeting_refs if ref not in meetings)
         if missing:
-            message = f"Meetings not found: {', '.join(missing)}"
+            labels = ", ".join(f"{ref.source_uuid}/{ref.external_id}" for ref in missing)
+            message = f"Meetings not found: {labels}"
             raise ValueError(message)
-        return tuple(resolved)
 
     def _require_tags(self, tag_names: tuple[str, ...]) -> None:
         if normalize_tags(tag_names):

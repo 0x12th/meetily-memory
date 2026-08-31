@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 
-from meetily_memory.context_builder import build_context_markdown
 from meetily_memory.db.migrations import (
     CURRENT_SCHEMA_VERSION,
     LATEST_IN_PLACE_SCHEMA_VERSION,
@@ -190,12 +189,6 @@ def test_scan_indexes_meetily_rows_with_upstream_ids(meetily_db: Path, tmp_path:
 
     question_results = repo.search("What was the pricing decision?")
     assert question_results[0]["meeting_external_id"] == "meeting-1"
-
-    context = build_context_markdown("What was the pricing decision?", question_results)
-    assert context.startswith("# Question\n\nWhat was the pricing decision?")
-    assert "## Meeting: Launch Planning" in context
-    assert "### Relevant excerpt" in context
-    assert context.endswith("# Question\n\nWhat was the pricing decision?\n")
 
 
 def test_fts_query_filters_natural_language_noise() -> None:

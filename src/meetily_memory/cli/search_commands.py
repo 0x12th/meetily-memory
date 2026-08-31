@@ -14,17 +14,10 @@ from meetily_memory.cli.common import (
     print_json,
     print_text_block,
     read_repository_from_context,
-    ui_language_from_context,
 )
-from meetily_memory.cli.renderers import print_topic_memory
-from meetily_memory.context_builder import DEFAULT_CONTEXT_LIMIT, ContextRenderer
 from meetily_memory.domain import AmbiguousMeetingError, MeetingRef, MeetingSearchFilters
 from meetily_memory.open_commands import stable_meeting_open_command
-from meetily_memory.serializers import (
-    meeting_search_result_payload,
-    topic_alias_payload,
-    topic_memory_payload,
-)
+from meetily_memory.serializers import meeting_search_result_payload
 
 app = make_typer("Search and context commands.")
 
@@ -154,57 +147,9 @@ def print_search_excerpt(result: dict[str, object]) -> None:
     console.print()
 
 
-@app.command("c", hidden=True)
-def context(
-    ctx: typer.Context,
-    question: str,
-    limit: Annotated[int, typer.Option("--limit", "-n")] = DEFAULT_CONTEXT_LIMIT,
-    context: Annotated[
-        int,
-        typer.Option("--context", help="Adjacent chunks around each lexical match."),
-    ] = 0,
-) -> None:
-    bundle = core_from_context(ctx).build_context(question, limit, context=context)
-    print_text_block(ContextRenderer().render(bundle))
-
-
-@app.command("t", hidden=True)
-def topic_memory(
-    ctx: typer.Context,
-    query: str,
-    alias: Annotated[
-        list[str] | None,
-        typer.Option("--alias", help="Add an alias for this topic."),
-    ] = None,
-    limit: Annotated[int, typer.Option("--limit", "-n")] = 10,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
-) -> None:
-    core = core_from_context(ctx)
-    if alias:
-        alias_result = core.add_topic_alias(query, alias)
-        if json_output:
-            print_json(topic_alias_payload(alias_result))
-            return
-        for added_alias in alias_result.added_aliases:
-            print_text_block(f"alias added: {added_alias} -> {alias_result.topic.title}")
-    memory = topic_memory_payload(core.topic(query, limit))
-    if json_output:
-        print_json(memory)
-        return
-    memory["ui_language"] = ui_language_from_context(ctx)
-    print_topic_memory(memory)
-
-
-app.command("topic", hidden=True)(topic_memory)
-
-
 @app.command("open")
 def open_command(
     ctx: typer.Context,
-    meeting_id: Annotated[
-        int | None,
-        typer.Argument(help="Generation-local integer meeting ID."),
-    ] = None,
     source: Annotated[bool, typer.Option("--source", help="Open the indexed source path.")] = False,
     print_path: Annotated[
         bool,
@@ -221,16 +166,10 @@ def open_command(
 ) -> None:
     """Open the original meeting folder."""
     repo = read_repository_from_context(ctx)
-    if meeting_id is not None and (source_uuid is not None or external_id is not None):
-        message = "Use either a local meeting ID or --external-id/--source-uuid."
-        raise typer.BadParameter(message)
     if source_uuid is not None and external_id is None:
         message = "--source-uuid requires --external-id."
         raise typer.BadParameter(message)
-    if meeting_id is not None:
-        meeting = repo.get_meeting_by_local_id(meeting_id)
-        display_id = str(meeting_id)
-    elif external_id is not None and source_uuid is not None:
+    if external_id is not None and source_uuid is not None:
         meeting = repo.get_meeting_by_ref(MeetingRef(source_uuid, external_id))
         display_id = f"{source_uuid}/{external_id}"
     elif external_id is not None:
@@ -240,7 +179,7 @@ def open_command(
             raise typer.BadParameter(str(exc)) from exc
         display_id = external_id
     else:
-        message = "Provide a local meeting ID or --external-id."
+        message = "Provide --external-id and optionally --source-uuid."
         raise typer.BadParameter(message)
     if not meeting:
         message = f"Meeting not found: {display_id}"

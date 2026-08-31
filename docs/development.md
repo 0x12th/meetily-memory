@@ -3,8 +3,8 @@
 See [Retrieval evaluation](evaluation.md) for the reproducible FTS5 quality baseline and paired
 comparison workflow.
 
-See [Core contracts and persistent user state](contracts.md) for v1/v2 compatibility and the
-schema-v4 user-state migration boundary.
+See [Runtime contracts and persistent identity](contracts.md) for the current Core, storage, refresh,
+and stable-identity boundaries.
 
 An explicit `--index` without `MEETILY_MEMORY_DATA_DIR` uses `settings.json` beside that index.
 This keeps temporary CLI workspaces and tests from changing the default desktop configuration.

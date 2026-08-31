@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Remove MCP, background autosync, and the context/topic command families from the installed runtime.
+- Require stable source-aware meeting references for generated open commands and tag mutations;
+  generation-local numeric IDs are no longer accepted by those interfaces.
+- Keep lexical search, neighboring-chunk expansion, date filters, manual tags, and the hidden advanced
+  Obsidian integration on the current incremental index architecture.
+
 ## 0.7.0 - 2026-08-29
 
 - Make meeting and evidence identity source-aware, canonicalize source paths, and rebuild disposable

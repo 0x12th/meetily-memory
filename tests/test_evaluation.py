@@ -175,7 +175,10 @@ def test_evaluation_supports_tag_only_meeting_results_and_fingerprints_tag_state
         ),
     )
     before = evaluate_retrieval(dataset, index_path, limit=5)
-    TagService(IndexRepository(index_path)).assign(("2",), ("private-label",))
+    repository = IndexRepository(index_path)
+    meeting_ref = repository.meeting_ref_for_local_id(2)
+    assert meeting_ref is not None
+    TagService(repository).assign((meeting_ref,), ("private-label",))
 
     report = evaluate_retrieval(
         dataset,

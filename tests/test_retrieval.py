@@ -9,10 +9,8 @@ from typing import override
 import pytest
 
 from meetily_memory import retrieval
-from meetily_memory.context_builder import ContextRenderer
 from meetily_memory.core import MeetilyMemoryCore
 from meetily_memory.domain import (
-    ContextBundle,
     MeetingSearchFilters,
     MeetingSearchResult,
     RetrievalSource,
@@ -265,7 +263,7 @@ def test_fts_date_filter_is_applied_before_candidate_limit(
     assert filtered[0].meeting.external_id == "meeting-2"
 
 
-def test_selected_strategy_drives_only_explicit_v3_search(
+def test_selected_strategy_drives_search(
     meetily_db: Path,
     tmp_path: Path,
 ) -> None:
@@ -278,14 +276,9 @@ def test_selected_strategy_drives_only_explicit_v3_search(
     )
 
     search = core.search("query ignored by strategy")
-    bundle = core.build_context("migration risks")
-    context = core.build_context("migration risks")
 
     assert search.results[0].evidence == (lexical_hit,)
     assert search.results[0].match_sources == (RetrievalSource.FTS,)
-    assert bundle.evidence[0].excerpt.chunk_external_id == "transcript-2"
-    assert bundle.evidence != (lexical_hit,)
-    assert context == bundle
 
 
 def test_tag_retrieval_strategy_keeps_lookup_behind_strategy_boundary(
@@ -302,30 +295,6 @@ def test_tag_retrieval_strategy_keeps_lookup_behind_strategy_boundary(
     assert [(match.meeting_external_id, match.kind) for match in matches] == [
         ("meeting-1", "token")
     ]
-
-
-def test_context_renderer_uses_context_bundle_without_storage_rows(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    MeetilySQLiteScanner(index_path).scan(meetily_db)
-    hits = IndexRepository(index_path).search_hits("migration risks", limit=1, context=1)
-    bundle = ContextBundle(
-        question="Who owns migration risks?",
-        evidence=hits,
-        entities=(),
-    )
-
-    markdown = ContextRenderer().render(bundle)
-
-    assert markdown.startswith("# Question\n\nWho owns migration risks?")
-    assert "## Meeting: Dobrynya Follow-up" in markdown
-    assert f"Source UUID: {hits[0].meeting.ref.source_uuid}" in markdown
-    assert "/meeting-2 / transcript-2" in markdown
-    assert "Dobrynya agreed to send migration risks by Friday." in markdown
-    assert "Evidence role: neighboring context" in markdown
-    assert markdown.endswith("# Question\n\nWho owns migration risks?\n")
 
 
 def test_hybrid_strategy_fuses_ranks_without_polluting_search_hits(
@@ -367,11 +336,14 @@ def test_hybrid_strategy_uses_tags_as_a_meeting_level_rrf_source(
 ) -> None:
     index_path = tmp_path / "index.sqlite"
     MeetilySQLiteScanner(index_path).scan(meetily_db)
-    migration_hit = IndexRepository(index_path).search_hits("migration risks", 1)[0]
-    pricing_hit = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
-    TagService(IndexRepository(index_path)).assign(("1",), ("project-history",))
+    repository = IndexRepository(index_path)
+    migration_hit = repository.search_hits("migration risks", 1)[0]
+    pricing_hit = repository.search_hits("pricing decision", 1)[0]
+    meeting_ref = repository.meeting_ref_for_local_id(1)
+    assert meeting_ref is not None
+    TagService(repository).assign((meeting_ref,), ("project-history",))
     strategy = retrieval.HybridRetrievalStrategy(
-        repository=IndexRepository(index_path),
+        repository=repository,
         lexical=FixedRetrievalStrategy((migration_hit, pricing_hit)),
         semantic=FixedRetrievalStrategy((migration_hit, pricing_hit)),
         tags=retrieval.TagRetrievalStrategy(TagRepository(IndexRepository(index_path).state_path)),
@@ -465,7 +437,9 @@ def test_hybrid_strategy_keeps_lexical_and_tag_results_when_query_prepare_fails(
         embedding_provider=LocalHashEmbeddingProvider(),
     )
     repository = IndexRepository(index_path)
-    TagService(repository).assign(("1",), ("migration risks",))
+    meeting_ref = repository.meeting_ref_for_local_id(1)
+    assert meeting_ref is not None
+    TagService(repository).assign((meeting_ref,), ("migration risks",))
     provider = FailingQueryEmbeddingProvider()
     strategy = retrieval.HybridRetrievalStrategy(
         repository=repository,
