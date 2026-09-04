@@ -120,9 +120,11 @@ jobs:
             "meetily-memory-${RELEASE_TAG}-macos-arm64.tar.gz.sha256" \
             "meetily-memory-${RELEASE_TAG}-macos-x86_64.tar.gz.sha256" \
             > SHA256SUMS
+      - name: Extract release notes
+        run: scripts/extract-release-notes.py "$RELEASE_TAG" target/release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG.md
+          body_path: target/release-notes.md
           files: |
             target/release-assets/meetily-memory-${{ env.RELEASE_TAG }}-macos-arm64.tar.gz
             target/release-assets/meetily-memory-${{ env.RELEASE_TAG }}-macos-x86_64.tar.gz
