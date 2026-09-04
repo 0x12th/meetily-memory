@@ -24,10 +24,6 @@ def canonical_source_path(path: Path) -> Path:
     return Path(path).expanduser().resolve(strict=True)
 
 
-def app_config_path() -> Path:
-    return default_data_dir() / "settings.json"
-
-
 def candidate_meetily_db_paths(
     env: Mapping[str, str] | None = None,
     home: Path | None = None,

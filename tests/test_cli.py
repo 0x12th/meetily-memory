@@ -18,12 +18,12 @@ from meetily_memory.cli.search_commands import parse_search_filters
 from meetily_memory.config.settings import (
     ObsidianSettings,
     load_app_settings,
-    update_app_settings,
 )
 from meetily_memory.db.schema_family import INDEX_SCHEMA_USER_VERSION
 from meetily_memory.json_codec import loads_json
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.tagging import TagRepository
+from meetily_memory.user_state import UserStateRepository
 from tests.index_helpers import publish_fresh_index
 
 
@@ -178,10 +178,8 @@ def test_cli_config_language_persists_ui_language(tmp_path: Path) -> None:
 
     assert language.exit_code == 0
     assert "ui language: ru" in language.stdout
-    settings_path = index_path.with_name("settings.json")
     state_path = index_path.with_name("state.sqlite")
-    assert load_app_settings(settings_path).ui_language == "ru"
-    assert not settings_path.exists()
+    assert load_app_settings(state_path).ui_language == "ru"
     with sqlite3.connect(state_path) as connection:
         assert connection.execute("SELECT ui_language FROM app_settings").fetchone() == ("ru",)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
@@ -198,8 +196,7 @@ def test_cli_config_language_persists_ui_language(tmp_path: Path) -> None:
     )
     assert auto.exit_code == 0
     assert "ui language: auto" in auto.stdout
-    assert load_app_settings(settings_path).ui_language is None
-    assert not settings_path.exists()
+    assert load_app_settings(state_path).ui_language is None
     with sqlite3.connect(state_path) as connection:
         assert connection.execute("SELECT ui_language FROM app_settings").fetchone() == (None,)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
@@ -611,9 +608,9 @@ def test_cli_init_status_and_obsidian_sync(
     assert loads_json(obsidian_status.stdout) == {
         "vault_path": str(vault_dir),
         "folder": "Meetily Memory",
-        "last_sync_at": load_app_settings(data_dir / "settings.json").obsidian.last_sync_at,
+        "last_sync_at": load_app_settings(data_dir / "state.sqlite").obsidian.last_sync_at,
     }
-    assert load_app_settings(data_dir / "settings.json").obsidian.last_sync_at is not None
+    assert load_app_settings(data_dir / "state.sqlite").obsidian.last_sync_at is not None
 
     obsidian_sync = runner.invoke(
         app,
@@ -669,14 +666,14 @@ def test_refresh_keeps_successful_index_result_when_obsidian_sync_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     index_path = tmp_path / "index.sqlite"
-    settings_path = tmp_path / "settings.json"
+    state_path = tmp_path / "state.sqlite"
     runner = CliRunner()
     initialized = runner.invoke(
         app,
         ["--index", str(index_path), "init", "--source", str(meetily_db)],
     )
     assert initialized.exit_code == 0, initialized.output
-    update_app_settings(settings_path=settings_path, last_update_at="old")
+    UserStateRepository(state_path).record_refresh("old")
     before = index_path.read_bytes()
 
     def fail_sync(*_args: object, **_kwargs: object) -> None:
@@ -699,7 +696,7 @@ def test_refresh_keeps_successful_index_result_when_obsidian_sync_fails(
     assert refreshed.exit_code != 0
     assert "Index refresh unchanged; Obsidian sync failed" in str(refreshed.exception)
     assert index_path.read_bytes() == before
-    assert load_app_settings(settings_path).last_update_at != "old"
+    assert load_app_settings(state_path).last_update_at != "old"
 
 
 def test_cli_obsidian_uses_workspace_settings_scope_and_manual_sync(
@@ -708,17 +705,14 @@ def test_cli_obsidian_uses_workspace_settings_scope_and_manual_sync(
 ) -> None:
     workspace = tmp_path / "workspace"
     index_path = workspace / "index.sqlite"
-    workspace_settings = workspace / "settings.json"
+    workspace_state = workspace / "state.sqlite"
     global_data_dir = tmp_path / "global"
-    global_settings = global_data_dir / "settings.json"
+    global_state = global_data_dir / "state.sqlite"
     workspace_vault = tmp_path / "workspace-vault"
     global_vault = tmp_path / "global-vault"
     runner = CliRunner()
 
-    update_app_settings(
-        settings_path=global_settings,
-        obsidian=ObsidianSettings(vault_path=str(global_vault)),
-    )
+    UserStateRepository(global_state).set_obsidian_target(str(global_vault), "Meetily Memory")
 
     init = runner.invoke(
         app,
@@ -785,8 +779,8 @@ def test_cli_obsidian_uses_workspace_settings_scope_and_manual_sync(
     assert loads_json(scheduled.stdout)["changed"] is False
     assert meeting_note.exists()
 
-    workspace_config = load_app_settings(workspace_settings)
-    global_config = load_app_settings(global_settings)
+    workspace_config = load_app_settings(workspace_state)
+    global_config = load_app_settings(global_state)
     assert workspace_config.obsidian.vault_path == str(workspace_vault)
     assert workspace_config.obsidian.last_sync_at is not None
     assert global_config.obsidian == ObsidianSettings(vault_path=str(global_vault))

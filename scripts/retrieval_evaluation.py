@@ -59,7 +59,7 @@ class RetrievalStrategy(Protocol):
 
 
 class MeetingRetrievalStrategy(Protocol):
-    def search_meetings(
+    def search(
         self,
         query: str,
         limit: int = 10,
@@ -453,7 +453,7 @@ def retrieve_results(
     context: int,
 ) -> tuple[MeetingSearchResult, ...]:
     if config.meeting_strategy is not None:
-        return config.meeting_strategy.search_meetings(query, limit, context)
+        return config.meeting_strategy.search(query, limit, context)
     if config.strategy is not None:
         hits = config.strategy.search(query, limit)
         if context:

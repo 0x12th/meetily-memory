@@ -1,6 +1,6 @@
 [project]
 name = "meetily-memory"
-version = "0.7.0"
+version = "0.8.0"
 description = "Search past Meetily meetings locally and open the original"
 readme = "README.md"
 requires-python = ">=3.12"

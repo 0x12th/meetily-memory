@@ -8,11 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from meetily_memory.config.paths import canonical_source_path
-from meetily_memory.db.row_decode import (
-    decode_nullable_integer,
-    decode_required_integer,
-    decode_required_text,
-)
+from meetily_memory.db.row_decode import decode_required_integer, decode_required_text
 from meetily_memory.db.schema import IndexReadError, missing_user_state_message
 from meetily_memory.db.schema_family import STATE_SCHEMA_USER_VERSION
 from meetily_memory.db.state_schema import (
@@ -111,34 +107,14 @@ class UserStateRepository:
                     context="existing source lookup",
                     error_type=StateSchemaError,
                 )
-            projected_owner = conn.execute(
-                "SELECT uuid FROM sources WHERE kind = ? AND projected_path = ?",
-                (kind, path),
-            ).fetchone()
-            if projected_owner is not None:
-                projected_owner_uuid = decode_required_text(
-                    projected_owner["uuid"],
-                    table="sources",
-                    column="uuid",
-                    context="pending index projection lookup",
-                    error_type=StateSchemaError,
-                )
-                message = (
-                    "Source path is still reserved by a pending index projection for UUID "
-                    f"{projected_owner_uuid}."
-                )
-                raise AmbiguousSourceIdentityError(
-                    message,
-                    source_uuids=(projected_owner_uuid,),
-                )
             source_uuid = str(uuid.uuid4())
             conn.execute(
                 """
                 INSERT INTO sources (
-                  uuid, kind, current_path, created_at, updated_at, projected_path
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                  uuid, kind, current_path, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (source_uuid, kind, path, now, now, path),
+                (source_uuid, kind, path, now, now),
             )
             conn.commit()
             return source_uuid
@@ -162,16 +138,16 @@ class UserStateRepository:
                 )
                 conn.commit()
                 return source_uuid
-            _require_unreserved_projection_path(conn, kind, canonical_path)
+            _require_unclaimed_source_path(conn, kind, canonical_path)
             source_uuid = str(uuid.uuid4())
             canonical_string = str(canonical_path)
             conn.execute(
                 """
                 INSERT INTO sources (
-                  uuid, kind, current_path, created_at, updated_at, projected_path
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                  uuid, kind, current_path, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (source_uuid, kind, canonical_string, now, now, canonical_string),
+                (source_uuid, kind, canonical_string, now, now),
             )
             conn.commit()
             return source_uuid
@@ -192,8 +168,7 @@ class UserStateRepository:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT uuid, kind, current_path, revision,
-                       projected_path, pending_revision, updated_at
+                SELECT uuid, kind, current_path, revision, updated_at
                 FROM sources WHERE uuid = ?
                 """,
                 (source_uuid,),
@@ -204,8 +179,7 @@ class UserStateRepository:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT s.uuid, s.kind, s.current_path, s.revision,
-                       s.projected_path, s.pending_revision, s.updated_at
+                SELECT s.uuid, s.kind, s.current_path, s.revision, s.updated_at
                 FROM app_settings a
                 JOIN sources s ON s.uuid = a.source_uuid
                 WHERE a.singleton = 1
@@ -227,10 +201,9 @@ class UserStateRepository:
                 """
                 SELECT 1
                 FROM sources
-                WHERE uuid = ? AND kind = ? AND current_path = ? AND projected_path = ?
-                  AND revision = ? AND pending_revision IS NULL
+                WHERE uuid = ? AND kind = ? AND current_path = ? AND revision = ?
                 """,
-                (source_uuid, kind, current_path, current_path, revision),
+                (source_uuid, kind, current_path, revision),
             ).fetchone()
             return row is not None
 
@@ -238,16 +211,16 @@ class UserStateRepository:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             source = conn.execute(
-                "SELECT 1 FROM sources WHERE uuid = ? AND pending_revision IS NULL",
+                "SELECT 1 FROM sources WHERE uuid = ?",
                 (source_uuid,),
             ).fetchone()
             if source is None:
-                message = f"Source UUID is missing or has a pending relocation: {source_uuid}."
+                message = f"Source UUID is missing: {source_uuid}."
                 raise ValueError(message)
             cursor = conn.execute(
                 """
                 UPDATE app_settings
-                SET source_uuid = ?, source_path = NULL
+                SET source_uuid = ?
                 WHERE singleton = 1
                 """,
                 (source_uuid,),
@@ -276,19 +249,15 @@ class UserStateRepository:
             cursor = conn.execute(
                 """
                 UPDATE sources
-                SET current_path = ?, projected_path = ?, updated_at = ?, revision = ?,
-                    pending_revision = NULL
-                WHERE uuid = ? AND kind = ? AND current_path = ? AND projected_path = ?
-                  AND revision = ? AND pending_revision IS NULL
+                SET current_path = ?, updated_at = ?, revision = ?
+                WHERE uuid = ? AND kind = ? AND current_path = ? AND revision = ?
                 """,
                 (
-                    canonical_string,
                     canonical_string,
                     now,
                     next_revision,
                     source_uuid,
                     kind,
-                    previous_path,
                     previous_path,
                     previous_revision,
                 ),
@@ -298,7 +267,7 @@ class UserStateRepository:
                 message = f"Source binding changed before relocating UUID {source_uuid}."
                 raise RuntimeError(message)
             selected = conn.execute(
-                "UPDATE app_settings SET source_uuid = ?, source_path = NULL WHERE singleton = 1",
+                "UPDATE app_settings SET source_uuid = ? WHERE singleton = 1",
                 (source_uuid,),
             )
             if selected.rowcount != 1:
@@ -319,32 +288,15 @@ class UserStateRepository:
             ).fetchall()
             return [_decode_source_identity(row, "source path lookup") for row in rows]
 
-    def get_sources_for_settings_path(self, kind: str, raw_path: str) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT uuid, kind, current_path, revision,
-                       projected_path, pending_revision, updated_at
-                FROM sources
-                WHERE kind = ? AND (
-                  current_path = ? OR (pending_revision IS NOT NULL AND projected_path = ?)
-                )
-                ORDER BY uuid
-                """,
-                (kind, raw_path, raw_path),
-            ).fetchall()
-            return [_decode_source_binding(row, "settings source path lookup") for row in rows]
-
     def update_source_path(self, source_uuid: str, path: str, *, now: str) -> None:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE sources
-                SET current_path = ?, projected_path = ?, pending_revision = NULL,
-                    updated_at = ?, revision = revision + 1
+                SET current_path = ?, updated_at = ?, revision = revision + 1
                 WHERE uuid = ?
                 """,
-                (path, path, now, source_uuid),
+                (path, now, source_uuid),
             )
             if cursor.rowcount != 1:
                 message = f"Persistent source not found: {source_uuid}"
@@ -359,21 +311,44 @@ class UserStateRepository:
                 raise StateSchemaError(message)
             return dict(row)
 
-    def replace_app_settings(self, values: dict[str, object]) -> None:
+    def set_ui_language(self, language: str | None) -> None:
+        self._update_app_settings("ui_language = ?", (language,))
+
+    def record_refresh(self, refreshed_at: str) -> None:
+        self._update_app_settings("last_update_at = ?", (refreshed_at,))
+
+    def set_obsidian_target(self, vault_path: str | None, folder: str) -> None:
+        self._update_app_settings(
+            "obsidian_vault_path = ?, obsidian_folder = ?, obsidian_last_sync_at = NULL",
+            (vault_path, folder),
+        )
+
+    def record_obsidian_sync(
+        self,
+        expected_vault_path: str | None,
+        expected_folder: str,
+        synced_at: str,
+    ) -> bool:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 """
                 UPDATE app_settings
-                SET source_uuid = :source_uuid,
-                    source_path = :source_path,
-                    ui_language = :ui_language,
-                    last_update_at = :last_update_at,
-                    obsidian_vault_path = :obsidian_vault_path,
-                    obsidian_folder = :obsidian_folder,
-                    obsidian_last_sync_at = :obsidian_last_sync_at
+                SET obsidian_last_sync_at = ?
                 WHERE singleton = 1
+                  AND obsidian_vault_path IS ?
+                  AND obsidian_folder = ?
                 """,
+                (synced_at, expected_vault_path, expected_folder),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def _update_app_settings(self, assignments: str, values: tuple[object, ...]) -> None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                f"UPDATE app_settings SET {assignments} WHERE singleton = 1",  # noqa: S608
                 values,
             )
             if cursor.rowcount != 1:
@@ -483,36 +458,6 @@ def find_existing_source_by_canonical_path(
     return UserStateRepository.open_existing(state_path).get_source_by_canonical_path(kind, path)
 
 
-def find_existing_source_for_settings_path(
-    state_path: Path,
-    kind: str,
-    raw_path: str,
-) -> dict[str, Any] | None:
-    state_path = Path(state_path)
-    if not state_path.is_file():
-        return None
-    rows = UserStateRepository.open_existing(state_path).get_sources_for_settings_path(
-        kind,
-        raw_path,
-    )
-    if len(rows) > 1:
-        source_uuids = tuple(
-            decode_required_text(
-                row["uuid"],
-                table="sources",
-                column="uuid",
-                context="settings source ambiguity check",
-                error_type=StateSchemaError,
-            )
-            for row in rows
-        )
-        message = (
-            f"Settings path {raw_path} maps to multiple source UUIDs: {', '.join(source_uuids)}."
-        )
-        raise AmbiguousSourceIdentityError(message, source_uuids=source_uuids)
-    return rows[0] if rows else None
-
-
 def _source_path_claims(
     conn: sqlite3.Connection,
     kind: str,
@@ -520,8 +465,7 @@ def _source_path_claims(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows = conn.execute(
         """
-        SELECT uuid, kind, current_path, revision,
-               projected_path, pending_revision, updated_at
+        SELECT uuid, kind, current_path, revision, updated_at
         FROM sources WHERE kind = ? ORDER BY uuid
         """,
         (kind,),
@@ -537,8 +481,7 @@ def _source_target_claims(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows = conn.execute(
         """
-        SELECT uuid, kind, current_path, revision,
-               projected_path, pending_revision, updated_at
+        SELECT uuid, kind, current_path, revision, updated_at
         FROM sources WHERE kind = ? ORDER BY uuid
         """,
         (kind,),
@@ -548,17 +491,16 @@ def _source_target_claims(
     collision_hints: dict[str, dict[str, Any]] = {}
     for raw_row in rows:
         row = _decode_source_binding(raw_row, "source claim target classification")
-        stored_paths = {row["current_path"], row["projected_path"]}
-        for stored_string in stored_paths:
-            if stored_string == canonical_string:
-                exact[row["uuid"]] = row
-                continue
-            try:
-                resolved_stored_path = canonical_source_path(Path(stored_string))
-            except (OSError, RuntimeError):
-                continue
-            if resolved_stored_path == canonical_path:
-                collision_hints[row["uuid"]] = row
+        stored_string = row["current_path"]
+        if stored_string == canonical_string:
+            exact[row["uuid"]] = row
+            continue
+        try:
+            resolved_stored_path = canonical_source_path(Path(stored_string))
+        except (OSError, RuntimeError):
+            continue
+        if resolved_stored_path == canonical_path:
+            collision_hints[row["uuid"]] = row
     return list(exact.values()), list(collision_hints.values())
 
 
@@ -569,8 +511,7 @@ def _require_source_binding(
 ) -> dict[str, Any]:
     source = conn.execute(
         """
-        SELECT uuid, kind, current_path, updated_at, revision,
-               projected_path, pending_revision
+        SELECT uuid, kind, current_path, updated_at, revision
         FROM sources WHERE uuid = ?
         """,
         (source_uuid,),
@@ -604,7 +545,7 @@ def _require_available_claim_target(
         raise AmbiguousSourceIdentityError(message, source_uuids=conflicting_uuids)
 
 
-def _require_unreserved_projection_path(
+def _require_unclaimed_source_path(
     conn: sqlite3.Connection,
     kind: str,
     canonical_path: Path,
@@ -707,20 +648,6 @@ def _decode_source_binding(row: sqlite3.Row, context: str) -> dict[str, Any]:
                 row["revision"],
                 table="sources",
                 column="revision",
-                context=context,
-                error_type=StateSchemaError,
-            ),
-            "projected_path": decode_required_text(
-                row["projected_path"],
-                table="sources",
-                column="projected_path",
-                context=context,
-                error_type=StateSchemaError,
-            ),
-            "pending_revision": decode_nullable_integer(
-                row["pending_revision"],
-                table="sources",
-                column="pending_revision",
                 context=context,
                 error_type=StateSchemaError,
             ),

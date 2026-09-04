@@ -10,7 +10,6 @@ from meetily_memory.cli.lifecycle_commands import config_app, db_app
 from meetily_memory.cli.obsidian_commands import obsidian_app
 from meetily_memory.cli.search_commands import app as search_app
 from meetily_memory.cli.tag_commands import tag_app
-from meetily_memory.config.paths import app_config_path
 
 app = make_typer(
     "Local search over Meetily meeting history.\n\n"
@@ -49,10 +48,10 @@ def callback(
 ) -> None:
     del version_output
     index_path = index_option(index)
-    settings_path = app_config_path() if index is None else index_path.with_name("settings.json")
+    state_path = index_path.with_name("state.sqlite")
     ctx.obj = {
         "index_path": index_path,
-        "settings_path": settings_path,
+        "state_path": state_path,
         "index_explicit": index is not None,
     }
 

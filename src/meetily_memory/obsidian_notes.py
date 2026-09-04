@@ -15,26 +15,12 @@ from meetily_memory.repositories.snapshot import SnapshotRepository
 
 OBSIDIAN_MARKER_VERSION = 2
 OBJECT_KEY_VERSION = 2
-LEGACY_OBSIDIAN_MARKER_VERSION = 1
-LEGACY_OBJECT_KEY_VERSION = 1
 OBSIDIAN_DIRS = ("Meetings", "Tags")
-LEGACY_OBSIDIAN_DIRS = (
-    "Topics",
-    "People",
-    "Tasks",
-    "Decisions",
-    "Risks",
-    "Questions",
-)
-OBSIDIAN_SCAN_DIRS = OBSIDIAN_DIRS + LEGACY_OBSIDIAN_DIRS
 MANAGED_MARKER = f"<!-- meetily-memory:managed:v{OBSIDIAN_MARKER_VERSION}:"
 MANAGED_MARKER_RE = re.compile(
     rf"^<!-- meetily-memory:managed:v{OBSIDIAN_MARKER_VERSION}:([A-Za-z0-9_-]+) -->$"
 )
-LEGACY_MANAGED_MARKER_RE = re.compile(
-    rf"^<!-- meetily-memory:managed:v{LEGACY_OBSIDIAN_MARKER_VERSION}:"
-    r"([A-Za-z0-9_-]+) -->$"
-)
+
 MAX_FILENAME_COMPONENT_BYTES = 255
 NOTE_EXTENSION = ".md"
 SUFFIX_DIGEST_HEX_LENGTH = 20
@@ -48,31 +34,9 @@ WINDOWS_RESERVED_NAMES = frozenset(
     | {f"com{number}" for number in range(1, 10)}
     | {f"lpt{number}" for number in range(1, 10)}
 )
-ENTITY_DIRS = {
-    "action_items": "Tasks",
-    "decisions": "Decisions",
-    "risks": "Risks",
-    "open_questions": "Questions",
-}
 IDENTITY_SCHEMAS = {
     "meeting": frozenset({"version", "kind", "source_uuid", "external_id"}),
     "tag": frozenset({"version", "kind", "normalized_name"}),
-}
-LEGACY_IDENTITY_SCHEMAS = {
-    "meeting": frozenset({"version", "kind", "source_uuid", "external_id"}),
-    "entity": frozenset(
-        {
-            "version",
-            "kind",
-            "source_uuid",
-            "meeting_external_id",
-            "chunk_evidence_id",
-            "entity_kind",
-            "stable_content_fingerprint",
-        }
-    ),
-    "topic": frozenset({"version", "kind", "stable_key"}),
-    "person": frozenset({"version", "kind", "stable_key"}),
 }
 
 
@@ -182,7 +146,6 @@ class PlannedNote:
 
 @dataclass(frozen=True)
 class _MarkerIdentity:
-    marker_version: int
     object_key: str
     payload: dict[object, object]
 
@@ -488,7 +451,7 @@ def preflight_obsidian_vault(
 
 def existing_managed_notes(root_dir: Path) -> dict[str, list[Path]]:
     notes: dict[str, list[Path]] = {}
-    for directory in OBSIDIAN_SCAN_DIRS:
+    for directory in OBSIDIAN_DIRS:
         directory_path = root_dir / directory
         if not directory_path.exists():
             continue
@@ -499,8 +462,7 @@ def existing_managed_notes(root_dir: Path) -> dict[str, list[Path]]:
             identity = owned_marker_identity(path, directory)
             if identity is None:
                 continue
-            object_key = migrated_object_key(identity)
-            notes.setdefault(object_key, []).append(path)
+            notes.setdefault(identity.object_key, []).append(path)
     return notes
 
 
@@ -509,30 +471,8 @@ def owned_marker_identity(path: Path, directory: str) -> _MarkerIdentity | None:
     if identity is None:
         return None
     kind = cast("str", identity.payload["kind"])
-    if identity.marker_version == OBSIDIAN_MARKER_VERSION:
-        expected_directory = "Meetings" if kind == "meeting" else "Tags"
-    elif kind == "meeting":
-        expected_directory = "Meetings"
-    elif kind == "topic":
-        expected_directory = "Topics"
-    elif kind == "person":
-        expected_directory = "People"
-    else:
-        expected_directory = ENTITY_DIRS[cast("str", identity.payload["entity_kind"])]
+    expected_directory = "Meetings" if kind == "meeting" else "Tags"
     return identity if directory == expected_directory else None
-
-
-def migrated_object_key(identity: _MarkerIdentity) -> str:
-    if (
-        identity.marker_version == LEGACY_OBSIDIAN_MARKER_VERSION
-        and identity.payload["kind"] == "meeting"
-    ):
-        return note_object_key(
-            "meeting",
-            source_uuid=cast("str", identity.payload["source_uuid"]),
-            external_id=cast("str", identity.payload["external_id"]),
-        )
-    return identity.object_key
 
 
 def writable_notes(
@@ -592,7 +532,7 @@ def stale_managed_notes(
 def existing_portable_path_keys(root_dir: Path) -> set[str]:
     return {
         portable_path_key(path)
-        for directory in OBSIDIAN_SCAN_DIRS
+        for directory in OBSIDIAN_DIRS
         if (directory_path := root_dir / directory).exists()
         for path in directory_path.iterdir()
     }
@@ -698,7 +638,7 @@ def portable_path_key(path: Path) -> str:
 
 def validate_obsidian_scan_directories(root_dir: Path) -> None:
     root = root_dir.resolve()
-    for directory in OBSIDIAN_SCAN_DIRS:
+    for directory in OBSIDIAN_DIRS:
         directory_path = root_dir / directory
         if directory_path.is_symlink():
             message = f"Obsidian snapshot directory must not be a symlink: {directory}"
@@ -718,33 +658,17 @@ def managed_object_key(path: Path) -> str | None:
 
 def object_key_from_note_text(text: str) -> str | None:
     identity = marker_identity_from_note_text(text)
-    if identity is None or identity.marker_version != OBSIDIAN_MARKER_VERSION:
-        return None
-    return identity.object_key
-
-
-def legacy_object_key_from_note_text(text: str) -> str | None:
-    identity = marker_identity_from_note_text(text)
-    if identity is None or identity.marker_version != LEGACY_OBSIDIAN_MARKER_VERSION:
-        return None
-    return identity.object_key
+    return identity.object_key if identity is not None else None
 
 
 def marker_identity_from_note_text(text: str) -> _MarkerIdentity | None:
     managed_lines = [line for line in text.splitlines() if line.startswith("<!-- meetily-memory:")]
     if len(managed_lines) != 1:
         return None
-    line = managed_lines[0]
-    current_match = MANAGED_MARKER_RE.fullmatch(line)
-    legacy_match = LEGACY_MANAGED_MARKER_RE.fullmatch(line)
-    if current_match is not None:
-        marker_version = OBSIDIAN_MARKER_VERSION
-        encoded = current_match.group(1)
-    elif legacy_match is not None:
-        marker_version = LEGACY_OBSIDIAN_MARKER_VERSION
-        encoded = legacy_match.group(1)
-    else:
+    match = MANAGED_MARKER_RE.fullmatch(managed_lines[0])
+    if match is None:
         return None
+    encoded = match.group(1)
     try:
         padding = "=" * (-len(encoded) % 4)
         object_key = base64.urlsafe_b64decode(f"{encoded}{padding}").decode()
@@ -752,23 +676,9 @@ def marker_identity_from_note_text(text: str) -> _MarkerIdentity | None:
     except (binascii.Error, ValueError, UnicodeDecodeError):
         return None
     canonical_encoded = base64.urlsafe_b64encode(object_key.encode()).decode().rstrip("=")
-    if canonical_encoded != encoded or not is_canonical_marker_payload(
-        object_key,
-        payload,
-        marker_version,
-    ):
+    if canonical_encoded != encoded or not is_canonical_object_key(object_key, payload=payload):
         return None
-    return _MarkerIdentity(marker_version, object_key, cast("dict[object, object]", payload))
-
-
-def is_canonical_marker_payload(object_key: str, payload: object, marker_version: int) -> bool:
-    if marker_version == OBSIDIAN_MARKER_VERSION:
-        valid = is_valid_identity_payload(payload)
-    elif marker_version == LEGACY_OBSIDIAN_MARKER_VERSION:
-        valid = is_valid_legacy_identity_payload(payload)
-    else:
-        return False
-    return valid and dumps_json(payload) == object_key
+    return _MarkerIdentity(object_key, cast("dict[object, object]", payload))
 
 
 def is_canonical_object_key(object_key: str, *, payload: object | None = None) -> bool:
@@ -781,13 +691,6 @@ def is_canonical_object_key(object_key: str, *, payload: object | None = None) -
 
 def is_valid_identity_payload(payload: object) -> bool:
     return is_valid_kind_payload(payload, OBJECT_KEY_VERSION, IDENTITY_SCHEMAS)
-
-
-def is_valid_legacy_identity_payload(payload: object) -> bool:
-    if not is_valid_kind_payload(payload, LEGACY_OBJECT_KEY_VERSION, LEGACY_IDENTITY_SCHEMAS):
-        return False
-    identity = cast("dict[object, object]", payload)
-    return identity["kind"] != "entity" or identity["entity_kind"] in ENTITY_DIRS
 
 
 def is_valid_kind_payload(

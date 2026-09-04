@@ -16,8 +16,8 @@ from meetily_memory.config.settings import load_app_settings
 autosync_app = make_typer("Manage periodic index refresh with macOS launchd.")
 
 
-def print_autosync_status(result: AutosyncStatus, settings_path: Path) -> None:
-    settings = load_app_settings(settings_path)
+def print_autosync_status(result: AutosyncStatus, state_path: Path) -> None:
+    settings = load_app_settings(state_path)
     payload = result.as_payload()
     print_text_block(f"autosync: {result.state}")
     print_text_block("scheduler: launchd")
@@ -48,7 +48,7 @@ def autosync_enable(
     if json_output:
         print_json(result.as_payload())
         return
-    print_autosync_status(result, ctx.obj["settings_path"])
+    print_autosync_status(result, ctx.obj["state_path"])
 
 
 @autosync_app.command("disable")
@@ -63,7 +63,7 @@ def autosync_disable(
     if json_output:
         print_json(result.as_payload())
         return
-    print_autosync_status(result, ctx.obj["settings_path"])
+    print_autosync_status(result, ctx.obj["state_path"])
 
 
 @autosync_app.command("status")
@@ -78,4 +78,4 @@ def autosync_status(
     if json_output:
         print_json(result.as_payload())
         return
-    print_autosync_status(result, ctx.obj["settings_path"])
+    print_autosync_status(result, ctx.obj["state_path"])

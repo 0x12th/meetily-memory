@@ -168,10 +168,7 @@ def fake_binary_source(version: str, mode: str) -> str:
                 connection.execute("CREATE TABLE smoke_rows (value TEXT NOT NULL)")
                 connection.execute("INSERT INTO smoke_rows VALUES ('synthetic')")
                 connection.commit()
-        (data_dir / "settings.json").write_text(
-            json.dumps({"source_uuid": "synthetic-source-uuid"}) + "\\n",
-            encoding="utf-8",
-        )
+
         print(json.dumps({
             "initialized": True,
             "index_path": str(index_path),

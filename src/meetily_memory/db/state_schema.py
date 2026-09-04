@@ -42,18 +42,12 @@ CREATE TABLE sources (
   created_at TEXT NOT NULL CHECK (length(created_at) > 0),
   updated_at TEXT NOT NULL CHECK (length(updated_at) > 0),
   revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
-  projected_path TEXT NOT NULL CHECK (length(projected_path) > 0),
-  pending_revision INTEGER,
-  UNIQUE (kind, current_path),
-  CHECK (pending_revision IS NULL OR pending_revision = revision)
+  UNIQUE (kind, current_path)
 );
-CREATE UNIQUE INDEX idx_sources_kind_projected_path
-ON sources(kind, projected_path);
 
 CREATE TABLE app_settings (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   source_uuid TEXT REFERENCES sources(uuid) ON DELETE RESTRICT,
-  source_path TEXT,
   ui_language TEXT CHECK (ui_language IS NULL OR ui_language IN ('en', 'ru')),
   last_update_at TEXT,
   obsidian_vault_path TEXT,

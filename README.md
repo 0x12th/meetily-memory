@@ -93,8 +93,7 @@ mm obsidian sync
 mm obsidian status
 ```
 
-Run `mm obsidian
---help` for the current commands.
+Run `mm obsidian --help` for the current commands.
 
 ## Troubleshooting and Help
 

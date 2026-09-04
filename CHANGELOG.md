@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-09-04
 
-- Remove MCP, background autosync, and the context/topic command families from the installed runtime.
+- Remove MCP and the context/topic command families from the installed runtime while retaining
+  periodic background refresh through the supported autosync commands.
 - Require stable source-aware meeting references for generated open commands and tag mutations;
   generation-local numeric IDs are no longer accepted by those interfaces.
 - Keep lexical search, neighboring-chunk expansion, date filters, manual tags, and the hidden advanced
@@ -11,6 +12,10 @@
   keep the reproducible evaluation framework as developer-only tooling under `scripts/`.
 - Drop write-only raw payloads and fingerprints from the disposable index, advance its schema epoch,
   and remove retired source-claim repository APIs while preserving the supported verified rebind.
+- Store only canonical source bindings in `state.sqlite`, use column-scoped transactional settings
+  updates, and remove the obsolete `settings.json` path and lock protocol.
+- Collapse runtime retrieval into one meeting search service and remove Obsidian v1 note migration
+  after the one-user transition window.
 
 ## 0.7.0 - 2026-08-29
 

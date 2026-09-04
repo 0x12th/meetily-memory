@@ -4,10 +4,11 @@ from typing import Annotated
 import typer
 
 from meetily_memory.cli.common import make_typer, print_json, print_text_block
-from meetily_memory.config.settings import ObsidianSettings, load_app_settings, update_app_settings
-from meetily_memory.integrations import ObsidianSyncResult, obsidian_root_dir
+from meetily_memory.config.settings import load_app_settings
+from meetily_memory.obsidian_notes import ObsidianSyncResult, obsidian_root_dir
 from meetily_memory.obsidian_sync import sync_configured_obsidian_locked
 from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
+from meetily_memory.user_state import UserStateRepository
 
 obsidian_app = make_typer("Sync Meetily Memory into Obsidian.")
 
@@ -36,18 +37,13 @@ def obsidian_init(
         obsidian_root_dir(vault, folder)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    settings = update_app_settings(
-        settings_path=ctx.obj["settings_path"],
-        obsidian=ObsidianSettings(
-            vault_path=str(vault.expanduser()),
-            folder=folder,
-        ),
-    )
+    state_path = ctx.obj["state_path"]
+    UserStateRepository(state_path).set_obsidian_target(str(vault.expanduser()), folder)
     try:
         with RefreshLock(ctx.obj["index_path"]):
             result = sync_configured_obsidian_locked(
                 ctx.obj["index_path"],
-                ctx.obj["settings_path"],
+                ctx.obj["state_path"],
                 required=True,
             )
     except RefreshLockBusyError as exc:
@@ -55,6 +51,7 @@ def obsidian_init(
     if result is None:
         message = "Configured Obsidian sync unexpectedly returned no result."
         raise RuntimeError(message)
+    settings = load_app_settings(state_path)
     payload = {**settings.obsidian.__dict__, "sync": result.as_payload()}
     if json_output:
         print_json(payload)
@@ -73,7 +70,7 @@ def obsidian_sync(
         with RefreshLock(ctx.obj["index_path"]):
             result = sync_configured_obsidian_locked(
                 ctx.obj["index_path"],
-                ctx.obj["settings_path"],
+                ctx.obj["state_path"],
                 required=True,
             )
     except RefreshLockBusyError as exc:
@@ -94,7 +91,7 @@ def obsidian_status(
     ctx: typer.Context,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    settings = load_app_settings(ctx.obj["settings_path"])
+    settings = load_app_settings(ctx.obj["state_path"])
     payload = settings.obsidian.__dict__
     if json_output:
         print_json(payload)

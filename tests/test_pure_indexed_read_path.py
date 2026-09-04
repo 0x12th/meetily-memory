@@ -219,7 +219,7 @@ def test_operation_snapshot_validates_exact_attached_state_and_rejects_replaceme
             snapshot.execute(
                 "SELECT schema_family, schema_epoch FROM operation_state.state_meta"
             ).fetchone()
-        ) == ("meetily-memory-state", 1)
+        ) == ("meetily-memory-state", 2)
         assert tuple(
             snapshot.execute(
                 """

@@ -5,11 +5,7 @@ import pytest
 
 from meetily_memory.domain import MeetingSearchFilters, SearchHit
 from meetily_memory.repositories.index import IndexRepository
-from meetily_memory.retrieval import (
-    LexicalRetrievalStrategy,
-    LexicalTagMeetingRetrievalStrategy,
-    TagRetrievalStrategy,
-)
+from meetily_memory.retrieval import MeetingSearchService
 from meetily_memory.tagging import TagRepository, TagService
 from scripts.retrieval_evaluation import (
     EvaluationDataset,
@@ -179,10 +175,9 @@ def test_evaluation_supports_tag_only_meeting_results_and_fingerprints_tag_state
         index_path,
         limit=5,
         config=EvaluationRetrievalConfig(
-            meeting_strategy=LexicalTagMeetingRetrievalStrategy(
-                repository=repository,
-                lexical=LexicalRetrievalStrategy(repository),
-                tags=TagRetrievalStrategy(TagRepository(repository.state_path)),
+            meeting_strategy=MeetingSearchService(
+                repository,
+                TagRepository(repository.state_path),
             ),
             mode="fts5_tags",
         ),

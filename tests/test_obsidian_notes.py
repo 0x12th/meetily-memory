@@ -7,11 +7,10 @@ from pathlib import Path
 
 import pytest
 
-import meetily_memory.integrations as integrations_module
 from meetily_memory.db.schema import IndexReadError
 from meetily_memory.domain import MeetingRef
-from meetily_memory.integrations import (
-    LEGACY_OBSIDIAN_MARKER_VERSION,
+from meetily_memory.json_codec import dumps_json, loads_json
+from meetily_memory.obsidian_notes import (
     MANAGED_MARKER,
     MAX_FILENAME_COMPONENT_BYTES,
     OBJECT_KEY_VERSION,
@@ -21,16 +20,13 @@ from meetily_memory.integrations import (
     ObsidianMeetingSnapshot,
     PlannedNote,
     apply_obsidian_note_plan,
-    build_obsidian_note_plan,
     build_obsidian_snapshot,
-    legacy_object_key_from_note_text,
     object_key_from_note_text,
     paths_are_same_case_variant,
     rename_case_variant_exactly,
     render_obsidian_meeting_note,
     sync_obsidian_vault,
 )
-from meetily_memory.json_codec import dumps_json, loads_json
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.repositories.snapshot import SnapshotRepository
 from meetily_memory.tagging import TagRepository
@@ -65,10 +61,6 @@ def marker_text(payload: object, *, version: int) -> str:
     object_key = dumps_json(payload)
     encoded = base64.urlsafe_b64encode(object_key.encode()).decode().rstrip("=")
     return f"<!-- meetily-memory:managed:v{version}:{encoded} -->\n"
-
-
-def legacy_payload(kind: str, **identity: object) -> dict[str, object]:
-    return {"version": 1, "kind": kind, **identity}
 
 
 def meeting_note_refs(index_path: Path) -> dict[str, NoteRef]:
@@ -209,9 +201,7 @@ def test_sync_creates_only_meetings_and_tags_snapshot(
     assert {path.name for path in root.iterdir()} == set(OBSIDIAN_DIRS)
     assert len(list((root / "Meetings").glob("*.md"))) == 2
     assert len(list((root / "Tags").glob("*.md"))) == 2
-    assert not any(
-        (root / directory).exists() for directory in integrations_module.LEGACY_OBSIDIAN_DIRS
-    )
+    assert {path.name for path in root.iterdir()} == {"Meetings", "Tags"}
 
 
 def test_meeting_notes_include_ref_dates_summary_open_command_and_manual_tags(
@@ -304,7 +294,7 @@ def test_marker_v2_and_object_key_v2_are_explicit_and_strict() -> None:
 
     assert OBSIDIAN_MARKER_VERSION == 2
     assert OBJECT_KEY_VERSION == 2
-    assert LEGACY_OBSIDIAN_MARKER_VERSION == 1
+
     assert MANAGED_MARKER.startswith("<!-- meetily-memory:managed:v2:")
     assert loads_json(meeting.object_key) == {
         "external_id": "meeting",
@@ -343,96 +333,20 @@ def test_malformed_v2_markers_are_foreign(payload: object) -> None:
     assert object_key_from_note_text(text) is None
 
 
-def test_legacy_v1_migration_updates_meeting_and_removes_owned_graph_notes(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = scan_fixture(meetily_db, tmp_path)
-    snapshot = build_obsidian_snapshot(index_path, 100)
-    meeting = next(item for item in snapshot.meetings if item.ref.external_id == "meeting-1")
-    root = tmp_path / "vault" / "Meetily Memory"
-    legacy_notes = {
-        root / "Meetings" / "Old meeting.md": legacy_payload(
-            "meeting",
-            source_uuid=meeting.ref.source_uuid,
-            external_id=meeting.ref.external_id,
-        ),
-        root / "Topics" / "Old topic.md": legacy_payload("topic", stable_key="topic:old"),
-        root / "People" / "Old person.md": legacy_payload("person", stable_key="person:old"),
-        root / "Tasks" / "Old task.md": legacy_payload(
-            "entity",
-            source_uuid=meeting.ref.source_uuid,
-            meeting_external_id=meeting.ref.external_id,
-            chunk_evidence_id="evidence:1",
-            entity_kind="action_items",
-            stable_content_fingerprint="fingerprint",
-        ),
-    }
-    for path, payload in legacy_notes.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(marker_text(payload, version=1), encoding="utf-8")
-
-    result = sync_obsidian_vault(index_path, tmp_path / "vault")
-
-    current_ref = NoteRef.meeting(
-        meeting.ref.source_uuid,
-        meeting.ref.external_id,
-        meeting.title,
-    )
-    current_path = root / current_ref.relative_path
-    assert result.files_removed == len(legacy_notes)
-    assert current_path.exists()
-    assert (
-        object_key_from_note_text(current_path.read_text(encoding="utf-8"))
-        == current_ref.object_key
-    )
-    assert all(not path.exists() for path in legacy_notes)
-
-
-def test_legacy_migration_completes_preflight_before_first_mutation(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = scan_fixture(meetily_db, tmp_path)
-    snapshot = build_obsidian_snapshot(index_path, 100)
-    plan = build_obsidian_note_plan(snapshot)
-    expected = next(note for note in plan if note.ref.directory == "Meetings")
-    foreign = NoteRef.meeting("foreign-source", "foreign-meeting", "Foreign")
-    root = tmp_path / "vault" / "Meetily Memory"
-    destination = root / expected.ref.relative_path
-    destination.parent.mkdir(parents=True)
-    destination.write_text(planned_text(foreign), encoding="utf-8")
-    legacy_topic = root / "Topics" / "Legacy.md"
-    legacy_topic.parent.mkdir()
-    legacy_text = marker_text(legacy_payload("topic", stable_key="topic:legacy"), version=1)
-    legacy_topic.write_text(legacy_text, encoding="utf-8")
-
-    with pytest.raises(ValueError, match="belongs to another managed object"):
-        sync_obsidian_vault(index_path, tmp_path / "vault")
-
-    assert destination.read_text(encoding="utf-8") == planned_text(foreign)
-    assert legacy_topic.read_text(encoding="utf-8") == legacy_text
-    assert not (root / "Tags").exists()
-
-
-def test_unmanaged_malformed_foreign_and_wrong_directory_markers_are_untouched(
-    tmp_path: Path,
-) -> None:
+def test_v1_and_retired_directory_notes_are_foreign_and_untouched(tmp_path: Path) -> None:
     root = tmp_path / "vault" / "Meetily Memory"
     protected = {
         root / "Meetings" / "Personal.md": "personal\n",
-        root / "Topics" / "Malformed.md": marker_text(
-            legacy_payload("topic", stable_key=""),
+        root / "Meetings" / "Legacy.md": marker_text(
+            {
+                "version": 1,
+                "kind": "meeting",
+                "source_uuid": "source",
+                "external_id": "meeting",
+            },
             version=1,
         ),
-        root / "People" / "Foreign.md": marker_text(
-            legacy_payload("person", stable_key="person:x"),
-            version=3,
-        ),
-        root / "People" / "Wrong directory.md": marker_text(
-            legacy_payload("topic", stable_key="topic:x"),
-            version=1,
-        ),
+        root / "Topics" / "Retired.md": "retired content\n",
     }
     for path, text in protected.items():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -442,18 +356,6 @@ def test_unmanaged_malformed_foreign_and_wrong_directory_markers_are_untouched(
 
     assert result.files_removed == 0
     assert {path: path.read_text(encoding="utf-8") for path in protected} == protected
-
-
-def test_strict_legacy_parser_accepts_only_canonical_v1_shape() -> None:
-    payload = legacy_payload("topic", stable_key="topic:roadmap")
-    canonical = marker_text(payload, version=1)
-    noncanonical_key = '{"version":1,"kind":"topic","stable_key":"topic:roadmap"}'
-    encoded = base64.urlsafe_b64encode(noncanonical_key.encode()).decode().rstrip("=")
-
-    assert legacy_object_key_from_note_text(canonical) == dumps_json(payload)
-    assert legacy_object_key_from_note_text(f"<!-- meetily-memory:managed:v1:{encoded} -->") is None
-    assert legacy_object_key_from_note_text(canonical + canonical) is None
-    assert legacy_object_key_from_note_text("<!-- meetily-memory:managed:v1:a -->") is None
 
 
 def test_stale_current_owned_notes_are_removed(tmp_path: Path) -> None:
@@ -546,7 +448,7 @@ def test_sync_rejects_folder_outside_vault(
     assert protected.read_text(encoding="utf-8") == "protected\n"
 
 
-@pytest.mark.parametrize("directory", ["Meetings", "Tags", "Topics", "Tasks"])
+@pytest.mark.parametrize("directory", ["Meetings", "Tags"])
 def test_sync_rejects_snapshot_directory_symlinks_before_mutation(
     meetily_db: Path,
     tmp_path: Path,

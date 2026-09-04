@@ -294,15 +294,7 @@ def durably_remove_index_locked(index_path: Path) -> None:
 
 
 def _selection_from_binding(binding: dict[str, object]) -> SourceSelection:
-    pending_revision = binding.get("pending_revision")
     current_path = str(binding["current_path"])
-    projected_path = str(binding["projected_path"])
-    if pending_revision is not None or current_path != projected_path:
-        message = (
-            f"Source UUID {binding['uuid']} has an unfinished path projection. Complete or repair "
-            "the relocation before rebuilding the canonical index."
-        )
-        raise StaleSourceSelectionError(message)
     kind = str(binding["kind"])
     if kind != SOURCE_KIND:
         message = f"Source UUID {binding['uuid']} has unsupported source kind {kind!r}."

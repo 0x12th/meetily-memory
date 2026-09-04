@@ -16,7 +16,7 @@ from meetily_memory.repositories.index import IndexRepository, meeting_from_row
 if TYPE_CHECKING:
     import sqlite3
 
-    from meetily_memory.tagging import TagMatch, TagRepository
+    from meetily_memory.tagging import TagRepository
 
 RETRIEVAL_CANDIDATE_MULTIPLIER = 4
 MAX_EVIDENCE_PER_SOURCE = 2
@@ -24,62 +24,12 @@ MeetingKey = MeetingRef
 
 
 @dataclass(frozen=True)
-class LexicalRetrievalStrategy:
+class MeetingSearchService:
     repository: IndexRepository
-
-    def search(
-        self,
-        query: str,
-        limit: int = 10,
-        *,
-        filters: MeetingSearchFilters | None = None,
-    ) -> tuple[SearchHit, ...]:
-        return self.repository.search_hits(query, limit, filters=filters)
-
-    def _prepare_query_for_snapshot(self, query: str) -> None:
-        del query
-
-    def _search_in_snapshot(
-        self,
-        query: str,
-        limit: int,
-        *,
-        operation_snapshot: sqlite3.Connection,
-        prepared_query: object | None,
-        filters: MeetingSearchFilters | None,
-    ) -> tuple[SearchHit, ...]:
-        del prepared_query
-        return self.repository.search_hits(
-            query,
-            limit,
-            filters=filters,
-            connection=operation_snapshot,
-        )
-
-
-@dataclass(frozen=True)
-class TagRetrievalStrategy:
-    repository: TagRepository
-
-    def search(self, query: str) -> tuple[TagMatch, ...]:
-        return self.repository.search(query)
-
-    def _search_in_snapshot(
-        self,
-        query: str,
-        operation_snapshot: sqlite3.Connection,
-    ) -> tuple[TagMatch, ...]:
-        return self.repository.search_in_snapshot(operation_snapshot, query)
-
-
-@dataclass(frozen=True)
-class LexicalTagMeetingRetrievalStrategy:
-    repository: IndexRepository
-    lexical: LexicalRetrievalStrategy
-    tags: TagRetrievalStrategy
+    tags: TagRepository
     candidate_multiplier: int = RETRIEVAL_CANDIDATE_MULTIPLIER
 
-    def search_meetings(
+    def search(
         self,
         query: str,
         limit: int = 10,
@@ -87,37 +37,30 @@ class LexicalTagMeetingRetrievalStrategy:
         *,
         filters: MeetingSearchFilters | None = None,
     ) -> tuple[MeetingSearchResult, ...]:
-        prepared_query = self._prepare_query_for_snapshot(query)
         with self.repository.operation_snapshot() as operation_snapshot:
-            return self._search_meetings_in_snapshot(
+            return self._search_in_snapshot(
                 query,
                 limit,
                 context,
                 operation_snapshot=operation_snapshot,
-                prepared_query=prepared_query,
                 filters=filters,
             )
 
-    def _prepare_query_for_snapshot(self, query: str) -> object | None:
-        return self.lexical._prepare_query_for_snapshot(query)  # noqa: SLF001
-
-    def _search_meetings_in_snapshot(  # noqa: PLR0913
+    def _search_in_snapshot(
         self,
         query: str,
         limit: int,
         context: int,
         *,
         operation_snapshot: sqlite3.Connection,
-        prepared_query: object | None,
         filters: MeetingSearchFilters | None,
     ) -> tuple[MeetingSearchResult, ...]:
         fts_ranks, fts_evidence, fts_meetings = collect_hits_by_meeting(
-            self.lexical,
+            self.repository,
             query,
             limit,
             candidate_multiplier=self.candidate_multiplier,
             operation_snapshot=operation_snapshot,
-            prepared_query=prepared_query,
             filters=filters,
         )
         exact_tag_order, token_tag_order, matched_tags, tag_meetings = tag_candidates(
@@ -160,13 +103,12 @@ class LexicalTagMeetingRetrievalStrategy:
 
 
 def collect_hits_by_meeting(  # noqa: PLR0913
-    strategy: LexicalRetrievalStrategy,
+    repository: IndexRepository,
     query: str,
     meeting_limit: int,
     *,
     candidate_multiplier: int,
     operation_snapshot: sqlite3.Connection,
-    prepared_query: object | None = None,
     filters: MeetingSearchFilters | None = None,
 ) -> tuple[
     dict[MeetingKey, int],
@@ -175,12 +117,11 @@ def collect_hits_by_meeting(  # noqa: PLR0913
 ]:
     candidate_limit = max(meeting_limit, meeting_limit * candidate_multiplier)
     while True:
-        hits = strategy._search_in_snapshot(  # noqa: SLF001
+        hits = repository.search_hits(
             query,
             candidate_limit,
-            operation_snapshot=operation_snapshot,
-            prepared_query=prepared_query,
             filters=filters,
+            connection=operation_snapshot,
         )
         ranks, evidence, meetings = collapse_hits_by_meeting(hits)
         if len(ranks) >= meeting_limit or len(hits) < candidate_limit:
@@ -190,7 +131,7 @@ def collect_hits_by_meeting(  # noqa: PLR0913
 
 def tag_candidates(
     repository: IndexRepository,
-    tags: TagRetrievalStrategy,
+    tags: TagRepository,
     query: str,
     *,
     operation_snapshot: sqlite3.Connection,
@@ -201,7 +142,7 @@ def tag_candidates(
     dict[MeetingKey, tuple[str, ...]],
     dict[MeetingKey, Meeting],
 ]:
-    matches = tags._search_in_snapshot(query, operation_snapshot)  # noqa: SLF001
+    matches = tags.search_in_snapshot(operation_snapshot, query)
     meeting_rows = repository.get_meetings_by_refs(
         tuple(dict.fromkeys(match.meeting_ref for match in matches)),
         filters=filters,

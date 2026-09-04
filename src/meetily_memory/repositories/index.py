@@ -45,8 +45,6 @@ SELECT EXISTS (
     AND i.source_uuid = s.uuid
     AND i.source_path = s.current_path
     AND i.source_revision = s.revision
-    AND s.current_path = s.projected_path
-    AND s.pending_revision IS NULL
 ) AS source_binding_matches
 """
 
@@ -88,13 +86,7 @@ class IndexRepository:
             context="selected source binding",
             error_type=IndexReadError,
         )
-        selected_projected_path = decode_required_text(
-            selected["projected_path"],
-            table="sources",
-            column="projected_path",
-            context="selected source binding",
-            error_type=IndexReadError,
-        )
+
         expected = (
             decode_required_text(
                 selected["uuid"],
@@ -139,11 +131,7 @@ class IndexRepository:
                 error_type=IndexReadError,
             ),
         )
-        if (
-            selected["pending_revision"] is not None
-            or selected_current_path != selected_projected_path
-            or actual != expected
-        ):
+        if actual != expected:
             raise IndexReadError(_binding_error(actual=actual, expected=expected))
 
         self.meetings = MeetingsRepository(self.index_path, self.connection)

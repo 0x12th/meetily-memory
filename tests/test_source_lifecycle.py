@@ -63,9 +63,9 @@ def test_public_refresh_bootstraps_exact_state_and_single_source_index(
     assert refresh.exit_code == 0, refresh.output
     payload = loads_json(refresh.stdout)
     assert payload["meetings_seen"] == 2
-    settings = load_app_settings(data_dir / "settings.json")
+    settings = load_app_settings(data_dir / "state.sqlite")
     assert settings.source_uuid == payload["source_uuid"]
-    assert settings.source_path is None
+
     with sqlite3.connect(index_path) as conn:
         assert conn.execute("SELECT source_uuid, meeting_count FROM index_meta").fetchone() == (
             payload["source_uuid"],
@@ -110,7 +110,7 @@ def test_explicit_rebind_preserves_identity_evidence_and_manual_tags(
     after = MeetilyMemoryCore(index_path).search("migration risks", limit=1).results[0]
     assert after.meeting.ref == before.meeting.ref
     assert after.evidence[0].id == before.evidence[0].id
-    assert load_app_settings(data_dir / "settings.json").source_uuid == original_uuid
+    assert load_app_settings(data_dir / "state.sqlite").source_uuid == original_uuid
     assert [
         tag.display_name
         for tag in TagService(IndexRepository(index_path)).list_for_meeting(before.meeting.ref)

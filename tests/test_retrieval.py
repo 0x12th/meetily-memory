@@ -1,5 +1,4 @@
 import sqlite3
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from inspect import signature
 from pathlib import Path
@@ -18,21 +17,23 @@ def test_core_constructor_exposes_only_runtime_storage_dependencies() -> None:
     assert tuple(signature(MeetilyMemoryCore).parameters) == ("index_path", "state_path")
 
 
-@dataclass(frozen=True)
-class FixedRetrievalStrategy(retrieval.LexicalRetrievalStrategy):
-    hits: tuple[SearchHit, ...]
+class FixedIndexRepository(IndexRepository):
+    def __init__(self, index_path: Path, hits: tuple[SearchHit, ...]) -> None:
+        super().__init__(index_path)
+        self.hits = hits
 
     @override
-    def _search_in_snapshot(
+    def search_hits(
         self,
         query: str,
-        limit: int,
+        limit: int = 10,
         *,
-        operation_snapshot: sqlite3.Connection,
-        prepared_query: object | None,
+        meeting_id: int | None = None,
+        context: int = 0,
         filters: MeetingSearchFilters | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[SearchHit, ...]:
-        del query, operation_snapshot, prepared_query, filters
+        del query, meeting_id, context, filters, connection
         return self.hits[:limit]
 
 
@@ -44,15 +45,10 @@ def test_meeting_retrieval_expands_candidates_until_limit_has_unique_meetings(
     publish_fresh_index(index_path, meetily_db)
     first = IndexRepository(index_path).search_hits("pricing decision", 1)[0]
     second = IndexRepository(index_path).search_hits("migration risks", 1)[0]
-    repository = IndexRepository(index_path)
-    saturated = FixedRetrievalStrategy(repository, (*((first,) * 40), second))
-    strategy = retrieval.LexicalTagMeetingRetrievalStrategy(
-        repository=repository,
-        lexical=saturated,
-        tags=retrieval.TagRetrievalStrategy(TagRepository(repository.state_path)),
-    )
+    repository = FixedIndexRepository(index_path, (*((first,) * 40), second))
+    service = retrieval.MeetingSearchService(repository, TagRepository(repository.state_path))
 
-    results = strategy.search_meetings("query ignored by strategy", limit=2)
+    results = service.search("query ignored by repository", limit=2)
 
     assert [result.meeting.external_id for result in results] == [
         "meeting-1",
@@ -87,7 +83,7 @@ def test_fts_date_filter_is_applied_before_candidate_limit(
     assert filtered[0].meeting.external_id == "meeting-2"
 
 
-def test_tag_retrieval_strategy_keeps_lookup_behind_strategy_boundary(
+def test_meeting_search_service_includes_tag_matches(
     tmp_path: Path,
 ) -> None:
     state_path = tmp_path / "state.sqlite"
@@ -96,7 +92,7 @@ def test_tag_retrieval_strategy_keeps_lookup_behind_strategy_boundary(
     repository = TagRepository(state_path)
     repository.assign(source_uuid, ("meeting-1",), ("Сбер собес",), now="2")
 
-    matches = retrieval.TagRetrievalStrategy(repository).search("сбер")
+    matches = repository.search("сбер")
 
     assert [(match.meeting_ref.external_id, match.kind) for match in matches] == [
         ("meeting-1", "token")

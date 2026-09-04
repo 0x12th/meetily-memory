@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from meetily_memory.db.row_decode import decode_nullable_integer
 from meetily_memory.db.schema_family import (
     INDEX_APPLICATION_ID,
     INDEX_SCHEMA_EPOCH,
@@ -53,9 +52,9 @@ def test_schema_family_constants_are_stable() -> None:
     assert INDEX_SCHEMA_FAMILY == "meetily-memory-index"
     assert STATE_APPLICATION_ID == 0x4D4D5354
     assert INDEX_APPLICATION_ID == 0x4D4D4958
-    assert STATE_SCHEMA_EPOCH == 1
+    assert STATE_SCHEMA_EPOCH == 2
     assert INDEX_SCHEMA_EPOCH == 2
-    assert STATE_SCHEMA_USER_VERSION == 1001
+    assert STATE_SCHEMA_USER_VERSION == 1002
     assert INDEX_SCHEMA_USER_VERSION == 1002
 
 
@@ -102,7 +101,6 @@ def test_fresh_state_has_exact_epoch_schema_identity_and_singletons(tmp_path: Pa
         assert setting_columns == [
             "singleton",
             "source_uuid",
-            "source_path",
             "ui_language",
             "last_update_at",
             "obsidian_vault_path",
@@ -128,7 +126,6 @@ def test_fresh_state_has_exact_epoch_schema_identity_and_singletons(tmp_path: Pa
             "idx_app_settings_source_uuid",
             "idx_meeting_tags_manual_tag_id",
             "idx_meeting_tags_meeting",
-            "idx_sources_kind_projected_path",
         }
     validate_state_database(state_path)
 
@@ -251,64 +248,26 @@ def test_corrupt_existing_state_is_rejected_actionably_and_read_only(tmp_path: P
     assert _database_identity(state_path) == before
 
 
-def test_settings_preserve_selected_source_and_runtime_values(tmp_path: Path) -> None:
+def test_narrow_settings_operations_preserve_unrelated_values(tmp_path: Path) -> None:
     state = UserStateRepository(tmp_path / "state.sqlite")
     source_uuid = state.get_or_create_source("meetily_sqlite", "/source.sqlite", now="created")
 
-    state.replace_app_settings(
-        {
-            "source_uuid": source_uuid,
-            "source_path": None,
-            "ui_language": "ru",
-            "last_update_at": "updated",
-            "obsidian_vault_path": "/vault",
-            "obsidian_folder": "Meetily",
-            "obsidian_last_sync_at": "synced",
-        }
-    )
+    state.select_source(source_uuid)
+    state.set_ui_language("ru")
+    state.record_refresh("updated")
+    state.set_obsidian_target("/vault", "Meetily")
+    assert state.record_obsidian_sync("/vault", "Meetily", "synced") is True
 
     row = state.read_app_settings()
     assert row == {
         "singleton": 1,
         "source_uuid": source_uuid,
-        "source_path": None,
         "ui_language": "ru",
         "last_update_at": "updated",
         "obsidian_vault_path": "/vault",
         "obsidian_folder": "Meetily",
         "obsidian_last_sync_at": "synced",
     }
-
-
-def test_pending_revision_decoder_accepts_only_sqlite_integer_or_null(tmp_path: Path) -> None:
-    database = tmp_path / "row-values.sqlite"
-    with sqlite3.connect(database) as connection:
-        text_value = connection.execute("SELECT CAST('7' AS TEXT) AS pending_revision").fetchone()[
-            0
-        ]
-        null_value = connection.execute("SELECT NULL AS pending_revision").fetchone()[0]
-
-    with pytest.raises(
-        StateSchemaError,
-        match=r"sources\.pending_revision must be INTEGER, got TEXT",
-    ):
-        decode_nullable_integer(
-            text_value,
-            table="sources",
-            column="pending_revision",
-            context="source binding",
-            error_type=StateSchemaError,
-        )
-    assert (
-        decode_nullable_integer(
-            null_value,
-            table="sources",
-            column="pending_revision",
-            context="source binding",
-            error_type=StateSchemaError,
-        )
-        is None
-    )
 
 
 def test_source_uuid_survives_explicit_path_update(tmp_path: Path) -> None:

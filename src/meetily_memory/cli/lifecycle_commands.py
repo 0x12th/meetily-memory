@@ -23,7 +23,6 @@ from meetily_memory.config.settings import (
     AppSettings,
     load_app_settings,
     normalize_ui_language,
-    update_app_settings,
 )
 from meetily_memory.db.schema_family import INDEX_SCHEMA_USER_VERSION
 from meetily_memory.db.state_schema import StateSchemaError
@@ -100,16 +99,15 @@ def resolve_existing_rebind_source_uuid(
 
 
 def configured_source_path(
-    index_path: Path,
-    settings_path: Path,
+    state_path: Path,
     explicit_source: Path | None = None,
 ) -> Path | None:
     if explicit_source is not None:
         return require_canonical_source_path(explicit_source)
-    settings = load_app_settings(settings_path)
+    settings = load_app_settings(state_path)
     if settings.source_uuid:
         source = find_existing_source_by_uuid(
-            Path(index_path).with_name("state.sqlite"),
+            state_path,
             settings.source_uuid,
         )
         if source is None:
@@ -181,14 +179,9 @@ def print_database_diagnostic(label: str, diagnostic: DatabaseDiagnostic) -> Non
 
 
 def diagnostic_source_path(
-    settings: AppSettings,
     persisted_source_path: Path | None,
 ) -> Path | None:
-    if persisted_source_path is not None:
-        return persisted_source_path
-    if settings.source_path:
-        return Path(settings.source_path).expanduser()
-    return None
+    return persisted_source_path
 
 
 def resolve_diagnostic_ui_language(settings: AppSettings, indexed_language: str | None) -> str:
@@ -219,19 +212,12 @@ def init(
 ) -> None:
     try:
         with RefreshLock(ctx.obj["index_path"]):
-            source_path = configured_source_path(
-                ctx.obj["index_path"], ctx.obj["settings_path"], source
-            )
+            source_path = configured_source_path(ctx.obj["state_path"], source)
             if source_path is None:
                 message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
                 raise typer.BadParameter(message)
-            payload, result = scan_update(ctx.obj["index_path"], source_path)
-            update_app_settings(
-                settings_path=ctx.obj["settings_path"],
-                source_uuid=result.source.source_uuid,
-                source_path=None,
-                last_update_at=utc_now_iso(),
-            )
+            payload, _result = scan_update(ctx.obj["index_path"], source_path)
+            UserStateRepository(ctx.obj["state_path"]).record_refresh(utc_now_iso())
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -280,10 +266,10 @@ def status(
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
     index_path = ctx.obj["index_path"]
-    settings = load_app_settings(ctx.obj["settings_path"])
+    settings = load_app_settings(ctx.obj["state_path"])
     diagnostics = inspect_local_databases(index_path, settings.source_uuid)
 
-    configured_source = diagnostic_source_path(settings, diagnostics.configured_source_path)
+    configured_source = diagnostic_source_path(diagnostics.configured_source_path)
     source_path = str(configured_source) if configured_source else None
     stats = diagnostics.stats
     obsidian_configured = bool(settings.obsidian.vault_path)
@@ -332,20 +318,19 @@ def config_language(
 ) -> None:
     normalized = language.casefold().replace("_", "-").split("-", maxsplit=1)[0]
     if normalized == "auto":
-        settings = update_app_settings(settings_path=ctx.obj["settings_path"], ui_language=None)
+        configured_language = None
     elif normalized in {"en", "ru"}:
-        settings = update_app_settings(
-            settings_path=ctx.obj["settings_path"], ui_language=normalized
-        )
+        configured_language = normalized
     else:
         message = "UI language must be one of: en, ru, auto."
         raise typer.BadParameter(message)
 
-    payload = {"ui_language": settings.ui_language}
+    UserStateRepository(ctx.obj["state_path"]).set_ui_language(configured_language)
+    payload = {"ui_language": configured_language}
     if json_output:
         print_json(payload)
         return
-    print_text_block(f"ui language: {settings.ui_language or 'auto'}")
+    print_text_block(f"ui language: {configured_language or 'auto'}")
 
 
 @config_app.command("source")
@@ -377,7 +362,7 @@ def config_source(
         with RefreshLock(index_path):
             if rebind:
                 state_path = Path(index_path).with_name("state.sqlite")
-                settings = load_app_settings(ctx.obj["settings_path"])
+                settings = load_app_settings(ctx.obj["state_path"])
                 rebind_uuid = resolve_existing_rebind_source_uuid(
                     state_path,
                     settings,
@@ -400,12 +385,7 @@ def config_source(
                         new_path,
                         now=utc_now_iso(),
                     )
-                    update_app_settings(
-                        settings_path=ctx.obj["settings_path"],
-                        source_uuid=rebind_uuid,
-                        source_path=None,
-                        last_update_at=utc_now_iso(),
-                    )
+                    user_state.record_refresh(utc_now_iso())
                     payload = {
                         "source_uuid": rebind_uuid,
                         "old_source_path": str(relocated.previous_path),
@@ -418,12 +398,7 @@ def config_source(
                     raise typer.BadParameter(str(exc)) from exc
             else:
                 payload, selected = scan_update(index_path, new_path)
-                update_app_settings(
-                    settings_path=ctx.obj["settings_path"],
-                    source_uuid=selected.source.source_uuid,
-                    source_path=None,
-                    last_update_at=utc_now_iso(),
-                )
+                UserStateRepository(ctx.obj["state_path"]).record_refresh(utc_now_iso())
                 payload.update(
                     {
                         "source_path": str(selected.source.source_path),
@@ -455,19 +430,12 @@ def scan(
 ) -> None:
     try:
         with RefreshLock(ctx.obj["index_path"]):
-            source_path = configured_source_path(
-                ctx.obj["index_path"], ctx.obj["settings_path"], source
-            )
+            source_path = configured_source_path(ctx.obj["state_path"], source)
             if source_path is None:
                 message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
                 raise typer.BadParameter(message)
-            payload, result = scan_update(ctx.obj["index_path"], source_path)
-            update_app_settings(
-                settings_path=ctx.obj["settings_path"],
-                source_uuid=result.source.source_uuid,
-                source_path=None,
-                last_update_at=utc_now_iso(),
-            )
+            payload, _result = scan_update(ctx.obj["index_path"], source_path)
+            UserStateRepository(ctx.obj["state_path"]).record_refresh(utc_now_iso())
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
@@ -478,7 +446,7 @@ def scan(
 
 def run_refresh(
     index_path: Path,
-    settings_path: Path,
+    state_path: Path,
     source_path: Path,
     *,
     force: bool = False,
@@ -487,12 +455,7 @@ def run_refresh(
     source_path = require_canonical_source_path(source_path)
     payload, result = scan_update(index_path, source_path, force=force)
     try:
-        update_app_settings(
-            settings_path=settings_path,
-            source_uuid=result.source.source_uuid,
-            source_path=None,
-            last_update_at=utc_now_iso(),
-        )
+        UserStateRepository(state_path).record_refresh(utc_now_iso())
     except Exception as exc:
         message = (
             "The fresh index was published and must not be rolled back, but state settings could "
@@ -501,7 +464,7 @@ def run_refresh(
         raise RuntimeError(message) from exc
     if sync_obsidian:
         try:
-            obsidian_result = sync_configured_obsidian_locked(index_path, settings_path)
+            obsidian_result = sync_configured_obsidian_locked(index_path, state_path)
         except Exception as exc:
             state = "completed" if result.changed else "unchanged"
             message = f"Index refresh {state}; Obsidian sync failed: {exc}"
@@ -531,15 +494,13 @@ def refresh(
 ) -> None:
     try:
         with RefreshLock(ctx.obj["index_path"]):
-            source_path = configured_source_path(
-                ctx.obj["index_path"], ctx.obj["settings_path"], source
-            )
+            source_path = configured_source_path(ctx.obj["state_path"], source)
             if source_path is None:
                 message = "Meetily DB was not found. Pass --source /path/to/meeting_minutes.sqlite."
                 raise typer.BadParameter(message)
             payload = run_refresh(
                 ctx.obj["index_path"],
-                ctx.obj["settings_path"],
+                ctx.obj["state_path"],
                 source_path,
                 force=force,
                 sync_obsidian=sync_obsidian,
@@ -631,11 +592,11 @@ def doctor(
 ) -> None:
     index_path = ctx.obj["index_path"]
     try:
-        settings = load_app_settings(ctx.obj["settings_path"])
+        settings = load_app_settings(ctx.obj["state_path"])
     except StateSchemaError:
         settings = AppSettings()
     diagnostics = inspect_local_databases(index_path, settings.source_uuid)
-    configured_source = diagnostic_source_path(settings, diagnostics.configured_source_path)
+    configured_source = diagnostic_source_path(diagnostics.configured_source_path)
     source_path = source.expanduser() if source else configured_source or discover_meetily_db()
     source_diagnostic = inspect_source_database(source_path)
     fts5 = sqlite_has_fts5()
