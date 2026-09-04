@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Never
 
-from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
+from meetily_memory.json_codec import dumps_json, loads_json
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-MEETING_NORMALIZATION_VERSION = 2
-SOURCE_KIND = "meetily_sqlite"
 
 
 @dataclass(frozen=True)
@@ -27,9 +23,6 @@ class MeetingRecord:
     source_path: str | None
     language: str | None
     summary_text: str | None
-    raw_summary_json: str | None
-    raw_metadata_json: str | None
-    fingerprint: str
     indexed_at: str
 
 
@@ -43,9 +36,6 @@ class ChunkRecord:
     starts_at_seconds: float | None
     ends_at_seconds: float | None
     timestamp_label: str | None
-    token_count: int | None
-    fingerprint: str
-    raw_metadata_json: str | None
 
 
 REQUIRED_MEETILY_SCHEMA = {
@@ -122,14 +112,10 @@ def normalize_meeting(
                 starts_at_seconds=transcript.get("audio_start_time"),
                 ends_at_seconds=transcript.get("audio_end_time"),
                 timestamp_label=clean_optional(transcript.get("timestamp")),
-                token_count=len(text.split()),
-                fingerprint=fingerprint_json(transcript),
-                raw_metadata_json=dumps_json(transcript),
             )
         )
 
     if summary_text:
-        summary_payload = upstream.get("summary_process") or {}
         chunks.append(
             ChunkRecord(
                 external_id=f"summary:{upstream['id']}",
@@ -140,9 +126,6 @@ def normalize_meeting(
                 starts_at_seconds=None,
                 ends_at_seconds=None,
                 timestamp_label=None,
-                token_count=len(summary_text.split()),
-                fingerprint=fingerprint_json({"kind": "summary", "payload": summary_payload}),
-                raw_metadata_json=dumps_json(summary_payload),
             )
         )
 
@@ -159,25 +142,9 @@ def normalize_meeting(
                 starts_at_seconds=None,
                 ends_at_seconds=None,
                 timestamp_label=None,
-                token_count=len(notes_text.split()),
-                fingerprint=fingerprint_json({"kind": "note", "payload": notes}),
-                raw_metadata_json=dumps_json(notes),
             )
         )
 
-    meeting_fingerprint_payload = {
-        "normalization_version": MEETING_NORMALIZATION_VERSION,
-        "meeting": {
-            "id": upstream.get("id"),
-            "title": upstream.get("title"),
-            "created_at": upstream.get("created_at"),
-            "updated_at": upstream.get("updated_at"),
-            "folder_path": upstream.get("folder_path"),
-        },
-        "chunks": [chunk.fingerprint for chunk in chunks],
-        "summary": upstream.get("summary_process"),
-        "notes": upstream.get("notes"),
-    }
     meeting = MeetingRecord(
         external_id=upstream["id"],
         title=upstream["title"],
@@ -189,11 +156,6 @@ def normalize_meeting(
         source_path=str(source_path),
         language=language,
         summary_text=summary_text,
-        raw_summary_json=(
-            dumps_json(upstream.get("summary_process")) if upstream.get("summary_process") else None
-        ),
-        raw_metadata_json=dumps_json({"source_kind": SOURCE_KIND}),
-        fingerprint=fingerprint_json(meeting_fingerprint_payload),
         indexed_at=indexed_at,
     )
     return meeting, chunks
@@ -252,7 +214,3 @@ def clean_optional(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def fingerprint_json(payload: Any) -> str:
-    return hashlib.sha256(dumps_json_bytes(payload)).hexdigest()

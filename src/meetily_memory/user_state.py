@@ -1,5 +1,3 @@
-# ruff: noqa: FBT003
-
 from __future__ import annotations
 
 import sqlite3
@@ -34,19 +32,6 @@ class AmbiguousSourceIdentityError(RuntimeError):
     def __init__(self, message: str, *, source_uuids: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.source_uuids = source_uuids
-
-
-@dataclass(frozen=True)
-class SourcePathClaim:
-    source_uuid: str
-    kind: str
-    previous_path: str
-    projected_path: str
-    claimed_path: str
-    previous_updated_at: str
-    previous_pending_revision: int | None
-    claimed_revision: int
-    resumed: bool
 
 
 @dataclass(frozen=True)
@@ -106,14 +91,6 @@ class UserStateRepository:
             message = "A validated user-state identity is required for pinned access."
             raise RuntimeError(message)
         _require_user_state_identity(self.state_path, expected=self._state_identity)
-
-    def open_existing_writer(self) -> UserStateRepository:
-        if not self.read_only:
-            return self
-        if self._state_identity is None:
-            message = "A validated user-state identity is required for writable access."
-            raise RuntimeError(message)
-        return type(self)(self.state_path, _expected_identity=self._state_identity)
 
     def get_or_create_source(self, kind: str, path: str, *, now: str) -> str:
         with self._connect() as conn:
@@ -210,261 +187,6 @@ class UserStateRepository:
         with self._connect() as conn:
             _require_source_binding(conn, source_uuid, kind)
             _require_available_claim_target(conn, source_uuid, kind, canonical_path)
-
-    def claim_source_path(
-        self,
-        source_uuid: str,
-        kind: str,
-        path: Path,
-        *,
-        now: str,
-    ) -> SourcePathClaim:
-        canonical_path = canonical_source_path(path)
-        claimed_path = str(canonical_path)
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            source = _require_source_binding(conn, source_uuid, kind)
-            _require_available_claim_target(conn, source_uuid, kind, canonical_path)
-            previous_path = source["current_path"]
-            projected_path = source["projected_path"]
-            previous_updated_at = source["updated_at"]
-            previous_revision = source["revision"]
-            pending_revision = source["pending_revision"]
-            if pending_revision is not None:
-                if previous_path != claimed_path:
-                    message = (
-                        f"Source UUID {source_uuid} still has a pending projection to "
-                        f"{previous_path}; repair it before claiming {claimed_path}."
-                    )
-                    raise RuntimeError(message)
-                claimed_revision = previous_revision + 1
-                cursor = conn.execute(
-                    """
-                    UPDATE sources
-                    SET updated_at = ?, revision = ?, pending_revision = ?
-                    WHERE uuid = ? AND current_path = ? AND revision = ?
-                      AND pending_revision = ?
-                    """,
-                    (
-                        now,
-                        claimed_revision,
-                        claimed_revision,
-                        source_uuid,
-                        previous_path,
-                        previous_revision,
-                        pending_revision,
-                    ),
-                )
-                if cursor.rowcount != 1:
-                    message = f"Pending source claim changed while retrying UUID {source_uuid}."
-                    raise RuntimeError(message)
-                conn.commit()
-                return SourcePathClaim(
-                    source_uuid,
-                    kind,
-                    previous_path,
-                    projected_path,
-                    claimed_path,
-                    previous_updated_at,
-                    pending_revision,
-                    claimed_revision,
-                    True,
-                )
-
-            claimed_revision = previous_revision + 1
-            cursor = conn.execute(
-                """
-                UPDATE sources
-                SET current_path = ?, updated_at = ?, revision = ?, pending_revision = ?
-                WHERE uuid = ? AND current_path = ? AND revision = ?
-                  AND pending_revision IS NULL
-                """,
-                (
-                    claimed_path,
-                    now,
-                    claimed_revision,
-                    claimed_revision,
-                    source_uuid,
-                    previous_path,
-                    previous_revision,
-                ),
-            )
-            if cursor.rowcount != 1:
-                message = f"Source path changed while claiming UUID {source_uuid}."
-                raise RuntimeError(message)
-            conn.commit()
-        return SourcePathClaim(
-            source_uuid,
-            kind,
-            previous_path,
-            projected_path,
-            claimed_path,
-            previous_updated_at,
-            None,
-            claimed_revision,
-            False,
-        )
-
-    def is_source_path_claim_current(self, claim: SourcePathClaim) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM sources
-                WHERE uuid = ? AND kind = ? AND current_path = ? AND projected_path = ?
-                  AND revision = ? AND pending_revision = ?
-                """,
-                (
-                    claim.source_uuid,
-                    claim.kind,
-                    claim.claimed_path,
-                    claim.projected_path,
-                    claim.claimed_revision,
-                    claim.claimed_revision,
-                ),
-            ).fetchone()
-            return row is not None
-
-    def finalize_source_path_claim(self, claim: SourcePathClaim) -> bool:
-        return self.finalize_source_path_claims((claim,))
-
-    def finalize_source_path_claims(self, claims: tuple[SourcePathClaim, ...]) -> bool:
-        if not claims:
-            return True
-        source_uuids = [claim.source_uuid for claim in claims]
-        if len(source_uuids) != len(set(source_uuids)):
-            message = "A source path claim batch cannot contain duplicate source UUIDs."
-            raise ValueError(message)
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                for claim in claims:
-                    current = conn.execute(
-                        """
-                        SELECT 1 FROM sources
-                        WHERE uuid = ? AND kind = ? AND current_path = ? AND projected_path = ?
-                          AND revision = ? AND pending_revision = ?
-                        """,
-                        (
-                            claim.source_uuid,
-                            claim.kind,
-                            claim.claimed_path,
-                            claim.projected_path,
-                            claim.claimed_revision,
-                            claim.claimed_revision,
-                        ),
-                    ).fetchone()
-                    if current is None:
-                        conn.rollback()
-                        return False
-                for claim in claims:
-                    cursor = conn.execute(
-                        """
-                        UPDATE sources
-                        SET projected_path = current_path, pending_revision = NULL
-                        WHERE uuid = ? AND kind = ? AND current_path = ? AND projected_path = ?
-                          AND revision = ? AND pending_revision = ?
-                        """,
-                        (
-                            claim.source_uuid,
-                            claim.kind,
-                            claim.claimed_path,
-                            claim.projected_path,
-                            claim.claimed_revision,
-                            claim.claimed_revision,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        conn.rollback()
-                        return False
-                    _source_claim_finalize_checkpoint("row")
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                raise
-        _source_claim_finalize_checkpoint("committed")
-        return True
-
-    def begin_source_path_rollback(
-        self,
-        claim: SourcePathClaim,
-        *,
-        now: str,
-    ) -> SourcePathClaim | None:
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            current_row = conn.execute(
-                """
-                SELECT uuid, kind, current_path, projected_path, updated_at,
-                       revision, pending_revision
-                FROM sources WHERE uuid = ?
-                """,
-                (claim.source_uuid,),
-            ).fetchone()
-            current = (
-                _decode_source_binding(current_row, "source rollback binding")
-                if current_row is not None
-                else None
-            )
-            if (
-                current is None
-                or current["kind"] != claim.kind
-                or current["current_path"] != claim.claimed_path
-                or current["projected_path"] != claim.projected_path
-                or current["revision"] != claim.claimed_revision
-                or current["pending_revision"] != claim.claimed_revision
-            ):
-                conn.rollback()
-                return None
-            rollback_revision = claim.claimed_revision + 1
-            try:
-                cursor = conn.execute(
-                    """
-                    UPDATE sources
-                    SET current_path = ?, projected_path = ?, updated_at = ?,
-                        revision = ?, pending_revision = ?
-                    WHERE uuid = ? AND kind = ? AND current_path = ? AND projected_path = ?
-                      AND revision = ? AND pending_revision = ?
-                    """,
-                    (
-                        claim.projected_path,
-                        claim.claimed_path,
-                        now,
-                        rollback_revision,
-                        rollback_revision,
-                        claim.source_uuid,
-                        claim.kind,
-                        claim.claimed_path,
-                        claim.projected_path,
-                        claim.claimed_revision,
-                        claim.claimed_revision,
-                    ),
-                )
-            except sqlite3.IntegrityError:
-                conn.rollback()
-                return None
-            if cursor.rowcount != 1:
-                conn.rollback()
-                return None
-            conn.commit()
-        return SourcePathClaim(
-            claim.source_uuid,
-            claim.kind,
-            claim.claimed_path,
-            claim.claimed_path,
-            claim.projected_path,
-            current["updated_at"],
-            claim.claimed_revision,
-            rollback_revision,
-            True,
-        )
-
-    def get_source(self, source_uuid: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT uuid, kind, current_path FROM sources WHERE uuid = ?",
-                (source_uuid,),
-            ).fetchone()
-            return _decode_source_identity(row, "source lookup") if row is not None else None
 
     def get_source_binding(self, source_uuid: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -586,47 +308,6 @@ class UserStateRepository:
             conn.commit()
         return next_revision
 
-    def get_pending_source_path_claim(self, source_uuid: str) -> SourcePathClaim | None:
-        binding = self.get_source_binding(source_uuid)
-        if binding is None or binding["pending_revision"] is None:
-            return None
-        projected_path = binding["projected_path"]
-        pending_revision = binding["pending_revision"]
-        if type(pending_revision) is not int:
-            message = "Decoded pending source claim is missing its integer revision."
-            raise StateSchemaError(message)
-        return SourcePathClaim(
-            source_uuid,
-            binding["kind"],
-            projected_path,
-            projected_path,
-            binding["current_path"],
-            binding["updated_at"],
-            pending_revision,
-            pending_revision,
-            True,
-        )
-
-    def list_pending_source_path_claims(self) -> tuple[SourcePathClaim, ...]:
-        with self._connect() as conn:
-            source_uuids = [
-                decode_required_text(
-                    row["uuid"],
-                    table="sources",
-                    column="uuid",
-                    context="pending source claim list",
-                    error_type=StateSchemaError,
-                )
-                for row in conn.execute(
-                    "SELECT uuid FROM sources WHERE pending_revision IS NOT NULL ORDER BY uuid"
-                ).fetchall()
-            ]
-        return tuple(
-            claim
-            for source_uuid in source_uuids
-            if (claim := self.get_pending_source_path_claim(source_uuid)) is not None
-        )
-
     def get_sources_by_path(self, kind: str, path: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -637,22 +318,6 @@ class UserStateRepository:
                 (kind, path),
             ).fetchall()
             return [_decode_source_identity(row, "source path lookup") for row in rows]
-
-    def get_source_by_path(self, kind: str, path: str) -> dict[str, Any] | None:
-        sources = self.get_sources_by_path(kind, path)
-        return sources[0] if len(sources) == 1 else None
-
-    def get_sources_by_projected_path(self, kind: str, path: str) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT uuid, kind, current_path, revision,
-                       projected_path, pending_revision, updated_at
-                FROM sources WHERE kind = ? AND projected_path = ? ORDER BY uuid
-                """,
-                (kind, path),
-            ).fetchall()
-            return [_decode_source_binding(row, "projected source path lookup") for row in rows]
 
     def get_sources_for_settings_path(self, kind: str, raw_path: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -669,31 +334,6 @@ class UserStateRepository:
                 (kind, raw_path, raw_path),
             ).fetchall()
             return [_decode_source_binding(row, "settings source path lookup") for row in rows]
-
-    def get_source_for_index_projection(self, kind: str, path: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT uuid, kind, current_path, revision,
-                       projected_path, pending_revision, updated_at
-                FROM sources
-                WHERE kind = ? AND (current_path = ? OR projected_path = ?)
-                ORDER BY uuid
-                """,
-                (kind, path, path),
-            ).fetchall()
-        decoded_rows = [
-            _decode_source_binding(row, "index projection source lookup") for row in rows
-        ]
-        unique_rows = {row["uuid"]: row for row in decoded_rows}
-        if len(unique_rows) > 1:
-            source_uuids = tuple(unique_rows)
-            message = (
-                f"Index projection path {path} is claimed by multiple source UUIDs: "
-                f"{', '.join(source_uuids)}."
-            )
-            raise AmbiguousSourceIdentityError(message, source_uuids=source_uuids)
-        return next(iter(unique_rows.values()), None)
 
     def update_source_path(self, source_uuid: str, path: str, *, now: str) -> None:
         with self._connect() as conn:
@@ -1094,7 +734,3 @@ def _decode_source_binding(row: sqlite3.Row, context: str) -> dict[str, Any]:
         }
     )
     return binding
-
-
-def _source_claim_finalize_checkpoint(_name: str) -> None:
-    return

@@ -24,6 +24,7 @@ from meetily_memory.db.row_decode import (
 from meetily_memory.domain import stable_evidence_id
 from meetily_memory.scanner.meetily_sqlite import normalize_meeting, validate_meetily_schema
 from meetily_memory.scanner.sqlite_source import readonly_sqlite_connection
+from meetily_memory.source_fingerprint import capture_source_fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator
@@ -60,6 +61,7 @@ class FreshIndexResult:
     chunks: int
     fts_rows: int
     bytes: int
+    source_fingerprint: str | None
     timings: FreshIndexTimings
 
     def as_payload(self) -> dict[str, object]:
@@ -74,6 +76,7 @@ class FreshIndexResult:
                 "fts_rows": self.fts_rows,
             },
             "bytes": self.bytes,
+            "source_fingerprint": self.source_fingerprint,
             "timings": self.timings.as_payload(),
         }
 
@@ -135,7 +138,7 @@ def iter_meetily_meetings(conn: sqlite3.Connection) -> Iterator[dict[str, Any]]:
         yield meeting
 
 
-def build_fresh_index(  # noqa: PLR0915
+def build_fresh_index(  # noqa: C901, PLR0915
     *,
     selected_source_uuid: str,
     selected_source_path: Path,
@@ -154,6 +157,7 @@ def build_fresh_index(  # noqa: PLR0915
     if not source_path.is_file():
         message = f"Selected Meetily source is not a regular file: {selected_source_path}."
         raise ValueError(message)
+    source_fingerprint_before = capture_source_fingerprint(source_path)
     destination = Path(destination_directory)
     destination.mkdir(parents=True, exist_ok=True)
     if not destination.is_dir():
@@ -200,6 +204,19 @@ def build_fresh_index(  # noqa: PLR0915
                 candidate.rollback()
                 raise
         populate_finished = perf_counter()
+        source_fingerprint_after = capture_source_fingerprint(source_path)
+        source_fingerprint = (
+            source_fingerprint_before
+            if source_fingerprint_before == source_fingerprint_after
+            else None
+        )
+        if source_fingerprint is not None:
+            with closing(sqlite3.connect(candidate_path)) as candidate:
+                candidate.execute(
+                    "UPDATE index_meta SET source_fingerprint=? WHERE singleton=1",
+                    (source_fingerprint,),
+                )
+                candidate.commit()
 
         validate_started = perf_counter()
         validated = validate_index_snapshot_database(candidate_path)
@@ -230,6 +247,7 @@ def build_fresh_index(  # noqa: PLR0915
             chunks=chunk_count,
             fts_rows=int(validated["fts_rows"]),
             bytes=candidate_path.stat().st_size,
+            source_fingerprint=source_fingerprint,
             timings=timings,
         )
     except BaseException:
@@ -269,10 +287,9 @@ def _populate_candidate(
             """
             INSERT INTO meetings (
               source_uuid, external_id, title, started_at, ended_at, created_at, updated_at,
-              folder_path, source_path, language, summary_text, raw_summary_json,
-              raw_metadata_json, fingerprint, indexed_at
+              folder_path, source_path, language, summary_text, indexed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source_uuid,
@@ -286,9 +303,6 @@ def _populate_candidate(
                 meeting.source_path,
                 meeting.language,
                 meeting.summary_text,
-                meeting.raw_summary_json,
-                meeting.raw_metadata_json,
-                meeting.fingerprint,
                 meeting.indexed_at,
             ),
         )
@@ -332,10 +346,9 @@ def _insert_chunk(
         """
         INSERT INTO chunks (
           meeting_id, external_id, evidence_id, kind, ordinal, text, speaker,
-          starts_at_seconds, ends_at_seconds, timestamp_label, token_count,
-          fingerprint, raw_metadata_json
+          starts_at_seconds, ends_at_seconds, timestamp_label
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             meeting_id,
@@ -348,9 +361,6 @@ def _insert_chunk(
             chunk.starts_at_seconds,
             chunk.ends_at_seconds,
             chunk.timestamp_label,
-            chunk.token_count,
-            chunk.fingerprint,
-            chunk.raw_metadata_json,
         ),
     )
     if cursor.lastrowid is None:

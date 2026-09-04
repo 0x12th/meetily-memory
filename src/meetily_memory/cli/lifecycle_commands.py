@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from datetime import UTC, datetime
 from locale import getlocale
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Annotated
 
 import typer
 
+from meetily_memory import autosync as autosync_service
 from meetily_memory.cli.common import (
     console,
     make_typer,
@@ -31,8 +33,10 @@ from meetily_memory.diagnostics import (
     inspect_local_databases,
     inspect_source_database,
 )
+from meetily_memory.obsidian_sync import sync_configured_obsidian_locked
 from meetily_memory.refresh import (
     PublishedIndex,
+    refresh_index_locked,
     relocate_selected_source_locked,
     switch_selected_source_locked,
 )
@@ -140,10 +144,16 @@ def configured_source_path(
 def scan_update(
     index_path: Path,
     source_path: Path,
+    *,
+    force: bool = False,
 ) -> tuple[dict[str, object], PublishedIndex]:
     user_state = source_state_repository(index_path)
     source_uuid = resolve_source_uuid(user_state, source_path)
-    result = switch_selected_source_locked(index_path, user_state, source_uuid)
+    selected = user_state.get_selected_source_binding()
+    if selected is not None and str(selected["uuid"]) == source_uuid:
+        result = refresh_index_locked(index_path, user_state, force=force)
+    else:
+        result = switch_selected_source_locked(index_path, user_state, source_uuid)
     payload: dict[str, object] = {
         "source_uuid": result.source.source_uuid,
         "source_revision": result.source.source_revision,
@@ -151,11 +161,13 @@ def scan_update(
         "chunks_seen": result.chunks,
         "fts_rows": result.fts_rows,
         "index_bytes": result.bytes,
+        "changed": result.changed,
     }
     return payload, result
 
 
 def print_update_payload(payload: dict[str, object]) -> None:
+    print_text_block(f"changed: {'yes' if payload['changed'] else 'no'}")
     console.print(f"meetings: {payload['meetings_seen']}")
     console.print(f"chunks: {payload['chunks_seen']}")
     console.print(f"fts rows: {payload['fts_rows']}")
@@ -196,6 +208,13 @@ def init(
         Path | None,
         typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
     ] = None,
+    autosync: Annotated[
+        bool | None,
+        typer.Option(
+            "--autosync/--no-autosync",
+            help="Enable or disable periodic refresh for this index.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
     try:
@@ -216,10 +235,34 @@ def init(
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
+    autosync_state = "not-requested"
+    if autosync is not None or not ctx.obj["index_explicit"]:
+        should_enable_autosync = autosync is not False
+        try:
+            if should_enable_autosync:
+                autosync_result = autosync_service.enable(ctx.obj["index_path"])
+            else:
+                current_autosync = autosync_service.status(ctx.obj["index_path"])
+                current_index = Path(ctx.obj["index_path"]).absolute()
+                owns_job = current_autosync.configured_index == current_index
+                autosync_result = (
+                    autosync_service.disable(ctx.obj["index_path"])
+                    if owns_job and current_autosync.state != "disabled"
+                    else current_autosync
+                )
+            autosync_state = autosync_result.state
+        except autosync_service.AutosyncError as exc:
+            message = (
+                "Initialization completed, but autosync failed: "
+                f"{exc}. Retry with `mm autosync enable`."
+            )
+            raise RuntimeError(message) from exc
+
     response = {
         "initialized": True,
         "index_path": str(ctx.obj["index_path"]),
         "source_path": str(source_path),
+        "autosync": autosync_state,
         **payload,
     }
     if json_output:
@@ -244,6 +287,9 @@ def status(
     source_path = str(configured_source) if configured_source else None
     stats = diagnostics.stats
     obsidian_configured = bool(settings.obsidian.vault_path)
+    autosync_state = (
+        autosync_service.status(index_path).state if sys.platform == "darwin" else "unavailable"
+    )
     resolved_ui_language = resolve_diagnostic_ui_language(
         settings, diagnostics.dominant_meeting_language
     )
@@ -256,6 +302,7 @@ def status(
         "resolved_ui_language": resolved_ui_language,
         "last_update_at": settings.last_update_at,
         "obsidian_configured": obsidian_configured,
+        "autosync": autosync_state,
         **stats,
     }
     if json_output:
@@ -269,6 +316,7 @@ def status(
     print_text_block(f"language: {resolved_ui_language} ({configured_label})")
     print_text_block(f"last refresh: {settings.last_update_at or 'never'}")
     print_text_block(f"obsidian: {'configured' if obsidian_configured else 'not configured'}")
+    print_text_block(f"autosync: {autosync_state}")
     print_text_block(f"meetings: {stats['meetings']}")
     print_text_block(f"chunks: {stats['chunks']}")
 
@@ -432,9 +480,12 @@ def run_refresh(
     index_path: Path,
     settings_path: Path,
     source_path: Path,
+    *,
+    force: bool = False,
+    sync_obsidian: bool = False,
 ) -> dict[str, object]:
     source_path = require_canonical_source_path(source_path)
-    payload, result = scan_update(index_path, source_path)
+    payload, result = scan_update(index_path, source_path, force=force)
     try:
         update_app_settings(
             settings_path=settings_path,
@@ -448,6 +499,16 @@ def run_refresh(
             "not record the refresh timestamp. Fix state.sqlite access and rerun `mm refresh`."
         )
         raise RuntimeError(message) from exc
+    if sync_obsidian:
+        try:
+            obsidian_result = sync_configured_obsidian_locked(index_path, settings_path)
+        except Exception as exc:
+            state = "completed" if result.changed else "unchanged"
+            message = f"Index refresh {state}; Obsidian sync failed: {exc}"
+            raise RuntimeError(message) from exc
+        payload["obsidian_sync"] = (
+            obsidian_result.as_payload() if obsidian_result is not None else None
+        )
     return payload
 
 
@@ -458,6 +519,14 @@ def refresh(
         Path | None,
         typer.Option("--source", help="Path to Meetily meeting_minutes.sqlite."),
     ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Rebuild even when the source fingerprint is unchanged."),
+    ] = False,
+    sync_obsidian: Annotated[
+        bool,
+        typer.Option("--sync-obsidian", help="Sync configured Obsidian notes after refresh."),
+    ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
     try:
@@ -472,6 +541,8 @@ def refresh(
                 ctx.obj["index_path"],
                 ctx.obj["settings_path"],
                 source_path,
+                force=force,
+                sync_obsidian=sync_obsidian,
             )
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -479,6 +550,12 @@ def refresh(
         print_json(payload)
         return
     print_update_payload(payload)
+    if sync_obsidian:
+        print_text_block(
+            "obsidian sync: completed"
+            if payload.get("obsidian_sync") is not None
+            else "obsidian sync: skipped"
+        )
 
 
 @app.command("update")

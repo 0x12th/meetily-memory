@@ -7,6 +7,7 @@ from typing import Never
 
 from meetily_memory.db.index_snapshot import (
     IndexSnapshotError,
+    IndexSnapshotMetadata,
     remove_index_snapshot,
     validate_index_snapshot_database,
 )
@@ -17,6 +18,7 @@ from meetily_memory.scanner.fresh_index import (
     build_fresh_index,
     cleanup_fresh_index,
 )
+from meetily_memory.source_fingerprint import capture_source_fingerprint
 from meetily_memory.user_state import UserStateRepository
 
 SOURCE_KIND = "meetily_sqlite"
@@ -38,6 +40,7 @@ class PublishedIndex:
     chunks: int
     fts_rows: int
     bytes: int
+    changed: bool = True
 
 
 @dataclass(frozen=True)
@@ -90,15 +93,29 @@ def source_from_state(state: UserStateRepository, source_uuid: str) -> SourceSel
     return _selection_from_binding(binding)
 
 
-def refresh_index(index_path: Path, *, state_path: Path | None = None) -> PublishedIndex:
+def refresh_index(
+    index_path: Path,
+    *,
+    state_path: Path | None = None,
+    force: bool = False,
+) -> PublishedIndex:
     canonical = Path(index_path)
     with RefreshLock(canonical):
         state = UserStateRepository(state_path or canonical.with_name("state.sqlite"))
-        return refresh_index_locked(canonical, state)
+        return refresh_index_locked(canonical, state, force=force)
 
 
-def refresh_index_locked(index_path: Path, state: UserStateRepository) -> PublishedIndex:
+def refresh_index_locked(
+    index_path: Path,
+    state: UserStateRepository,
+    *,
+    force: bool = False,
+) -> PublishedIndex:
     source = selected_source_from_state(state)
+    if not force:
+        unchanged = unchanged_published_index(index_path, state, source)
+        if unchanged is not None:
+            return unchanged
     candidate = build_fresh_index(
         selected_source_uuid=source.source_uuid,
         selected_source_path=source.source_path,
@@ -106,6 +123,34 @@ def refresh_index_locked(index_path: Path, state: UserStateRepository) -> Publis
         destination_directory=Path(index_path).parent,
     )
     return publish_index_candidate_locked(index_path, state, source, candidate)
+
+
+def unchanged_published_index(
+    index_path: Path,
+    state: UserStateRepository,
+    source: SourceSelection,
+) -> PublishedIndex | None:
+    canonical = Path(index_path)
+    try:
+        metadata = validate_index_snapshot_database(canonical)
+    except (IndexSnapshotError, OSError, ValueError):
+        return None
+    _require_expected_snapshot(metadata, source)
+    _require_current_source(state, source)
+    stored_fingerprint = metadata["source_fingerprint"]
+    if not isinstance(stored_fingerprint, str):
+        return None
+    if capture_source_fingerprint(source.source_path) != stored_fingerprint:
+        return None
+    return PublishedIndex(
+        index_path=canonical,
+        source=source,
+        meetings=metadata["meetings"],
+        chunks=metadata["chunks"],
+        fts_rows=metadata["fts_rows"],
+        bytes=canonical.stat().st_size,
+        changed=False,
+    )
 
 
 def switch_selected_source_locked(
@@ -227,9 +272,9 @@ def publish_index_candidate_locked(
     return PublishedIndex(
         index_path=canonical,
         source=source,
-        meetings=int(final["meetings"]),
-        chunks=int(final["chunks"]),
-        fts_rows=int(final["fts_rows"]),
+        meetings=final["meetings"],
+        chunks=final["chunks"],
+        fts_rows=final["fts_rows"],
         bytes=canonical.stat().st_size,
     )
 
@@ -293,13 +338,13 @@ def _require_current_source(state: UserStateRepository, source: SourceSelection)
 
 
 def _require_expected_snapshot(
-    metadata: dict[str, int | str],
+    metadata: IndexSnapshotMetadata,
     source: SourceSelection,
 ) -> None:
     actual = (
         str(metadata["source_uuid"]),
         str(Path(str(metadata["source_path"])).resolve()),
-        int(metadata["source_revision"]),
+        metadata["source_revision"],
     )
     expected = (
         source.source_uuid,

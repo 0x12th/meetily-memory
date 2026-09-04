@@ -10,10 +10,7 @@ from meetily_memory.repositories.index import IndexRepository, meeting_from_row
 from meetily_memory.retrieval import (
     LexicalRetrievalStrategy,
     LexicalTagMeetingRetrievalStrategy,
-    MeetingRetrievalStrategy,
-    RetrievalStrategy,
     TagRetrievalStrategy,
-    search_meetings_with_builtin_snapshot,
 )
 from meetily_memory.tagging import TagRepository
 
@@ -24,8 +21,6 @@ class MeetilyMemoryCore:
         index_path: Path,
         *,
         state_path: Path | None = None,
-        retrieval_strategy: RetrievalStrategy | None = None,
-        meeting_retrieval_strategy: MeetingRetrievalStrategy | None = None,
     ) -> None:
         self._index_path = Path(index_path)
         self._state_path = (
@@ -38,10 +33,10 @@ class MeetilyMemoryCore:
             state_path=self._state_path,
         )
         self._repository = repository
-        lexical = retrieval_strategy or LexicalRetrievalStrategy(repository)
+        lexical = LexicalRetrievalStrategy(repository)
         tag_repository = TagRepository.open_existing(repository.state_path)
         tag_retrieval = TagRetrievalStrategy(tag_repository)
-        self._meeting_retrieval = meeting_retrieval_strategy or LexicalTagMeetingRetrievalStrategy(
+        self._meeting_retrieval = LexicalTagMeetingRetrievalStrategy(
             repository=repository,
             lexical=lexical,
             tags=tag_retrieval,
@@ -55,14 +50,7 @@ class MeetilyMemoryCore:
         *,
         filters: MeetingSearchFilters | None = None,
     ) -> SearchResults:
-        results = search_meetings_with_builtin_snapshot(
-            self._repository,
-            self._meeting_retrieval,
-            query,
-            limit,
-            context,
-            filters=filters,
-        )
+        results = self._meeting_retrieval.search_meetings(query, limit, context, filters=filters)
         return SearchResults(query=query, context=context, results=results)
 
     def meetings(self, limit: int = 20) -> tuple[Meeting, ...]:

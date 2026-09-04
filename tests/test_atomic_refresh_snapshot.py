@@ -114,6 +114,58 @@ def test_refresh_replaces_reopens_and_searches_stable_evidence(
     assert all(not sidecar.exists() for sidecar in _sidecars(index_path))
 
 
+def test_refresh_noops_when_source_fingerprint_is_unchanged(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    _selected_state(index_path, meetily_db)
+
+    first = refresh_index(index_path)
+    before = (index_path.stat().st_ino, index_path.stat().st_mtime_ns, index_path.read_bytes())
+    second = refresh_index(index_path)
+
+    assert first.changed is True
+    assert second.changed is False
+    after = (index_path.stat().st_ino, index_path.stat().st_mtime_ns, index_path.read_bytes())
+    assert after == before
+
+
+def test_forced_refresh_rebuilds_an_unchanged_source(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    _selected_state(index_path, meetily_db)
+    refresh_index(index_path)
+    before_inode = index_path.stat().st_ino
+
+    forced = refresh_index(index_path, force=True)
+
+    assert forced.changed is True
+    assert index_path.stat().st_ino != before_inode
+
+
+def test_wal_change_invalidates_source_fingerprint(
+    meetily_db: Path,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    _selected_state(index_path, meetily_db)
+    refresh_index(index_path)
+
+    with sqlite3.connect(meetily_db) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("UPDATE meetings SET title='WAL title' WHERE id='meeting-1'")
+        writer.commit()
+        assert meetily_db.with_name(meetily_db.name + "-wal").exists()
+
+        refreshed = refresh_index(index_path)
+
+    assert refreshed.changed is True
+    assert _coherent_content(index_path)[0] == "WAL title"
+
+
 def test_cli_refresh_search_status_and_doctor_use_disposable_snapshot(
     meetily_db: Path,
     tmp_path: Path,

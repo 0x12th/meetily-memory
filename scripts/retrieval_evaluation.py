@@ -1,3 +1,5 @@
+# ruff: noqa: INP001
+
 import hashlib
 import math
 import shutil
@@ -9,19 +11,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from statistics import median
 from time import perf_counter
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
 from meetily_memory.db.schema import existing_index_connection
-from meetily_memory.domain import MeetingRef, MeetingSearchResult, RetrievalSource, SearchHit
+from meetily_memory.domain import (
+    MeetingRef,
+    MeetingSearchFilters,
+    MeetingSearchResult,
+    RetrievalSource,
+    SearchHit,
+)
 from meetily_memory.json_codec import dumps_json, dumps_json_bytes, loads_json
 from meetily_memory.repositories.index import IndexRepository
-from meetily_memory.retrieval import (
-    LexicalRetrievalStrategy,
-    MeetingRetrievalStrategy,
-    RetrievalStrategy,
-    search_hits_with_builtin_snapshot,
-    search_meetings_with_builtin_snapshot,
-)
 from meetily_memory.tagging import TagRepository
 
 EVALUATION_SCHEMA_VERSION = "meetily-memory.eval.v2"
@@ -45,6 +46,27 @@ TASK_CLASSES = frozenset(
         "paraphrase",
     }
 )
+
+
+class RetrievalStrategy(Protocol):
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> tuple[SearchHit, ...]: ...
+
+
+class MeetingRetrievalStrategy(Protocol):
+    def search_meetings(
+        self,
+        query: str,
+        limit: int = 10,
+        context: int = 0,
+        *,
+        filters: MeetingSearchFilters | None = None,
+    ) -> tuple[MeetingSearchResult, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -431,21 +453,20 @@ def retrieve_results(
     context: int,
 ) -> tuple[MeetingSearchResult, ...]:
     if config.meeting_strategy is not None:
-        return search_meetings_with_builtin_snapshot(
-            repository,
-            config.meeting_strategy,
-            query,
-            limit,
-            context,
-        )
-    strategy = config.strategy or LexicalRetrievalStrategy(repository)
-    hits = search_hits_with_builtin_snapshot(
-        repository,
-        strategy,
-        query,
-        limit,
-        context,
-    )
+        return config.meeting_strategy.search_meetings(query, limit, context)
+    if config.strategy is not None:
+        hits = config.strategy.search(query, limit)
+        if context:
+            hits = repository.expand_search_hits(hits, context)
+    else:
+        with repository.operation_snapshot() as operation_snapshot:
+            hits = repository.search_hits(query, limit, connection=operation_snapshot)
+            if context:
+                hits = repository.expand_search_hits(
+                    hits,
+                    context,
+                    connection=operation_snapshot,
+                )
     return collapse_search_hits(repository, hits, config.mode)
 
 
@@ -487,13 +508,13 @@ def observe_task(
 def collapse_search_hits(
     _repository: IndexRepository,
     hits: tuple[SearchHit, ...],
-    mode: str,
+    _mode: str,
 ) -> tuple[MeetingSearchResult, ...]:
     grouped: dict[MeetingRef, list[SearchHit]] = {}
     for hit in hits:
         key = hit.meeting.ref
         grouped.setdefault(key, []).append(hit)
-    source = RetrievalSource.SEMANTIC if mode == "semantic" else RetrievalSource.FTS
+    source = RetrievalSource.FTS
     results: list[MeetingSearchResult] = []
     for evidence in grouped.values():
         meeting = evidence[0].meeting
@@ -719,8 +740,10 @@ def corpus_fingerprint(index_path: Path) -> str:
         rows = conn.execute(
             """
             SELECT 'meetily_sqlite' AS kind, i.source_path AS path,
-                   m.external_id, m.fingerprint, c.external_id,
-                   c.kind, c.ordinal, c.fingerprint
+                   i.source_fingerprint, m.external_id, m.title,
+                   m.created_at, m.updated_at, c.external_id, c.evidence_id,
+                   c.kind, c.ordinal, c.text, c.speaker,
+                   c.starts_at_seconds, c.ends_at_seconds, c.timestamp_label
             FROM chunks c
             JOIN meetings m ON m.id = c.meeting_id
             JOIN index_meta i ON i.singleton = 1

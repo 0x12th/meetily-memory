@@ -51,6 +51,7 @@ def test_fresh_index_has_exact_schema_one_source_and_no_sidecars(
         "meetings": 2,
         "chunks": 6,
         "fts_rows": 6,
+        "source_fingerprint": result.source_fingerprint,
     }
     assert result.meetings == 2
     assert result.chunks == 6
@@ -71,10 +72,46 @@ def test_fresh_index_has_exact_schema_one_source_and_no_sidecars(
         assert conn.execute(
             """
             SELECT schema_family, schema_epoch, source_uuid, source_revision,
-                   meeting_count, chunk_count
+                   meeting_count, chunk_count, source_fingerprint
             FROM index_meta
             """
-        ).fetchone() == (INDEX_SCHEMA_FAMILY, INDEX_SCHEMA_EPOCH, source_uuid, 0, 2, 6)
+        ).fetchone() == (
+            INDEX_SCHEMA_FAMILY,
+            INDEX_SCHEMA_EPOCH,
+            source_uuid,
+            0,
+            2,
+            6,
+            result.source_fingerprint,
+        )
+        assert [row[1] for row in conn.execute("PRAGMA table_info(meetings)")] == [
+            "id",
+            "source_uuid",
+            "external_id",
+            "title",
+            "started_at",
+            "ended_at",
+            "created_at",
+            "updated_at",
+            "folder_path",
+            "source_path",
+            "language",
+            "summary_text",
+            "indexed_at",
+        ]
+        assert [row[1] for row in conn.execute("PRAGMA table_info(chunks)")] == [
+            "id",
+            "meeting_id",
+            "external_id",
+            "evidence_id",
+            "kind",
+            "ordinal",
+            "text",
+            "speaker",
+            "starts_at_seconds",
+            "ends_at_seconds",
+            "timestamp_label",
+        ]
         assert conn.execute("SELECT DISTINCT source_uuid FROM meetings").fetchall() == [
             (source_uuid,)
         ]

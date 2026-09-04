@@ -5,7 +5,6 @@ from itertools import batched
 from typing import TYPE_CHECKING, Any
 
 from meetily_memory.db.row_decode import (
-    decode_nullable_integer,
     decode_nullable_real,
     decode_nullable_text,
     decode_required_integer,
@@ -34,7 +33,7 @@ def _decode_meeting_row(row: Mapping[str, Any], context: str) -> dict[str, Any]:
         context=context,
         error_type=IndexReadError,
     )
-    for column in ("source_uuid", "external_id", "title", "fingerprint", "indexed_at"):
+    for column in ("source_uuid", "external_id", "title", "indexed_at"):
         decoded[column] = decode_required_text(
             row[column],
             table="meetings",
@@ -51,8 +50,6 @@ def _decode_meeting_row(row: Mapping[str, Any], context: str) -> dict[str, Any]:
         "source_path",
         "language",
         "summary_text",
-        "raw_summary_json",
-        "raw_metadata_json",
     ):
         decoded[column] = decode_nullable_text(
             row[column],
@@ -83,7 +80,7 @@ def _decode_chunk_row(row: Mapping[str, Any], context: str) -> dict[str, Any]:
             context=context,
             error_type=IndexReadError,
         )
-    for column in ("evidence_id", "kind", "text", "fingerprint"):
+    for column in ("evidence_id", "kind", "text"):
         decoded[column] = decode_required_text(
             row[column],
             table="chunks",
@@ -95,7 +92,6 @@ def _decode_chunk_row(row: Mapping[str, Any], context: str) -> dict[str, Any]:
         "external_id",
         "speaker",
         "timestamp_label",
-        "raw_metadata_json",
     ):
         decoded[column] = decode_nullable_text(
             row[column],
@@ -112,13 +108,6 @@ def _decode_chunk_row(row: Mapping[str, Any], context: str) -> dict[str, Any]:
             context=context,
             error_type=IndexReadError,
         )
-    decoded["token_count"] = decode_nullable_integer(
-        row["token_count"],
-        table="chunks",
-        column="token_count",
-        context=context,
-        error_type=IndexReadError,
-    )
     return decoded
 
 

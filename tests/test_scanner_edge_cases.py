@@ -9,7 +9,6 @@ import pytest
 from meetily_memory.repositories.index import IndexRepository
 from meetily_memory.scanner.meetily_sqlite import (
     extract_language,
-    fingerprint_json,
     normalize_meeting,
 )
 from tests.index_helpers import publish_fresh_index
@@ -64,38 +63,6 @@ def test_normalize_meeting_assigns_retained_chunks_contiguous_global_ordinals() 
         ("note", "note:meeting-edge", 3, "Retained note."),
     ]
     assert [chunk.ordinal for chunk in chunks] == list(range(len(chunks)))
-
-
-def test_contiguous_order_changes_the_pre_fix_meeting_fingerprint() -> None:
-    upstream = _upstream_meeting(
-        [
-            {"id": "transcript-first", "transcript": "First retained transcript."},
-            {"id": "blank-middle", "transcript": " "},
-            {"id": "transcript-second", "transcript": "Second retained transcript."},
-        ]
-    )
-
-    meeting, chunks = normalize_meeting(
-        Path("source.sqlite"),
-        upstream,
-        "2026-08-28T00:00:00Z",
-    )
-    previous_fingerprint = fingerprint_json(
-        {
-            "meeting": {
-                "id": upstream.get("id"),
-                "title": upstream.get("title"),
-                "created_at": upstream.get("created_at"),
-                "updated_at": upstream.get("updated_at"),
-                "folder_path": upstream.get("folder_path"),
-            },
-            "chunks": [chunk.fingerprint for chunk in chunks],
-            "summary": upstream.get("summary_process"),
-            "notes": upstream.get("notes"),
-        }
-    )
-
-    assert meeting.fingerprint != previous_fingerprint
 
 
 def test_normalize_meeting_starts_summary_and_note_at_zero_when_transcripts_are_blank() -> None:

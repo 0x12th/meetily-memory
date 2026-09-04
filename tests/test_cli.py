@@ -4,18 +4,21 @@ import sqlite3
 from datetime import UTC, datetime
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
+from meetily_memory.cli import lifecycle_commands
 from meetily_memory.cli.app import app
 from meetily_memory.cli.common import open_path
 from meetily_memory.cli.search_commands import parse_search_filters
 from meetily_memory.config.settings import (
     ObsidianSettings,
     load_app_settings,
+    update_app_settings,
 )
 from meetily_memory.db.schema_family import INDEX_SCHEMA_USER_VERSION
 from meetily_memory.json_codec import loads_json
@@ -97,6 +100,7 @@ def test_cli_help_uses_plain_click_format() -> None:
         "s",
         "open",
         "tag",
+        "autosync",
         "obsidian",
     ):
         assert re.search(rf"\n  {re.escape(command)}(?:\s{{2,}}|\n)", help_result.stdout)
@@ -549,7 +553,6 @@ def test_cli_removed_public_commands_are_not_available() -> None:
         "semantic",
         "ask",
         "llm",
-        "autosync",
         "c",
         "t",
         "topic",
@@ -608,8 +611,9 @@ def test_cli_init_status_and_obsidian_sync(
     assert loads_json(obsidian_status.stdout) == {
         "vault_path": str(vault_dir),
         "folder": "Meetily Memory",
-        "last_sync_at": None,
+        "last_sync_at": load_app_settings(data_dir / "settings.json").obsidian.last_sync_at,
     }
+    assert load_app_settings(data_dir / "settings.json").obsidian.last_sync_at is not None
 
     obsidian_sync = runner.invoke(
         app,
@@ -629,6 +633,75 @@ def test_cli_init_status_and_obsidian_sync(
     assert "<!-- meetily-memory:managed:v2:" in meeting_note.read_text(encoding="utf-8")
 
 
+def test_default_init_enables_autosync_but_explicit_index_does_not(
+    meetily_db: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "default"
+    enabled: list[Path] = []
+
+    def fake_enable(index_path: Path) -> SimpleNamespace:
+        enabled.append(Path(index_path))
+        return SimpleNamespace(state="enabled")
+
+    monkeypatch.setattr(lifecycle_commands.autosync_service, "enable", fake_enable)
+    runner = CliRunner()
+    default_init = runner.invoke(
+        app,
+        ["init", "--source", str(meetily_db)],
+        env={"MEETILY_MEMORY_DATA_DIR": str(data_dir)},
+    )
+    explicit_index = tmp_path / "workspace" / "index.sqlite"
+    explicit_init = runner.invoke(
+        app,
+        ["--index", str(explicit_index), "init", "--source", str(meetily_db)],
+    )
+
+    assert default_init.exit_code == 0, default_init.output
+    assert explicit_init.exit_code == 0, explicit_init.output
+    assert enabled == [data_dir / "index.sqlite"]
+
+
+def test_refresh_keeps_successful_index_result_when_obsidian_sync_fails(
+    meetily_db: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    settings_path = tmp_path / "settings.json"
+    runner = CliRunner()
+    initialized = runner.invoke(
+        app,
+        ["--index", str(index_path), "init", "--source", str(meetily_db)],
+    )
+    assert initialized.exit_code == 0, initialized.output
+    update_app_settings(settings_path=settings_path, last_update_at="old")
+    before = index_path.read_bytes()
+
+    def fail_sync(*_args: object, **_kwargs: object) -> None:
+        message = "vault unavailable"
+        raise OSError(message)
+
+    monkeypatch.setattr(lifecycle_commands, "sync_configured_obsidian_locked", fail_sync)
+    refreshed = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "refresh",
+            "--source",
+            str(meetily_db),
+            "--sync-obsidian",
+        ],
+    )
+
+    assert refreshed.exit_code != 0
+    assert "Index refresh unchanged; Obsidian sync failed" in str(refreshed.exception)
+    assert index_path.read_bytes() == before
+    assert load_app_settings(settings_path).last_update_at != "old"
+
+
 def test_cli_obsidian_uses_workspace_settings_scope_and_manual_sync(
     meetily_db: Path,
     tmp_path: Path,
@@ -642,12 +715,10 @@ def test_cli_obsidian_uses_workspace_settings_scope_and_manual_sync(
     global_vault = tmp_path / "global-vault"
     runner = CliRunner()
 
-    global_configured = runner.invoke(
-        app,
-        ["obsidian", "init", "--vault", str(global_vault)],
-        env={"MEETILY_MEMORY_DATA_DIR": str(global_data_dir)},
+    update_app_settings(
+        settings_path=global_settings,
+        obsidian=ObsidianSettings(vault_path=str(global_vault)),
     )
-    assert global_configured.exit_code == 0
 
     init = runner.invoke(
         app,
@@ -697,6 +768,22 @@ def test_cli_obsidian_uses_workspace_settings_scope_and_manual_sync(
     assert refresh.exit_code == 0
     assert "obsidian_synced" not in loads_json(refresh.stdout)
     assert not meeting_note.exists()
+
+    scheduled = runner.invoke(
+        app,
+        [
+            "--index",
+            str(index_path),
+            "refresh",
+            "--source",
+            str(meetily_db),
+            "--sync-obsidian",
+            "--json",
+        ],
+    )
+    assert scheduled.exit_code == 0, scheduled.output
+    assert loads_json(scheduled.stdout)["changed"] is False
+    assert meeting_note.exists()
 
     workspace_config = load_app_settings(workspace_settings)
     global_config = load_app_settings(global_settings)

@@ -1,4 +1,3 @@
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -6,14 +5,18 @@ import typer
 
 from meetily_memory.cli.common import make_typer, print_json, print_text_block
 from meetily_memory.config.settings import ObsidianSettings, load_app_settings, update_app_settings
-from meetily_memory.integrations import obsidian_root_dir, sync_obsidian_vault
+from meetily_memory.integrations import ObsidianSyncResult, obsidian_root_dir
+from meetily_memory.obsidian_sync import sync_configured_obsidian_locked
 from meetily_memory.refresh_lock import RefreshLock, RefreshLockBusyError
 
 obsidian_app = make_typer("Sync Meetily Memory into Obsidian.")
 
 
-def utc_now_iso() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def print_sync_result(result: ObsidianSyncResult) -> None:
+    print_text_block(f"obsidian root: {result.root_dir}")
+    print_text_block(f"obsidian files synced: {result.files_written}")
+    print_text_block(f"obsidian files skipped: {result.files_skipped}")
+    print_text_block(f"obsidian files removed: {result.files_removed}")
 
 
 @obsidian_app.command("init")
@@ -40,12 +43,25 @@ def obsidian_init(
             folder=folder,
         ),
     )
-    payload = settings.obsidian.__dict__
+    try:
+        with RefreshLock(ctx.obj["index_path"]):
+            result = sync_configured_obsidian_locked(
+                ctx.obj["index_path"],
+                ctx.obj["settings_path"],
+                required=True,
+            )
+    except RefreshLockBusyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if result is None:
+        message = "Configured Obsidian sync unexpectedly returned no result."
+        raise RuntimeError(message)
+    payload = {**settings.obsidian.__dict__, "sync": result.as_payload()}
     if json_output:
         print_json(payload)
         return
     print_text_block(f"obsidian vault: {settings.obsidian.vault_path}")
     print_text_block(f"obsidian folder: {settings.obsidian.folder}")
+    print_sync_result(result)
 
 
 @obsidian_app.command("sync")
@@ -53,31 +69,24 @@ def obsidian_sync(
     ctx: typer.Context,
     json_output: Annotated[bool, typer.Option("--json", help="Output JSON.")] = False,
 ) -> None:
-    settings = load_app_settings(ctx.obj["settings_path"])
-    if not settings.obsidian.vault_path:
-        message = "Obsidian is not configured. Run `mm obsidian init`."
-        raise typer.BadParameter(message)
     try:
         with RefreshLock(ctx.obj["index_path"]):
-            result = sync_obsidian_vault(
+            result = sync_configured_obsidian_locked(
                 ctx.obj["index_path"],
-                Path(settings.obsidian.vault_path),
-                settings.obsidian.folder,
-            )
-            update_app_settings(
-                settings_path=ctx.obj["settings_path"],
-                expected_obsidian=settings.obsidian,
-                obsidian_last_sync_at=utc_now_iso(),
+                ctx.obj["settings_path"],
+                required=True,
             )
     except RefreshLockBusyError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if result is None:
+        message = "Configured Obsidian sync unexpectedly returned no result."
+        raise RuntimeError(message)
     if json_output:
         print_json(result.as_payload())
         return
-    print_text_block(f"obsidian root: {result.root_dir}")
-    print_text_block(f"obsidian files synced: {result.files_written}")
-    print_text_block(f"obsidian files skipped: {result.files_skipped}")
-    print_text_block(f"obsidian files removed: {result.files_removed}")
+    print_sync_result(result)
 
 
 @obsidian_app.command("status")

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
 from typing import TYPE_CHECKING
 
 import pytest
@@ -26,11 +24,7 @@ from meetily_memory.db.state_schema import (
     create_state_database,
     validate_state_database,
 )
-from meetily_memory.user_state import (
-    AmbiguousSourceIdentityError,
-    SourcePathClaim,
-    UserStateRepository,
-)
+from meetily_memory.user_state import UserStateRepository
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,9 +54,30 @@ def test_schema_family_constants_are_stable() -> None:
     assert STATE_APPLICATION_ID == 0x4D4D5354
     assert INDEX_APPLICATION_ID == 0x4D4D4958
     assert STATE_SCHEMA_EPOCH == 1
-    assert INDEX_SCHEMA_EPOCH == 1
+    assert INDEX_SCHEMA_EPOCH == 2
     assert STATE_SCHEMA_USER_VERSION == 1001
-    assert INDEX_SCHEMA_USER_VERSION == 1001
+    assert INDEX_SCHEMA_USER_VERSION == 1002
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "open_existing_writer",
+        "claim_source_path",
+        "is_source_path_claim_current",
+        "finalize_source_path_claim",
+        "finalize_source_path_claims",
+        "begin_source_path_rollback",
+        "get_source",
+        "get_pending_source_path_claim",
+        "list_pending_source_path_claims",
+        "get_source_by_path",
+        "get_sources_by_projected_path",
+        "get_source_for_index_projection",
+    ],
+)
+def test_user_state_exposes_no_retired_source_projection_api(method_name: str) -> None:
+    assert not hasattr(UserStateRepository, method_name)
 
 
 def test_fresh_state_has_exact_epoch_schema_identity_and_singletons(tmp_path: Path) -> None:
@@ -305,92 +320,3 @@ def test_source_uuid_survives_explicit_path_update(tmp_path: Path) -> None:
     assert (
         state.get_or_create_source("meetily_sqlite", "/new/source.sqlite", now="3") == source_uuid
     )
-
-
-def test_atomic_source_path_claim_allows_only_one_competing_uuid(tmp_path: Path) -> None:
-    state_path = tmp_path / "state.sqlite"
-    state = UserStateRepository(state_path)
-    first_uuid = state.get_or_create_source("meetily_sqlite", "/old/first.sqlite", now="1")
-    second_uuid = state.get_or_create_source("meetily_sqlite", "/old/second.sqlite", now="1")
-    target_path = tmp_path / "target.sqlite"
-    target_path.touch()
-    barrier = Barrier(2)
-
-    def claim(source_uuid: str) -> SourcePathClaim | AmbiguousSourceIdentityError:
-        repository = UserStateRepository(state_path)
-        barrier.wait(timeout=5)
-        try:
-            return repository.claim_source_path(
-                source_uuid,
-                "meetily_sqlite",
-                target_path,
-                now=source_uuid,
-            )
-        except AmbiguousSourceIdentityError as exc:
-            return exc
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(claim, (first_uuid, second_uuid)))
-
-    claims = [result for result in results if isinstance(result, SourcePathClaim)]
-    conflicts = [result for result in results if isinstance(result, AmbiguousSourceIdentityError)]
-    assert len(claims) == 1
-    assert len(conflicts) == 1
-
-
-def test_same_target_retry_preserves_projection_and_finalizes_once(tmp_path: Path) -> None:
-    state_path = tmp_path / "state.sqlite"
-    state = UserStateRepository(state_path)
-    source_uuid = state.get_or_create_source("meetily_sqlite", "/old/source.sqlite", now="1")
-    target_path = tmp_path / "target.sqlite"
-    target_path.touch()
-    first_claim = state.claim_source_path(
-        source_uuid,
-        "meetily_sqlite",
-        target_path,
-        now="2",
-    )
-
-    restarted_state = UserStateRepository(state_path)
-    retry_claim = restarted_state.claim_source_path(
-        source_uuid,
-        "meetily_sqlite",
-        target_path,
-        now="3",
-    )
-
-    assert retry_claim.claimed_revision > first_claim.claimed_revision
-    assert retry_claim.projected_path == "/old/source.sqlite"
-    assert retry_claim.resumed is True
-    assert restarted_state.finalize_source_path_claim(retry_claim) is True
-    assert restarted_state.finalize_source_path_claim(first_claim) is False
-    assert restarted_state.get_source_binding(source_uuid) == {
-        "uuid": source_uuid,
-        "kind": "meetily_sqlite",
-        "current_path": str(target_path.resolve(strict=True)),
-        "revision": retry_claim.claimed_revision,
-        "projected_path": str(target_path.resolve(strict=True)),
-        "pending_revision": None,
-        "updated_at": "3",
-    }
-
-
-def test_source_path_claim_compensation_is_token_guarded(tmp_path: Path) -> None:
-    state = UserStateRepository(tmp_path / "state.sqlite")
-    source_uuid = state.get_or_create_source("meetily_sqlite", "/old/source.sqlite", now="1")
-    target_path = tmp_path / "target.sqlite"
-    target_path.touch()
-    first_claim = state.claim_source_path(
-        source_uuid,
-        "meetily_sqlite",
-        target_path,
-        now="2",
-    )
-
-    rollback_claim = state.begin_source_path_rollback(first_claim, now="rollback")
-
-    assert rollback_claim is not None
-    assert rollback_claim.claimed_path == "/old/source.sqlite"
-    assert rollback_claim.projected_path == str(target_path.resolve(strict=True))
-    assert state.finalize_source_path_claim(rollback_claim) is True
-    assert state.begin_source_path_rollback(first_claim, now="stale") is None

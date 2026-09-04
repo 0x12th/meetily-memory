@@ -4,7 +4,14 @@ from pathlib import Path
 import pytest
 
 from meetily_memory.domain import MeetingSearchFilters, SearchHit
-from meetily_memory.evaluation import (
+from meetily_memory.repositories.index import IndexRepository
+from meetily_memory.retrieval import (
+    LexicalRetrievalStrategy,
+    LexicalTagMeetingRetrievalStrategy,
+    TagRetrievalStrategy,
+)
+from meetily_memory.tagging import TagRepository, TagService
+from scripts.retrieval_evaluation import (
     EvaluationDataset,
     EvaluationManifest,
     EvaluationReport,
@@ -17,13 +24,6 @@ from meetily_memory.evaluation import (
     evaluate_retrieval,
     load_dataset,
 )
-from meetily_memory.repositories.index import IndexRepository
-from meetily_memory.retrieval import (
-    LexicalRetrievalStrategy,
-    LexicalTagMeetingRetrievalStrategy,
-    TagRetrievalStrategy,
-)
-from meetily_memory.tagging import TagRepository, TagService
 from tests.index_helpers import publish_fresh_index
 
 

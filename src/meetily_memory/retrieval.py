@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, TypeGuard
+from typing import TYPE_CHECKING
 
 from meetily_memory.domain import (
     Meeting,
@@ -21,27 +21,6 @@ if TYPE_CHECKING:
 RETRIEVAL_CANDIDATE_MULTIPLIER = 4
 MAX_EVIDENCE_PER_SOURCE = 2
 MeetingKey = MeetingRef
-
-
-class RetrievalStrategy(Protocol):
-    def search(
-        self,
-        query: str,
-        limit: int = 10,
-        *,
-        filters: MeetingSearchFilters | None = None,
-    ) -> tuple[SearchHit, ...]: ...
-
-
-class MeetingRetrievalStrategy(Protocol):
-    def search_meetings(
-        self,
-        query: str,
-        limit: int = 10,
-        context: int = 0,
-        *,
-        filters: MeetingSearchFilters | None = None,
-    ) -> tuple[MeetingSearchResult, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -96,7 +75,7 @@ class TagRetrievalStrategy:
 @dataclass(frozen=True)
 class LexicalTagMeetingRetrievalStrategy:
     repository: IndexRepository
-    lexical: RetrievalStrategy
+    lexical: LexicalRetrievalStrategy
     tags: TagRetrievalStrategy
     candidate_multiplier: int = RETRIEVAL_CANDIDATE_MULTIPLIER
 
@@ -120,7 +99,7 @@ class LexicalTagMeetingRetrievalStrategy:
             )
 
     def _prepare_query_for_snapshot(self, query: str) -> object | None:
-        return _prepare_retrieval_query_for_builtin_snapshot(self.lexical, query)
+        return self.lexical._prepare_query_for_snapshot(query)  # noqa: SLF001
 
     def _search_meetings_in_snapshot(  # noqa: PLR0913
         self,
@@ -180,92 +159,8 @@ class LexicalTagMeetingRetrievalStrategy:
         return tuple(results)
 
 
-def search_meetings_with_builtin_snapshot(  # noqa: PLR0913
-    repository: IndexRepository,
-    strategy: MeetingRetrievalStrategy,
-    query: str,
-    limit: int = 10,
-    context: int = 0,
-    *,
-    filters: MeetingSearchFilters | None = None,
-) -> tuple[MeetingSearchResult, ...]:
-    """Call the public strategy API; built-in implementations own their operation snapshot."""
-    del repository
-    return strategy.search_meetings(query, limit, context, filters=filters)
-
-
-def search_hits_with_builtin_snapshot(  # noqa: PLR0913
-    repository: IndexRepository,
-    strategy: RetrievalStrategy,
-    query: str,
-    limit: int = 10,
-    context: int = 0,
-    *,
-    filters: MeetingSearchFilters | None = None,
-) -> tuple[SearchHit, ...]:
-    """Use one snapshot for built-in retrieval; call custom strategies through the public API."""
-    if _uses_builtin_retrieval(strategy):
-        prepared_query = strategy._prepare_query_for_snapshot(query)  # noqa: SLF001
-        with repository.operation_snapshot() as operation_snapshot:
-            hits = strategy._search_in_snapshot(  # noqa: SLF001
-                query,
-                limit,
-                operation_snapshot=operation_snapshot,
-                prepared_query=prepared_query,
-                filters=filters,
-            )
-            if context:
-                return repository.expand_search_hits(
-                    hits,
-                    context,
-                    connection=operation_snapshot,
-                )
-            return hits
-    hits = strategy.search(query, limit, filters=filters)
-    return repository.expand_search_hits(hits, context) if context else hits
-
-
-def _prepare_retrieval_query_for_builtin_snapshot(
-    strategy: RetrievalStrategy,
-    query: str,
-) -> object | None:
-    if _uses_builtin_retrieval(strategy):
-        return strategy._prepare_query_for_snapshot(query)  # noqa: SLF001
-    return None
-
-
-def _search_retrieval_at_builtin_snapshot_boundary(  # noqa: PLR0913
-    strategy: RetrievalStrategy,
-    query: str,
-    limit: int,
-    *,
-    operation_snapshot: sqlite3.Connection,
-    prepared_query: object | None,
-    filters: MeetingSearchFilters | None,
-) -> tuple[SearchHit, ...]:
-    if _uses_builtin_retrieval(strategy):
-        return strategy._search_in_snapshot(  # noqa: SLF001
-            query,
-            limit,
-            operation_snapshot=operation_snapshot,
-            prepared_query=prepared_query,
-            filters=filters,
-        )
-    # Never expose the raw SQLite connection through the public extension-point protocol.
-    return strategy.search(query, limit, filters=filters)
-
-
-def _uses_builtin_retrieval(
-    strategy: RetrievalStrategy,
-) -> TypeGuard[LexicalRetrievalStrategy]:
-    return (
-        isinstance(strategy, LexicalRetrievalStrategy)
-        and type(strategy).search is LexicalRetrievalStrategy.search
-    )
-
-
 def collect_hits_by_meeting(  # noqa: PLR0913
-    strategy: RetrievalStrategy,
+    strategy: LexicalRetrievalStrategy,
     query: str,
     meeting_limit: int,
     *,
@@ -280,8 +175,7 @@ def collect_hits_by_meeting(  # noqa: PLR0913
 ]:
     candidate_limit = max(meeting_limit, meeting_limit * candidate_multiplier)
     while True:
-        hits = _search_retrieval_at_builtin_snapshot_boundary(
-            strategy,
+        hits = strategy._search_in_snapshot(  # noqa: SLF001
             query,
             candidate_limit,
             operation_snapshot=operation_snapshot,

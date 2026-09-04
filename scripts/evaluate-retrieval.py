@@ -3,7 +3,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from meetily_memory.evaluation import (
+from retrieval_evaluation import (
     EvaluationRetrievalConfig,
     compare_reports,
     evaluate_retrieval,
@@ -11,6 +11,7 @@ from meetily_memory.evaluation import (
     load_report,
     save_report,
 )
+
 from meetily_memory.json_codec import dumps_json
 
 

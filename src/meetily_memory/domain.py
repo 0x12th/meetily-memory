@@ -72,7 +72,6 @@ class SearchHit:
 
 class RetrievalSource(StrEnum):
     FTS = "fts"
-    SEMANTIC = "semantic"
     TAG = "tag"
 
 

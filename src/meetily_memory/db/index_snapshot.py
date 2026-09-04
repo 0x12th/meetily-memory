@@ -6,7 +6,7 @@ import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from typing import Never
+from typing import Never, TypedDict
 
 from meetily_memory.db._schema_utils import (
     application_objects,
@@ -21,6 +21,7 @@ from meetily_memory.db.schema_family import (
     INDEX_SCHEMA_FAMILY,
     INDEX_SCHEMA_USER_VERSION,
 )
+from meetily_memory.source_fingerprint import validate_source_fingerprint
 
 INDEX_APPLICATION_TABLES = frozenset({"index_meta", "meetings", "chunks", "chunks_fts"})
 INDEX_SCHEMA_SQL = f"""
@@ -32,7 +33,8 @@ CREATE TABLE index_meta (
   source_path TEXT NOT NULL CHECK (length(source_path) > 0),
   source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
   meeting_count INTEGER NOT NULL DEFAULT 0 CHECK (meeting_count >= 0),
-  chunk_count INTEGER NOT NULL DEFAULT 0 CHECK (chunk_count >= 0)
+  chunk_count INTEGER NOT NULL DEFAULT 0 CHECK (chunk_count >= 0),
+  source_fingerprint TEXT
 );
 
 CREATE TABLE meetings (
@@ -48,9 +50,6 @@ CREATE TABLE meetings (
   source_path TEXT,
   language TEXT,
   summary_text TEXT,
-  raw_summary_json TEXT,
-  raw_metadata_json TEXT,
-  fingerprint TEXT NOT NULL,
   indexed_at TEXT NOT NULL,
   UNIQUE(source_uuid, external_id)
 );
@@ -67,9 +66,6 @@ CREATE TABLE chunks (
   starts_at_seconds REAL,
   ends_at_seconds REAL,
   timestamp_label TEXT,
-  token_count INTEGER,
-  fingerprint TEXT NOT NULL,
-  raw_metadata_json TEXT,
   UNIQUE(meeting_id, kind, ordinal)
 );
 
@@ -85,12 +81,21 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
 CREATE INDEX idx_meetings_updated_at ON meetings(updated_at);
 CREATE INDEX idx_meetings_started_at ON meetings(started_at);
 CREATE INDEX idx_chunks_meeting_ordinal ON chunks(meeting_id, ordinal);
-CREATE INDEX idx_chunks_fingerprint ON chunks(fingerprint);
 """
 
 
 class IndexSnapshotError(RuntimeError):
     """A fresh index candidate is not the exact supported index snapshot family."""
+
+
+class IndexSnapshotMetadata(TypedDict):
+    source_uuid: str
+    source_path: str
+    source_revision: int
+    meetings: int
+    chunks: int
+    fts_rows: int
+    source_fingerprint: str | None
 
 
 def create_index_snapshot_schema(
@@ -157,7 +162,7 @@ def validate_index_snapshot_schema(  # noqa: C901, PLR0912, PLR0915
     conn: sqlite3.Connection,
     *,
     schema: str = "main",
-) -> dict[str, int | str]:
+) -> IndexSnapshotMetadata:
     try:
         application_id = pragma_int(conn, schema, "application_id")
         user_version = pragma_int(conn, schema, "user_version")
@@ -177,7 +182,7 @@ def validate_index_snapshot_schema(  # noqa: C901, PLR0912, PLR0915
         meta_rows = conn.execute(
             f"""
             SELECT singleton, schema_family, schema_epoch, source_uuid, source_path,
-                   source_revision, meeting_count, chunk_count
+                   source_revision, meeting_count, chunk_count, source_fingerprint
             FROM {quote_identifier(schema)}.index_meta
             ORDER BY singleton
             """
@@ -196,6 +201,14 @@ def validate_index_snapshot_schema(  # noqa: C901, PLR0912, PLR0915
     source_revision = int(meta[5])
     if source_revision < 0:
         _raise_invalid("index_meta source revision/token is invalid")
+    source_fingerprint = meta[8]
+    if source_fingerprint is not None:
+        if not isinstance(source_fingerprint, str):
+            _raise_invalid("index_meta source fingerprint must be TEXT or NULL")
+        try:
+            source_fingerprint = validate_source_fingerprint(source_fingerprint)
+        except ValueError as exc:
+            _raise_invalid(f"index_meta source fingerprint is invalid: {exc}")
 
     try:
         actual_manifest = schema_manifest(conn, schema)
@@ -301,10 +314,11 @@ def validate_index_snapshot_schema(  # noqa: C901, PLR0912, PLR0915
         "meetings": meeting_count,
         "chunks": chunk_count,
         "fts_rows": fts_count,
+        "source_fingerprint": source_fingerprint,
     }
 
 
-def validate_index_snapshot_database(path: Path) -> dict[str, int | str]:
+def validate_index_snapshot_database(path: Path) -> IndexSnapshotMetadata:
     index_path = Path(path)
     try:
         physical_path = index_path.resolve(strict=True)
