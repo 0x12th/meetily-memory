@@ -7,6 +7,10 @@
   generation-local numeric IDs are no longer accepted by those interfaces.
 - Keep lexical search, neighboring-chunk expansion, date filters, manual tags, and the hidden advanced
   Obsidian integration on the current incremental index architecture.
+- Remove injectable retrieval strategies and semantic result markers from the installed runtime;
+  keep the reproducible evaluation framework as developer-only tooling under `scripts/`.
+- Drop write-only raw payloads and fingerprints from the disposable index, advance its schema epoch,
+  and remove retired source-claim repository APIs while preserving the supported verified rebind.
 
 ## 0.7.0 - 2026-08-29
 

@@ -1,8 +1,10 @@
 # Retrieval evaluation
 
-Meetily Memory includes a reproducible evaluation runner for the current lexical meeting-search
-path. The public synthetic fixture verifies dataset parsing, stable meeting and evidence identities,
-metrics, and report comparison behavior; it is not evidence of real retrieval quality.
+The repository includes a reproducible developer-only evaluation runner for the current lexical
+meeting-search path. Its implementation lives under `scripts/` and is not part of the installed
+`meetily_memory` package. The public synthetic fixture verifies dataset parsing, stable meeting and
+evidence identities, metrics, and report comparison behavior; it is not evidence of real retrieval
+quality.
 
 Private real-corpus inputs and reports belong under the ignored `.docs/eval/` directory.
 

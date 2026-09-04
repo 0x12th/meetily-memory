@@ -28,10 +28,33 @@ from the result to open the original meeting; do not substitute the displayed re
 
 ## Refresh
 
-After Meetily has new meetings, refresh the local index manually:
+On macOS, `mm init` installs one LaunchAgent that refreshes the default index at `:00`, `:15`,
+`:30`, and `:45`. It runs the regular CLI process; no daemon stays resident. Manage it with:
+
+```bash
+mm autosync status
+mm autosync disable
+mm autosync enable
+```
+
+Use `mm init --no-autosync` to keep refresh manual. An explicit `--index` is not scheduled unless
+you run `mm --index PATH autosync enable`. Switching the one user-level job to another index
+requires `autosync enable --replace`.
+
+Refresh manually when needed:
 
 ```bash
 mm refresh
+mm refresh --force
+```
+
+Refresh compares a fingerprint of the Meetily SQLite database and its WAL/journal. If unchanged,
+it records a successful check without rewriting `index.sqlite`. `--force` always rebuilds.
+
+To sync configured Obsidian notes in the same locked pipeline:
+
+```bash
+mm refresh --sync-obsidian
 ```
 
 ## Lexical Search
