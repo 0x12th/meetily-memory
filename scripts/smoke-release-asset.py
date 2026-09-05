@@ -437,7 +437,7 @@ def run_smoke(archive: Path, expected_tag: str, result: dict[str, Any]) -> None:
 
         init_result = run_command(
             binary,
-            ["init", "--source", str(fixture), "--json"],
+            ["init", "--source", str(fixture), "--no-autosync", "--json"],
             cwd=work_dir,
             environment=environment,
         )
