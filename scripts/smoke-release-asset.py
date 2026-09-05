@@ -265,7 +265,8 @@ def validate_init(payload: object, fixture: Path) -> str:
     require(payload.get("initialized") is True, "mm init did not report initialized=true.")
     require(payload.get("source_path") == str(fixture), "mm init reported the wrong source path.")
     require(payload.get("meetings_seen") == 1, "mm init did not scan exactly one meeting.")
-    require(payload.get("meetings_inserted") == 1, "mm init did not insert exactly one meeting.")
+    require(payload.get("changed") is True, "mm init did not publish a fresh index.")
+    require(payload.get("fts_rows") == 1, "mm init did not index exactly one FTS row.")
     require(payload.get("chunks_seen") == 1, "mm init did not scan exactly one source chunk.")
     source_uuid = payload.get("source_uuid")
     if not isinstance(source_uuid, str) or not source_uuid:
@@ -328,14 +329,6 @@ def validate_doctor(payload: object, fixture: Path) -> None:
     require(
         state_database.get("status") == "current",
         "mm doctor did not observe a current state database.",
-    )
-    completed_run = json_object(
-        payload.get("last_completed_run"),
-        "mm doctor omitted the completed source scan.",
-    )
-    require(
-        completed_run.get("status") == "completed",
-        "mm doctor omitted the completed source scan.",
     )
 
 
@@ -437,7 +430,14 @@ def run_smoke(archive: Path, expected_tag: str, result: dict[str, Any]) -> None:
 
         init_result = run_command(
             binary,
-            ["init", "--source", str(fixture), "--no-autosync", "--json"],
+            [
+                "--index",
+                str(Path(environment["MEETILY_MEMORY_DATA_DIR"]) / "index.sqlite"),
+                "init",
+                "--source",
+                str(fixture),
+                "--json",
+            ],
             cwd=work_dir,
             environment=environment,
         )

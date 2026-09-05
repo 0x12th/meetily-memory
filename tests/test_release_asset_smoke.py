@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import runpy
 import stat
 import subprocess
 import sys
@@ -10,10 +11,42 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
+
+from meetily_memory.cli.app import app
 
 PROJECT_ROOT = Path(__file__).parents[1]
 SMOKE_SCRIPT = PROJECT_ROOT / "scripts" / "smoke-release-asset.py"
 WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "release.yml"
+
+
+def test_smoke_validators_match_current_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    smoke = runpy.run_path(str(SMOKE_SCRIPT))
+    fixture = tmp_path / "meeting_minutes.sqlite"
+    smoke["create_fixture"](fixture)
+    monkeypatch.setenv("MEETILY_MEMORY_DATA_DIR", str(tmp_path / "data"))
+    runner = CliRunner()
+    initialized = runner.invoke(
+        app,
+        [
+            "--index",
+            str(tmp_path / "data" / "index.sqlite"),
+            "init",
+            "--source",
+            str(fixture),
+            "--json",
+        ],
+    )
+    assert initialized.exit_code == 0, initialized.output
+    source_uuid = smoke["validate_init"](json.loads(initialized.stdout), fixture)
+    search = runner.invoke(app, ["s", smoke["QUERY"], "--json"])
+    assert search.exit_code == 0, search.output
+    smoke["validate_search"](json.loads(search.stdout), source_uuid)
+    doctor = runner.invoke(app, ["doctor", "--source", str(fixture), "--json"])
+    assert doctor.exit_code == 0, doctor.output
+    smoke["validate_doctor"](json.loads(doctor.stdout), fixture)
 
 
 def workflow_job(workflow: str, job_name: str) -> str:
@@ -134,6 +167,9 @@ def fake_binary_source(version: str, mode: str) -> str:
     VERSION = "__VERSION__"
     MODE = "__MODE__"
     args = sys.argv[1:]
+    explicit_index = bool(args and args[0] == "--index")
+    if explicit_index:
+        args = args[2:]
 
     if "PYTHONPATH" in os.environ or "VIRTUAL_ENV" in os.environ:
         print("project Python environment leaked into smoke", file=sys.stderr)
@@ -155,6 +191,9 @@ def fake_binary_source(version: str, mode: str) -> str:
     internal_dir = Path(__file__).resolve().parent / "_internal"
 
     if args and args[0] == "init":
+        if not explicit_index:
+            print("release smoke must use an explicit temporary index", file=sys.stderr)
+            raise SystemExit(74)
         if not (internal_dir / "sqlite.available").is_file():
             print("packaged sqlite module is unavailable", file=sys.stderr)
             raise SystemExit(72)
@@ -175,7 +214,8 @@ def fake_binary_source(version: str, mode: str) -> str:
             "source_path": source_path,
             "source_uuid": "synthetic-source-uuid",
             "meetings_seen": 1,
-            "meetings_inserted": 1,
+            "changed": True,
+            "fts_rows": 1,
             "chunks_seen": 1,
         }))
         raise SystemExit(0)
@@ -211,7 +251,6 @@ def fake_binary_source(version: str, mode: str) -> str:
             "chunks": 1,
             "index_database": {"status": "current"},
             "state_database": {"status": "current"},
-            "last_completed_run": {"status": "completed"},
         }))
         raise SystemExit(0)
 
