@@ -21,16 +21,20 @@ def migrate_v07_state_if_needed(state_path: Path) -> bool:
     if not state_path.is_file():
         return False
 
-    with closing(sqlite3.connect(f"{state_path.resolve(strict=True).as_uri()}?mode=ro", uri=True)) as conn:
+    uri = f"{state_path.resolve(strict=True).as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         application_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
         user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if application_id != LEGACY_STATE_APPLICATION_ID or user_version != LEGACY_STATE_USER_VERSION:
+        if (
+            application_id != LEGACY_STATE_APPLICATION_ID
+            or user_version != LEGACY_STATE_USER_VERSION
+        ):
             return False
-        tables = {
-            str(row[0])
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-        }
+        table_rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        tables = {str(row[0]) for row in table_rows}
         if not LEGACY_REQUIRED_TABLES.issubset(tables):
             return False
         sources = [dict(row) for row in conn.execute("SELECT * FROM sources ORDER BY uuid")]
@@ -63,7 +67,7 @@ def migrate_v07_state_if_needed(state_path: Path) -> bool:
         backup_path = state_path.with_name(f"{state_path.name}.v0.7.bak")
         if not backup_path.exists():
             shutil.copy2(state_path, backup_path)
-        os.replace(temp_path, state_path)
+        temp_path.replace(state_path)
         _fsync_directory(state_path.parent)
     finally:
         temp_path.unlink(missing_ok=True)
