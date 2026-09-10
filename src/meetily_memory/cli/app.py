@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -10,6 +11,7 @@ from meetily_memory.cli.lifecycle_commands import config_app, db_app
 from meetily_memory.cli.obsidian_commands import obsidian_app
 from meetily_memory.cli.search_commands import app as search_app
 from meetily_memory.cli.tag_commands import tag_app
+from meetily_memory.db.state_schema import StateSchemaError
 
 app = make_typer(
     "Local search over Meetily meeting history.\n\n"
@@ -57,7 +59,11 @@ def callback(
 
 
 def main() -> None:
-    app()
+    try:
+        app()
+    except StateSchemaError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":
