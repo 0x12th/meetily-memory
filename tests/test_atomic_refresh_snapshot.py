@@ -431,9 +431,12 @@ def test_foreign_and_corrupt_indexes_are_read_only_rebuild_errors(
     before_corrupt = (corrupt.read_bytes(), corrupt.stat().st_mtime_ns)
     with existing_index_connection(corrupt):
         pass
-    with sqlite3.connect(corrupt) as conn, pytest.raises(
-        IndexSnapshotError,
-        match="index_meta counts do not match",
+    with (
+        sqlite3.connect(corrupt) as conn,
+        pytest.raises(
+            IndexSnapshotError,
+            match="index_meta counts do not match",
+        ),
     ):
         validate_index_snapshot_schema(conn)
     assert (corrupt.read_bytes(), corrupt.stat().st_mtime_ns) == before_corrupt
