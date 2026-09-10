@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 from meetily_memory.db.index_snapshot import IndexSnapshotError, validate_index_snapshot_schema
 from meetily_memory.db.row_decode import decode_required_integer, decode_required_text
+from meetily_memory.db.schema import validate_existing_index_schema
 from meetily_memory.db.schema_family import INDEX_SCHEMA_USER_VERSION, STATE_SCHEMA_USER_VERSION
 from meetily_memory.db.state_schema import StateSchemaError, validate_state_schema
 from meetily_memory.scanner.meetily_sqlite import validate_meetily_schema
@@ -170,7 +171,10 @@ def inspect_local_databases(index_path: Path, source_uuid: str | None) -> LocalD
     with ExitStack() as stack:
         index_reader = open_pinned_database(stack, index_target)
         state_reader = open_pinned_database(stack, state_target)
-        index_database, stats, language = inspect_index_database_reader(index_reader)
+        index_database, stats, language = inspect_index_database_reader(
+            index_reader,
+            deep_validation=False,
+        )
         state_database, configured = inspect_state_database_reader(state_reader, source_uuid)
     return LocalDiagnostics(
         index_database=index_database,
@@ -219,6 +223,8 @@ def inspect_index_database(
 
 def inspect_index_database_reader(
     reader: PinnedDatabaseReader,
+    *,
+    deep_validation: bool = True,
 ) -> tuple[DatabaseDiagnostic, dict[str, int], str | None]:
     target = reader.target
     if not target.present:
@@ -233,19 +239,10 @@ def inspect_index_database_reader(
     try:
         conn = _required_connection(reader, "index")
         schema_version = read_schema_version(conn)
-        journal_row = conn.execute("PRAGMA journal_mode").fetchone()
-        if journal_row is None:
-            _raise_index_snapshot("index journal_mode PRAGMA returned no value")
-        journal_mode = decode_required_text(
-            journal_row[0],
-            table="pragma",
-            column="journal_mode",
-            context="index diagnostics",
-            error_type=IndexSnapshotError,
-        ).casefold()
-        if journal_mode != "delete":
-            _raise_index_snapshot(f"index journal_mode must be DELETE, got {journal_mode!r}")
-        validate_index_snapshot_schema(conn)
+        if deep_validation:
+            validate_index_snapshot_schema(conn)
+        else:
+            validate_existing_index_schema(conn)
         stats = {
             "meetings": _diagnostic_count(conn, "meetings"),
             "chunks": _diagnostic_count(conn, "chunks"),
