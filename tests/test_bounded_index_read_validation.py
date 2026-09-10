@@ -7,7 +7,10 @@ import pytest
 from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
-from meetily_memory.db.index_snapshot import IndexSnapshotError, validate_index_snapshot_schema
+from meetily_memory.db.index_snapshot import (
+    IndexSnapshotError,
+    validate_index_snapshot_schema,
+)
 from meetily_memory.db.schema import existing_index_connection
 from tests.index_helpers import publish_fresh_index
 
