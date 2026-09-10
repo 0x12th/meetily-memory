@@ -115,7 +115,7 @@ wheels = [
 
 [[package]]
 name = "meetily-memory"
-version = "0.8.0"
+version = "0.8.6"
 source = { editable = "." }
 dependencies = [
     { name = "orjson" },
