@@ -84,15 +84,17 @@ def validate_existing_index_schema(conn: sqlite3.Connection) -> None:
 
     application_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
     if application_id != INDEX_APPLICATION_ID:
-        raise IndexSnapshotError(f"foreign application_id 0x{application_id:08X}")
+        message = f"foreign application_id 0x{application_id:08X}"
+        raise IndexSnapshotError(message)
 
     user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if user_version != INDEX_SCHEMA_USER_VERSION:
         relation = "future" if user_version > INDEX_SCHEMA_USER_VERSION else "unsupported"
-        raise IndexSnapshotError(
+        message = (
             f"{relation} index user_version {user_version}; exact version "
             f"{INDEX_SCHEMA_USER_VERSION} is required"
         )
+        raise IndexSnapshotError(message)
 
     row = conn.execute(
         """
@@ -102,13 +104,17 @@ def validate_existing_index_schema(conn: sqlite3.Connection) -> None:
         """
     ).fetchone()
     if row is None:
-        raise IndexSnapshotError("index_meta singleton row is missing")
+        message = "index_meta singleton row is missing"
+        raise IndexSnapshotError(message)
     if tuple(row[:3]) != (1, INDEX_SCHEMA_FAMILY, INDEX_SCHEMA_EPOCH):
-        raise IndexSnapshotError("index_meta family/epoch identity is invalid")
+        message = "index_meta family/epoch identity is invalid"
+        raise IndexSnapshotError(message)
     if not str(row[3]).strip() or not str(row[4]):
-        raise IndexSnapshotError("index_meta source identity is empty")
+        message = "index_meta source identity is empty"
+        raise IndexSnapshotError(message)
     if int(row[5]) < 0:
-        raise IndexSnapshotError("index_meta source revision/token is invalid")
+        message = "index_meta source revision/token is invalid"
+        raise IndexSnapshotError(message)
 
 
 def _require_index_file(index_path: Path) -> Path:
