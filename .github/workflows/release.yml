@@ -83,7 +83,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: meetily-memory-smoke-${{ env.ASSET_SUFFIX }}
-          path: target/release-assets/packaged-binary-${ASSET_SUFFIX}.smoke.json
+          path: target/release-assets/packaged-binary-${{ env.ASSET_SUFFIX }}.smoke.json
           if-no-files-found: warn
       - name: Generate asset checksum
         if: ${{ success() }}
