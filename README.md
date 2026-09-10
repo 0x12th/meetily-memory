@@ -10,6 +10,7 @@ On macOS:
 
 ```bash
 brew tap 0x12th/meetily-memory
+brew trust --formula 0x12th/meetily-memory/meetily-memory
 brew install meetily-memory
 ```
 
