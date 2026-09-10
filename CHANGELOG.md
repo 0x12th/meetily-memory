@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.6 - 2026-09-11
+
+- Restore bounded validation on indexed read paths so `mm s` and other reads do not run full snapshot integrity checks on every invocation.
+- Add automatic migration of legacy v0.7 `state.sqlite` data into the current state schema while preserving source bindings, tags, meeting-tag assignments, and compatible settings.
+- Handle incompatible state databases as normal CLI errors instead of exposing a PyInstaller traceback during `mm init`.
+- Harden the release workflow with current-master tag validation, release smoke checks for both macOS architectures, and correct smoke artifact paths.
+
 ## 0.8.0 - 2026-09-04
 
 - Remove MCP and the context/topic command families from the installed runtime while retaining
