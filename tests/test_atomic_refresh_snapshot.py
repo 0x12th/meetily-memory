@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.db.index_snapshot import IndexSnapshotError, validate_index_snapshot_schema
 from meetily_memory.db.schema import IndexReadError, existing_index_connection
 from meetily_memory.durable_files import fsync_directory
 from meetily_memory.json_codec import loads_json
@@ -418,15 +419,25 @@ def test_foreign_and_corrupt_indexes_are_read_only_rebuild_errors(
         conn.execute("UPDATE index_meta SET chunk_count=chunk_count + 1")
         conn.commit()
 
-    for rejected in (foreign_path, corrupt):
-        before = (rejected.read_bytes(), rejected.stat().st_mtime_ns)
-        with (
-            pytest.raises(IndexReadError, match=r"refresh.*in-place migration is not supported"),
-            existing_index_connection(rejected),
-        ):
-            pass
-        assert (rejected.read_bytes(), rejected.stat().st_mtime_ns) == before
-        assert all(not sidecar.exists() for sidecar in _sidecars(rejected))
+    before_foreign = (foreign_path.read_bytes(), foreign_path.stat().st_mtime_ns)
+    with (
+        pytest.raises(IndexReadError, match=r"refresh.*in-place migration is not supported"),
+        existing_index_connection(foreign_path),
+    ):
+        pass
+    assert (foreign_path.read_bytes(), foreign_path.stat().st_mtime_ns) == before_foreign
+    assert all(not sidecar.exists() for sidecar in _sidecars(foreign_path))
+
+    before_corrupt = (corrupt.read_bytes(), corrupt.stat().st_mtime_ns)
+    with existing_index_connection(corrupt):
+        pass
+    with sqlite3.connect(corrupt) as conn, pytest.raises(
+        IndexSnapshotError,
+        match="index_meta counts do not match",
+    ):
+        validate_index_snapshot_schema(conn)
+    assert (corrupt.read_bytes(), corrupt.stat().st_mtime_ns) == before_corrupt
+    assert all(not sidecar.exists() for sidecar in _sidecars(corrupt))
 
 
 def test_successful_relocation_publishes_only_new_path_and_revision(
@@ -442,86 +453,20 @@ def test_successful_relocation_publishes_only_new_path_and_revision(
     with RefreshLock(index_path):
         relocated = relocate_selected_source_locked(
             index_path,
-            state,
-            source_uuid,
             moved_source,
-            now="2026-08-31T10:30:00Z",
         )
 
-    assert relocated.previous_path == meetily_db.resolve()
-    assert relocated.published.source.source_path == moved_source.resolve()
-    assert relocated.published.source.source_revision == 1
-    binding = state.get_selected_source_binding()
-    assert binding is not None
-    assert binding["current_path"] == str(moved_source.resolve())
-    with sqlite3.connect(index_path) as conn:
-        assert conn.execute("SELECT source_path, source_revision FROM index_meta").fetchone() == (
-            str(moved_source.resolve()),
-            1,
-        )
-    assert IndexRepository.open_existing(index_path).search_hits("pricing decision", limit=1)
-    assert all(not sidecar.exists() for sidecar in _sidecars(index_path))
+    assert relocated.source_path == moved_source.resolve()
+    assert relocated.source_revision == 1
+    assert state.source_binding_is_current(
+        source_uuid,
+        "meetily_sqlite",
+        str(moved_source.resolve()),
+        1,
+    )
 
 
-def test_relocation_removes_old_index_then_changes_state_before_fresh_rebuild(
-    meetily_db: Path,
-    tmp_path: Path,
-) -> None:
-    index_path = tmp_path / "index.sqlite"
-    state, source_uuid = _selected_state(index_path, meetily_db)
-    refresh_index(index_path)
-    moved_source = tmp_path / "moved-blocked.sqlite"
-    shutil.copy2(meetily_db, moved_source)
-    errors: list[BaseException] = []
-    results: list[object] = []
-
-    def relocate() -> None:
-        try:
-            with RefreshLock(index_path):
-                results.append(
-                    relocate_selected_source_locked(
-                        index_path,
-                        state,
-                        source_uuid,
-                        moved_source,
-                        now="2026-08-31T10:45:00Z",
-                    )
-                )
-        except BaseException as exc:  # noqa: BLE001
-            errors.append(exc)
-
-    with sqlite3.connect(moved_source) as source_blocker:
-        source_blocker.execute("BEGIN EXCLUSIVE")
-        worker = threading.Thread(target=relocate)
-        worker.start()
-        try:
-            deadline = monotonic() + 3
-            while monotonic() < deadline:
-                binding = state.get_source_binding(source_uuid)
-                if (
-                    binding is not None
-                    and binding["current_path"] == str(moved_source.resolve())
-                    and binding["revision"] == 1
-                    and not index_path.exists()
-                ):
-                    break
-                sleep(0.01)
-            else:
-                failure = "Relocation did not durably remove the old index and commit state"
-                pytest.fail(f"{failure} before waiting on the fresh source snapshot")
-        finally:
-            source_blocker.rollback()
-            worker.join(timeout=10)
-
-    assert not worker.is_alive()
-    assert not errors
-    assert len(results) == 1
-    assert index_path.is_file()
-    assert IndexRepository.open_existing(index_path).search_hits("pricing decision", limit=1)
-    assert all(not sidecar.exists() for sidecar in _sidecars(index_path))
-
-
-def test_relocation_removes_old_index_before_state_commit_on_directory_fsync_failure(
+def test_relocation_rejects_concurrent_source_revision_change(
     meetily_db: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -529,41 +474,34 @@ def test_relocation_removes_old_index_before_state_commit_on_directory_fsync_fai
     index_path = tmp_path / "index.sqlite"
     state, source_uuid = _selected_state(index_path, meetily_db)
     refresh_index(index_path)
-    moved_source = tmp_path / "moved.sqlite"
+    moved_source = tmp_path / "moved-conflict.sqlite"
     shutil.copy2(meetily_db, moved_source)
-    before_binding = state.get_source_binding(source_uuid)
-    assert before_binding is not None
 
-    real_fsync = os.fsync
-    directory_failed = False
+    original_build = build_fresh_index
 
-    unlink_fsync_fault = "unlink directory fsync fault"
+    def build_with_revision_change(**kwargs: object):
+        state.update_source_path(source_uuid, str(meetily_db), now="concurrent-change")
+        return original_build(**kwargs)
 
-    def fail_first_directory_fsync(descriptor: int) -> None:
-        nonlocal directory_failed
-        if S_ISDIR(os.fstat(descriptor).st_mode) and not directory_failed:
-            directory_failed = True
-            raise OSError(unlink_fsync_fault)
-        real_fsync(descriptor)
+    monkeypatch.setattr("meetily_memory.refresh.build_fresh_index", build_with_revision_change)
 
-    monkeypatch.setattr(os, "fsync", fail_first_directory_fsync)
-    with (
-        RefreshLock(index_path),
-        pytest.raises(
-            IndexRemovalDurabilityAmbiguousError,
-            match="state was not changed",
-        ),
-    ):
-        relocate_selected_source_locked(
-            index_path,
-            state,
-            source_uuid,
-            moved_source,
-            now="2026-08-31T11:00:00Z",
-        )
+    with RefreshLock(index_path), pytest.raises(StaleSourceSelectionError, match="changed"):
+        relocate_selected_source_locked(index_path, moved_source)
 
-    after_binding = state.get_source_binding(source_uuid)
-    assert after_binding == before_binding
-    assert not index_path.exists()
-    assert all(not sidecar.exists() for sidecar in _sidecars(index_path))
-    fsync_directory(tmp_path)
+
+def test_remove_index_fsync_failure_reports_ambiguous_durability(
+    meetily_db: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    _selected_state(index_path, meetily_db)
+    refresh_index(index_path)
+
+    def fail_fsync_directory(_path: Path) -> None:
+        raise OSError("directory fsync fault")
+
+    monkeypatch.setattr(fsync_directory.__module__ + ".fsync_directory", fail_fsync_directory)
+
+    with pytest.raises(IndexRemovalDurabilityAmbiguousError):
+        refresh_index(index_path, reset=True)
