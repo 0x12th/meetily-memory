@@ -10,6 +10,7 @@ from meetily_memory.cli.lifecycle_commands import config_app, db_app
 from meetily_memory.cli.obsidian_commands import obsidian_app
 from meetily_memory.cli.search_commands import app as search_app
 from meetily_memory.cli.tag_commands import tag_app
+from meetily_memory.db.legacy_state_migration import migrate_v07_state_if_needed
 
 app = make_typer(
     "Local search over Meetily meeting history.\n\n"
@@ -49,6 +50,7 @@ def callback(
     del version_output
     index_path = index_option(index)
     state_path = index_path.with_name("state.sqlite")
+    migrate_v07_state_if_needed(state_path)
     ctx.obj = {
         "index_path": index_path,
         "state_path": state_path,
