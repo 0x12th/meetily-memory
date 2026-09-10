@@ -29,9 +29,12 @@ def test_ordinary_reads_do_not_run_full_snapshot_validation(
         conn.execute("UPDATE index_meta SET chunk_count = chunk_count + 1 WHERE singleton = 1")
         conn.commit()
 
-    with sqlite3.connect(index_path) as conn, pytest.raises(
-        IndexSnapshotError,
-        match="index_meta counts do not match",
+    with (
+        sqlite3.connect(index_path) as conn,
+        pytest.raises(
+            IndexSnapshotError,
+            match="index_meta counts do not match",
+        ),
     ):
         validate_index_snapshot_schema(conn)
 
