@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from typer.testing import CliRunner
 
@@ -9,6 +9,9 @@ from meetily_memory.cli.app import app
 from meetily_memory.config.settings import load_app_settings
 from meetily_memory.db.schema_family import STATE_APPLICATION_ID, STATE_SCHEMA_USER_VERSION
 from meetily_memory.user_state import UserStateRepository
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 LEGACY_SCHEMA = """
 CREATE TABLE sources (
@@ -42,6 +45,7 @@ def test_cli_migrates_v07_state_and_preserves_tags_and_settings(tmp_path: Path) 
     index_path = tmp_path / "index.sqlite"
     state_path = tmp_path / "state.sqlite"
     source_path = tmp_path / "meeting_minutes.sqlite"
+    vault_path = tmp_path / "vault"
     source_path.touch()
     source_uuid = "source-1"
 
@@ -56,9 +60,7 @@ def test_cli_migrates_v07_state_and_preserves_tags_and_settings(tmp_path: Path) 
             """,
             (source_uuid, str(source_path), str(source_path)),
         )
-        conn.execute(
-            "INSERT INTO tags VALUES (7, 'agent', 'Agent', '2026-08-20')"
-        )
+        conn.execute("INSERT INTO tags VALUES (7, 'agent', 'Agent', '2026-08-20')")
         conn.execute(
             """
             INSERT INTO meeting_tags
@@ -70,16 +72,16 @@ def test_cli_migrates_v07_state_and_preserves_tags_and_settings(tmp_path: Path) 
         conn.commit()
 
     (tmp_path / "settings.json").write_text(
-        """{
+        f"""{{
           "source_uuid": "source-1",
           "ui_language": "ru",
           "last_update_at": "2026-08-29T10:00:00Z",
-          "obsidian": {
-            "vault_path": "/tmp/vault",
+          "obsidian": {{
+            "vault_path": "{vault_path}",
             "folder": "Meetings",
             "last_sync_at": "2026-08-29T09:00:00Z"
-          }
-        }""",
+          }}
+        }}""",
         encoding="utf-8",
     )
 
@@ -104,7 +106,7 @@ def test_cli_migrates_v07_state_and_preserves_tags_and_settings(tmp_path: Path) 
     assert settings.source_uuid == source_uuid
     assert settings.ui_language == "en"
     assert settings.last_update_at == "2026-08-29T10:00:00Z"
-    assert settings.obsidian.vault_path == "/tmp/vault"
+    assert settings.obsidian.vault_path == str(vault_path)
     assert settings.obsidian.folder == "Meetings"
     assert settings.obsidian.last_sync_at == "2026-08-29T09:00:00Z"
     assert state_path.with_name("state.sqlite.v0.7.bak").is_file()
