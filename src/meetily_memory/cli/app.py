@@ -62,7 +62,7 @@ def main() -> None:
     try:
         app()
     except StateSchemaError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        sys.stderr.write(f"Error: {exc}\n")
         raise SystemExit(2) from None
 
 
