@@ -38,5 +38,8 @@ def test_ordinary_reads_do_not_run_full_snapshot_validation(
     with existing_index_connection(index_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] > 0
 
-    result = CliRunner().invoke(app, ["--index", str(index_path), "s", "migration", "--json"])
+    result = CliRunner().invoke(
+        app,
+        ["--index", str(index_path), "s", "migration", "--json"],
+    )
     assert result.exit_code == 0, result.output

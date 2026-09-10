@@ -14,6 +14,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate release tag target
+        run: |
+          git fetch origin master --depth=1
+          tag_commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          master_commit="$(git rev-parse origin/master)"
+          if [[ "$tag_commit" != "$master_commit" ]]; then
+            printf 'release tag %s points to %s, but origin/master is %s\n' \
+              "$GITHUB_REF_NAME" "$tag_commit" "$master_commit" >&2
+            exit 2
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
