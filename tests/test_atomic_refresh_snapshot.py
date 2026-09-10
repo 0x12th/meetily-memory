@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 
 from meetily_memory.cli.app import app
 from meetily_memory.core import MeetilyMemoryCore
+from meetily_memory.db.index_snapshot import IndexSnapshotError, validate_index_snapshot_schema
 from meetily_memory.db.schema import IndexReadError, existing_index_connection
 from meetily_memory.durable_files import fsync_directory
 from meetily_memory.json_codec import loads_json
@@ -418,15 +419,25 @@ def test_foreign_and_corrupt_indexes_are_read_only_rebuild_errors(
         conn.execute("UPDATE index_meta SET chunk_count=chunk_count + 1")
         conn.commit()
 
-    for rejected in (foreign_path, corrupt):
-        before = (rejected.read_bytes(), rejected.stat().st_mtime_ns)
-        with (
-            pytest.raises(IndexReadError, match=r"refresh.*in-place migration is not supported"),
-            existing_index_connection(rejected),
-        ):
-            pass
-        assert (rejected.read_bytes(), rejected.stat().st_mtime_ns) == before
-        assert all(not sidecar.exists() for sidecar in _sidecars(rejected))
+    before_foreign = (foreign_path.read_bytes(), foreign_path.stat().st_mtime_ns)
+    with (
+        pytest.raises(IndexReadError, match=r"refresh.*in-place migration is not supported"),
+        existing_index_connection(foreign_path),
+    ):
+        pass
+    assert (foreign_path.read_bytes(), foreign_path.stat().st_mtime_ns) == before_foreign
+    assert all(not sidecar.exists() for sidecar in _sidecars(foreign_path))
+
+    before_corrupt = (corrupt.read_bytes(), corrupt.stat().st_mtime_ns)
+    with existing_index_connection(corrupt):
+        pass
+    with sqlite3.connect(corrupt) as conn, pytest.raises(
+        IndexSnapshotError,
+        match="index_meta counts do not match",
+    ):
+        validate_index_snapshot_schema(conn)
+    assert (corrupt.read_bytes(), corrupt.stat().st_mtime_ns) == before_corrupt
+    assert all(not sidecar.exists() for sidecar in _sidecars(corrupt))
 
 
 def test_successful_relocation_publishes_only_new_path_and_revision(
