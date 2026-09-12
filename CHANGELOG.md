@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.7 - 2026-09-12
+
+- Speed up `mm status` with bounded index compatibility validation while keeping full integrity and FTS consistency checks in `mm doctor` and `mm db status`.
+- Require release tags to point to the current `master` commit, rejecting older commits even when their files are identical.
+
 ## 0.8.6 - 2026-09-11
 
 - Restore bounded validation on indexed read paths so `mm s` and other reads do not run full snapshot integrity checks on every invocation.
