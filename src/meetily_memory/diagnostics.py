@@ -166,14 +166,19 @@ def open_pinned_database(stack: ExitStack, target: PinnedDatabasePath) -> Pinned
     return reader
 
 
-def inspect_local_databases(index_path: Path, source_uuid: str | None) -> LocalDiagnostics:
+def inspect_local_databases(
+    index_path: Path,
+    source_uuid: str | None,
+    *,
+    deep_validation: bool = True,
+) -> LocalDiagnostics:
     index_target, state_target = pin_local_database_paths(index_path)
     with ExitStack() as stack:
         index_reader = open_pinned_database(stack, index_target)
         state_reader = open_pinned_database(stack, state_target)
         index_database, stats, language = inspect_index_database_reader(
             index_reader,
-            deep_validation=False,
+            deep_validation=deep_validation,
         )
         state_database, configured = inspect_state_database_reader(state_reader, source_uuid)
     return LocalDiagnostics(

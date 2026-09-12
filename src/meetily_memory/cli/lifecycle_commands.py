@@ -267,7 +267,11 @@ def status(
 ) -> None:
     index_path = ctx.obj["index_path"]
     settings = load_app_settings(ctx.obj["state_path"])
-    diagnostics = inspect_local_databases(index_path, settings.source_uuid)
+    diagnostics = inspect_local_databases(
+        index_path,
+        settings.source_uuid,
+        deep_validation=False,
+    )
 
     configured_source = diagnostic_source_path(diagnostics.configured_source_path)
     source_path = str(configured_source) if configured_source else None
