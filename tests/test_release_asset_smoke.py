@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import runpy
 import stat
@@ -85,6 +86,62 @@ def workflow_run_sources(workflow: str) -> str:
 
 def release_workflow() -> str:
     return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("annotated", [False, True])
+@pytest.mark.parametrize("stale", [False, True])
+def test_release_tag_must_point_to_current_master_commit(
+    tmp_path: Path,
+    *,
+    annotated: bool,
+    stale: bool,
+) -> None:
+    origin = tmp_path / "origin"
+    checkout = tmp_path / "checkout"
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Release Test",
+        "GIT_AUTHOR_EMAIL": "release@example.test",
+        "GIT_COMMITTER_NAME": "Release Test",
+        "GIT_COMMITTER_EMAIL": "release@example.test",
+        "GITHUB_REF_NAME": "v1.0.0",
+        "RUNNER_TEMP": str(tmp_path),
+    }
+
+    def git(*args: str) -> None:
+        subprocess.run(  # noqa: S603
+            ["git", *args],  # noqa: S607
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    git("init", "--initial-branch=master", str(origin))
+    git("-C", str(origin), "commit", "--allow-empty", "-m", "initial")
+    git("clone", str(origin), str(checkout))
+    tag_args = ("-a", "v1.0.0", "-m", "release") if annotated else ("v1.0.0",)
+    git("-C", str(checkout), "tag", *tag_args)
+    if stale:
+        git("-C", str(origin), "commit", "--allow-empty", "-m", "same tree, new commit")
+
+    _, step = named_step(
+        workflow_steps(workflow_job(release_workflow(), "test")),
+        "Validate release tag target",
+    )
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    result = subprocess.run(  # noqa: S603
+        ["bash", "-e", "-o", "pipefail", "-c", script],  # noqa: S607
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == (2 if stale else 0), result.stderr
+    if stale:
+        assert "does not match origin/master" in result.stderr
 
 
 def assert_release_workflow_contract(workflow: str) -> None:

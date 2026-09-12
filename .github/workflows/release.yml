@@ -18,8 +18,10 @@ jobs:
           fetch-depth: 0
       - name: Validate release tag target
         run: |
-          git fetch origin master --depth=1
-          git diff --quiet "$GITHUB_REF_NAME" origin/master || {
+          git fetch origin +refs/heads/master:refs/remotes/origin/master --depth=1
+          git rev-parse --verify "refs/tags/${GITHUB_REF_NAME}^{commit}" > "$RUNNER_TEMP/release-tag-commit"
+          git rev-parse --verify 'refs/remotes/origin/master^{commit}' > "$RUNNER_TEMP/release-master-commit"
+          cmp -s "$RUNNER_TEMP/release-tag-commit" "$RUNNER_TEMP/release-master-commit" || {
             printf 'release tag %s does not match origin/master\n' "$GITHUB_REF_NAME" >&2
             exit 2
           }
