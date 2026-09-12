@@ -73,6 +73,40 @@ def test_doctor_status_and_db_status_preserve_current_files(
         assert tree_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_status"),
+    [
+        (("status",), "current"),
+        (("doctor",), "incompatible"),
+        (("db", "status"), "incompatible"),
+    ],
+)
+def test_only_status_skips_fts_consistency_validation(
+    meetily_db: Path,
+    tmp_path: Path,
+    command: tuple[str, ...],
+    expected_status: str,
+) -> None:
+    index_path = tmp_path / "index.sqlite"
+    publish_fresh_index(index_path, meetily_db)
+    with sqlite3.connect(index_path) as connection:
+        connection.execute("UPDATE chunks_fts SET text = 'inconsistent search content'")
+        connection.commit()
+    before = tree_snapshot(tmp_path)
+
+    result, payload = invoke_json(index_path, *command)
+
+    assert result.exit_code == 0
+    diagnostic = payload["index_database"]
+    assert diagnostic["status"] == expected_status
+    if expected_status == "incompatible":
+        assert "FTS content is inconsistent" in diagnostic["error"]
+    else:
+        assert diagnostic["error"] is None
+        assert payload["meetings"] == 2
+    assert tree_snapshot(tmp_path) == before
+
+
 def test_diagnostics_fail_closed_on_wrong_stored_language_type(
     meetily_db: Path,
     tmp_path: Path,
